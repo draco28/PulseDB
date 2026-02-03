@@ -1,0 +1,30 @@
+# AI Configuration (do not commit)
+CLAUDE.md
+AGENTS.md
+SPEC.md
+.claude/
+.mcp.json
+opencode.json
+.opencode/
+
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.profraw
+*.profdata
+
+# Benchmark results (can regenerate)
+/benches/results/
