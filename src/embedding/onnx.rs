@@ -50,7 +50,7 @@ pub struct OnnxEmbedding {
     model_path: Option<PathBuf>,
 
     /// Embedding dimension produced by this model.
-    dimension: u16,
+    dimension: usize,
 }
 
 impl OnnxEmbedding {
@@ -91,7 +91,7 @@ impl OnnxEmbedding {
     ///
     /// This is useful for testing or when using a model with known dimension.
     #[cfg(test)]
-    pub(crate) fn with_dimension(dimension: u16) -> Self {
+    pub(crate) fn with_dimension(dimension: usize) -> Self {
         Self {
             model_path: None,
             dimension,
@@ -123,7 +123,7 @@ impl EmbeddingService for OnnxEmbedding {
         ))
     }
 
-    fn dimension(&self) -> u16 {
+    fn dimension(&self) -> usize {
         self.dimension
     }
 }

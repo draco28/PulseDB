@@ -50,8 +50,11 @@ impl CollectiveId {
 }
 
 impl Default for CollectiveId {
+    /// Returns a nil (all zeros) CollectiveId.
+    ///
+    /// For a new unique ID, use [`CollectiveId::new()`].
     fn default() -> Self {
-        Self::new()
+        Self::nil()
     }
 }
 
@@ -95,8 +98,11 @@ impl ExperienceId {
 }
 
 impl Default for ExperienceId {
+    /// Returns a nil (all zeros) ExperienceId.
+    ///
+    /// For a new unique ID, use [`ExperienceId::new()`].
     fn default() -> Self {
-        Self::new()
+        Self::nil()
     }
 }
 
@@ -115,15 +121,16 @@ pub struct Timestamp(pub i64);
 
 impl Timestamp {
     /// Creates a timestamp for the current moment.
+    ///
+    /// If the system clock is before the Unix epoch (should never happen
+    /// in practice), returns a timestamp of 0 (epoch) rather than panicking.
     #[inline]
     pub fn now() -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
-        Self(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("System time before Unix epoch")
-                .as_millis() as i64,
-        )
+        let duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        Self(duration.as_millis() as i64)
     }
 
     /// Creates a timestamp from Unix milliseconds.

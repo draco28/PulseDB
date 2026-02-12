@@ -66,7 +66,9 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns an error if flushing fails.
+    /// Returns an error if the backend supports reporting flush failures.
+    /// Note: the current redb backend flushes on drop (infallible), so
+    /// this always returns `Ok(())` for [`RedbStorage`].
     fn close(self: Box<Self>) -> Result<()>;
 
     /// Returns the path to the database file, if applicable.

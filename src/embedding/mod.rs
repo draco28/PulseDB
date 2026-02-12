@@ -41,7 +41,7 @@ use crate::types::Embedding;
 ///
 /// struct MyEmbeddingService {
 ///     client: MyApiClient,
-///     dimension: u16,
+///     dimension: usize,
 /// }
 ///
 /// impl EmbeddingService for MyEmbeddingService {
@@ -53,7 +53,7 @@ use crate::types::Embedding;
 ///         Ok(self.client.get_embeddings(texts)?)
 ///     }
 ///
-///     fn dimension(&self) -> u16 {
+///     fn dimension(&self) -> usize {
 ///         self.dimension
 ///     }
 /// }
@@ -95,7 +95,7 @@ pub trait EmbeddingService: Send + Sync {
     /// Returns the dimension of embeddings produced by this service.
     ///
     /// All embeddings from this service will have exactly this many dimensions.
-    fn dimension(&self) -> u16;
+    fn dimension(&self) -> usize;
 
     /// Validates that an embedding has the correct dimension.
     ///
@@ -103,7 +103,7 @@ pub trait EmbeddingService: Send + Sync {
     ///
     /// Returns `ValidationError::DimensionMismatch` if dimensions don't match.
     fn validate_embedding(&self, embedding: &Embedding) -> Result<()> {
-        let expected = self.dimension() as usize;
+        let expected = self.dimension();
         let actual = embedding.len();
 
         if actual != expected {
@@ -139,7 +139,7 @@ pub trait EmbeddingService: Send + Sync {
 /// ```
 #[derive(Clone, Debug)]
 pub struct ExternalEmbedding {
-    dimension: u16,
+    dimension: usize,
 }
 
 impl ExternalEmbedding {
@@ -160,7 +160,7 @@ impl ExternalEmbedding {
     /// // OpenAI text-embedding-3-small
     /// let service = ExternalEmbedding::new(1536);
     /// ```
-    pub fn new(dimension: u16) -> Self {
+    pub fn new(dimension: usize) -> Self {
         Self { dimension }
     }
 }
@@ -178,7 +178,7 @@ impl EmbeddingService for ExternalEmbedding {
         ))
     }
 
-    fn dimension(&self) -> u16 {
+    fn dimension(&self) -> usize {
         self.dimension
     }
 }
@@ -205,7 +205,7 @@ pub fn create_embedding_service(
 
     match &config.embedding_provider {
         EmbeddingProvider::External => {
-            let dimension = config.embedding_dimension.size() as u16;
+            let dimension = config.embedding_dimension.size();
             Ok(Box::new(ExternalEmbedding::new(dimension)))
         }
 

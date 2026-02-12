@@ -155,12 +155,14 @@ impl PulseDB {
     /// Closes the database, flushing all pending writes.
     ///
     /// This method consumes the `PulseDB` instance, ensuring it cannot
-    /// be used after closing. All buffered data is flushed to disk
-    /// before returning.
+    /// be used after closing. The underlying storage engine flushes all
+    /// buffered data to disk.
     ///
     /// # Errors
     ///
-    /// Returns an error if flushing to disk fails.
+    /// Returns an error if the storage backend reports a flush failure.
+    /// Note: the current redb backend flushes durably on drop, so this
+    /// always returns `Ok(())` in practice.
     ///
     /// # Example
     ///
@@ -251,9 +253,8 @@ impl PulseDB {
     // pub fn delete_experience(&self, id: ExperienceId) -> Result<()>;
 }
 
-// PulseDB is Send + Sync because both storage and embedding are Send + Sync
-unsafe impl Send for PulseDB {}
-unsafe impl Sync for PulseDB {}
+// PulseDB is auto Send + Sync: Box<dyn StorageEngine + Send + Sync>,
+// Box<dyn EmbeddingService + Send + Sync>, and Config are all Send + Sync.
 
 #[cfg(test)]
 mod tests {

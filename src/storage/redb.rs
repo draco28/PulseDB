@@ -106,6 +106,9 @@ impl RedbStorage {
         // Note: redb 2.x doesn't have set_cache_size, it manages memory internally
         // The cache_size_mb config will be used for future optimizations
 
+        // Note: redb doesn't expose a typed error variant for lock conflicts,
+        // so we detect them via error message string matching. This may need
+        // updating if redb changes its error messages in a future version.
         let db = builder.create(path).map_err(|e| {
             if e.to_string().contains("locked") {
                 StorageError::DatabaseLocked
@@ -252,8 +255,10 @@ impl StorageEngine for RedbStorage {
     fn close(self: Box<Self>) -> Result<()> {
         info!("Closing storage engine");
 
-        // redb handles flushing on drop, but we explicitly drop
-        // the database to ensure any errors are caught
+        // redb flushes all data durably on drop. Since `Database::drop` is
+        // infallible, this method currently always returns Ok(()). The Result
+        // return type is retained for API forward-compatibility if a future
+        // storage backend can report flush errors.
         drop(self.db);
 
         info!("Storage engine closed");
@@ -265,9 +270,8 @@ impl StorageEngine for RedbStorage {
     }
 }
 
-// Implement Send and Sync - redb::Database is Send + Sync
-unsafe impl Send for RedbStorage {}
-unsafe impl Sync for RedbStorage {}
+// RedbStorage is auto Send + Sync: Database, DatabaseMetadata, and PathBuf
+// are all Send + Sync.
 
 #[cfg(test)]
 mod tests {
