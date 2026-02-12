@@ -30,8 +30,10 @@ pub use schema::{DatabaseMetadata, SCHEMA_VERSION};
 
 use std::path::Path;
 
+use crate::collective::Collective;
 use crate::config::Config;
 use crate::error::Result;
+use crate::types::CollectiveId;
 
 /// Storage engine trait for PulseDB.
 ///
@@ -54,6 +56,10 @@ use crate::error::Result;
 /// println!("Schema version: {}", metadata.schema_version);
 /// ```
 pub trait StorageEngine: Send + Sync {
+    // =========================================================================
+    // Lifecycle
+    // =========================================================================
+
     /// Returns the database metadata.
     ///
     /// The metadata includes schema version, embedding dimension, and timestamps.
@@ -75,6 +81,48 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// Some storage implementations (like in-memory) may not have a path.
     fn path(&self) -> Option<&Path>;
+
+    // =========================================================================
+    // Collective Storage Operations
+    // =========================================================================
+
+    /// Saves a collective to storage.
+    ///
+    /// If a collective with the same ID already exists, it is overwritten.
+    /// Each call opens and commits its own write transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction or serialization fails.
+    fn save_collective(&self, collective: &Collective) -> Result<()>;
+
+    /// Retrieves a collective by ID.
+    ///
+    /// Returns `None` if no collective with the given ID exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read transaction or deserialization fails.
+    fn get_collective(&self, id: CollectiveId) -> Result<Option<Collective>>;
+
+    /// Lists all collectives in the database.
+    ///
+    /// Returns an empty vector if no collectives exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read transaction or deserialization fails.
+    fn list_collectives(&self) -> Result<Vec<Collective>>;
+
+    /// Deletes a collective by ID.
+    ///
+    /// Returns `true` if the collective existed and was deleted,
+    /// `false` if no collective with the given ID was found.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write transaction fails.
+    fn delete_collective(&self, id: CollectiveId) -> Result<bool>;
 }
 
 /// Opens a storage engine at the given path.

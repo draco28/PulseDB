@@ -236,6 +236,21 @@ impl PulseDB {
     }
 
     // =========================================================================
+    // Test Helpers
+    // =========================================================================
+
+    /// Returns a reference to the storage engine for integration testing.
+    ///
+    /// This method is intentionally hidden from documentation. It provides
+    /// test-only access to the storage layer for verifying ACID guarantees
+    /// and crash recovery. Production code should use the public PulseDB API.
+    #[doc(hidden)]
+    #[inline]
+    pub fn storage_for_test(&self) -> &dyn StorageEngine {
+        self.storage.as_ref()
+    }
+
+    // =========================================================================
     // Placeholder methods for future tickets
     // =========================================================================
 

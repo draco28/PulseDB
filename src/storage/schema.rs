@@ -93,12 +93,88 @@ pub const EXPERIENCES_TABLE: TableDefinition<&[u8; 16], &[u8]> =
 pub const EXPERIENCES_BY_COLLECTIVE_TABLE: MultimapTableDefinition<&[u8; 16], &[u8; 24]> =
     MultimapTableDefinition::new("experiences_by_collective");
 
+/// Index: Experiences by collective and type.
+///
+/// Enables efficient queries like "all Lesson experiences in collective X".
+/// Key: (CollectiveId bytes, ExperienceTypeTag byte) = 17 bytes
+/// Value: ExperienceId as 16-byte UUID
+///
+/// Using a multimap allows multiple experiences of the same type.
+pub const EXPERIENCES_BY_TYPE_TABLE: MultimapTableDefinition<&[u8; 17], &[u8; 16]> =
+    MultimapTableDefinition::new("experiences_by_type");
+
 /// Embeddings table.
 ///
 /// Stored separately from experiences to keep the main table compact.
 /// Key: ExperienceId as 16-byte UUID
 /// Value: raw f32 bytes (dimension * 4 bytes)
 pub const EMBEDDINGS_TABLE: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("embeddings");
+
+// ============================================================================
+// Experience Type Tag
+// ============================================================================
+
+/// Compact discriminant for experience types, used in secondary index keys.
+///
+/// Each variant maps to a single byte (`repr(u8)`), making index keys small
+/// and comparison fast. The full `ExperienceType` enum (with any associated
+/// data) lives in `experience/types.rs` and will derive its tag via a
+/// `type_tag()` method.
+///
+/// # Variants
+///
+/// These match the Phase 1 spec's `ExperienceType` enum:
+/// - `Observation` — Something the agent noticed
+/// - `Decision` — A choice the agent made
+/// - `Outcome` — Result of a decision
+/// - `Lesson` — A learned principle
+/// - `Pattern` — A recurring pattern
+/// - `Preference` — A user or agent preference
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ExperienceTypeTag {
+    /// Something the agent observed.
+    Observation = 0,
+    /// A choice the agent made.
+    Decision = 1,
+    /// Result of a decision or action.
+    Outcome = 2,
+    /// A learned principle or rule.
+    Lesson = 3,
+    /// A recurring pattern.
+    Pattern = 4,
+    /// A user or agent preference.
+    Preference = 5,
+}
+
+impl ExperienceTypeTag {
+    /// Converts a raw byte to an ExperienceTypeTag.
+    ///
+    /// Returns `None` if the byte doesn't correspond to a known variant.
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Observation),
+            1 => Some(Self::Decision),
+            2 => Some(Self::Outcome),
+            3 => Some(Self::Lesson),
+            4 => Some(Self::Pattern),
+            5 => Some(Self::Preference),
+            _ => None,
+        }
+    }
+
+    /// Returns all variants in discriminant order.
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Observation,
+            Self::Decision,
+            Self::Outcome,
+            Self::Lesson,
+            Self::Pattern,
+            Self::Preference,
+        ]
+    }
+}
 
 // ============================================================================
 // Database Metadata
@@ -190,6 +266,41 @@ pub fn collective_range_end(collective_id: &[u8; 16]) -> [u8; 24] {
     encode_collective_timestamp_key(collective_id, Timestamp::from_millis(i64::MAX))
 }
 
+// ============================================================================
+// Type Index Key Encoding
+// ============================================================================
+
+/// Encodes a (CollectiveId, ExperienceTypeTag) key for the type index.
+///
+/// Format: [collective_id: 16 bytes][type_tag: 1 byte] = 17 bytes
+///
+/// This key design allows efficient range queries: to find all experiences
+/// of a given type in a collective, we do a point lookup on this 17-byte key
+/// and iterate the multimap values (ExperienceIds).
+#[inline]
+pub fn encode_type_index_key(collective_id: &[u8; 16], type_tag: ExperienceTypeTag) -> [u8; 17] {
+    let mut key = [0u8; 17];
+    key[..16].copy_from_slice(collective_id);
+    key[16] = type_tag as u8;
+    key
+}
+
+/// Decodes the ExperienceTypeTag from a type index key.
+///
+/// Returns `None` if the tag byte doesn't correspond to a known variant.
+#[inline]
+pub fn decode_type_tag_from_key(key: &[u8; 17]) -> Option<ExperienceTypeTag> {
+    ExperienceTypeTag::from_u8(key[16])
+}
+
+/// Decodes the CollectiveId bytes from a type index key.
+#[inline]
+pub fn decode_collective_from_type_key(key: &[u8; 17]) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&key[..16]);
+    id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +370,84 @@ mod tests {
         let mid = encode_collective_timestamp_key(&collective_id, Timestamp::now());
         assert!(start <= mid);
         assert!(mid <= end);
+    }
+
+    // ====================================================================
+    // ExperienceTypeTag tests
+    // ====================================================================
+
+    #[test]
+    fn test_experience_type_tag_from_u8_roundtrip() {
+        for tag in ExperienceTypeTag::all() {
+            let byte = *tag as u8;
+            let restored = ExperienceTypeTag::from_u8(byte).unwrap();
+            assert_eq!(*tag, restored);
+        }
+    }
+
+    #[test]
+    fn test_experience_type_tag_from_u8_invalid() {
+        assert!(ExperienceTypeTag::from_u8(255).is_none());
+        assert!(ExperienceTypeTag::from_u8(6).is_none());
+    }
+
+    #[test]
+    fn test_experience_type_tag_all_variants() {
+        let all = ExperienceTypeTag::all();
+        assert_eq!(all.len(), 6);
+        assert_eq!(all[0], ExperienceTypeTag::Observation);
+        assert_eq!(all[5], ExperienceTypeTag::Preference);
+    }
+
+    #[test]
+    fn test_experience_type_tag_bincode_roundtrip() {
+        for tag in ExperienceTypeTag::all() {
+            let bytes = bincode::serialize(tag).unwrap();
+            let restored: ExperienceTypeTag = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(*tag, restored);
+        }
+    }
+
+    // ====================================================================
+    // Type index key encoding tests
+    // ====================================================================
+
+    #[test]
+    fn test_encode_type_index_key_roundtrip() {
+        let collective_id = [7u8; 16];
+        let tag = ExperienceTypeTag::Lesson;
+
+        let key = encode_type_index_key(&collective_id, tag);
+
+        assert_eq!(decode_collective_from_type_key(&key), collective_id);
+        assert_eq!(decode_type_tag_from_key(&key), Some(tag));
+    }
+
+    #[test]
+    fn test_type_index_key_different_types_produce_different_keys() {
+        let collective_id = [1u8; 16];
+
+        let key_obs = encode_type_index_key(&collective_id, ExperienceTypeTag::Observation);
+        let key_les = encode_type_index_key(&collective_id, ExperienceTypeTag::Lesson);
+
+        assert_ne!(key_obs, key_les);
+        // Same collective prefix
+        assert_eq!(&key_obs[..16], &key_les[..16]);
+        // Different type byte
+        assert_ne!(key_obs[16], key_les[16]);
+    }
+
+    #[test]
+    fn test_type_index_key_different_collectives_produce_different_keys() {
+        let id_a = [1u8; 16];
+        let id_b = [2u8; 16];
+        let tag = ExperienceTypeTag::Decision;
+
+        let key_a = encode_type_index_key(&id_a, tag);
+        let key_b = encode_type_index_key(&id_b, tag);
+
+        assert_ne!(key_a, key_b);
+        // Same type byte
+        assert_eq!(key_a[16], key_b[16]);
     }
 }

@@ -9,7 +9,8 @@
 //!
 //! # Implementation Status
 //!
-//! **TODO**: This module will be implemented in E1-S02 (Collective CRUD).
+//! **Types**: Defined in [`types`] (E1-S05).
+//! **CRUD operations**: Coming in E1-S02 (Collective CRUD).
 //!
 //! Planned operations:
 //! - `create_collective(name)` - Create a new collective
@@ -48,5 +49,6 @@
 //! db.delete_collective(id)?;
 //! ```
 
-// This module is intentionally empty for now.
-// Implementation coming in E1-S02.
+pub mod types;
+
+pub use types::Collective;

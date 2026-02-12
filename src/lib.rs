@@ -80,7 +80,7 @@ mod types;
 pub mod embedding;
 pub mod storage;
 
-// Stub modules for future features
+// Domain modules
 mod collective;
 
 // ============================================================================
@@ -98,6 +98,9 @@ pub use error::{NotFoundError, PulseDBError, Result, StorageError, ValidationErr
 
 // Core types
 pub use types::{AgentId, CollectiveId, Embedding, ExperienceId, TaskId, Timestamp, UserId};
+
+// Domain types
+pub use collective::Collective;
 
 // Storage (for advanced users)
 pub use storage::DatabaseMetadata;
