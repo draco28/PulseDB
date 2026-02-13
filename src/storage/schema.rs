@@ -86,10 +86,11 @@ pub const EXPERIENCES_TABLE: TableDefinition<&[u8; 16], &[u8]> =
 /// Index: Experiences by collective and timestamp.
 ///
 /// Enables efficient queries like "recent experiences in collective X".
-/// Key: (CollectiveId bytes, Timestamp big-endian bytes, ExperienceId bytes) = 40 bytes
-/// Value: empty (index only)
+/// Key: CollectiveId as 16-byte UUID
+/// Value (multimap): (Timestamp big-endian 8 bytes, ExperienceId 16 bytes) = 24 bytes
 ///
-/// Using a multimap allows multiple experiences with the same timestamp.
+/// Using a multimap allows multiple experiences per collective. Values are
+/// sorted lexicographically, so big-endian timestamps ensure time ordering.
 pub const EXPERIENCES_BY_COLLECTIVE_TABLE: MultimapTableDefinition<&[u8; 16], &[u8; 24]> =
     MultimapTableDefinition::new("experiences_by_collective");
 

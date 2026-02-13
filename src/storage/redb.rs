@@ -784,4 +784,112 @@ mod tests {
 
         Box::new(storage).close().unwrap();
     }
+
+    // ====================================================================
+    // Corruption Detection Tests
+    // ====================================================================
+
+    #[test]
+    fn test_corruption_detection_invalid_metadata_bytes() {
+        // Opening a database whose metadata contains garbage bytes
+        // must return a Corrupted error, not a panic or deserialization UB.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("corrupt.db");
+
+        // Create a valid database, then corrupt the metadata
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+        let write_txn = storage.database().begin_write().unwrap();
+        {
+            let mut meta = write_txn.open_table(METADATA_TABLE).unwrap();
+            meta.insert(METADATA_KEY, b"not-valid-bincode-data".as_slice())
+                .unwrap();
+        }
+        write_txn.commit().unwrap();
+        Box::new(storage).close().unwrap();
+
+        // Reopen must detect the corruption
+        let result = RedbStorage::open(&path, &default_config());
+        assert!(result.is_err(), "Corrupted metadata must be rejected");
+        let err = result.unwrap_err();
+        match err {
+            PulseDBError::Storage(StorageError::Corrupted(msg)) => {
+                assert!(
+                    msg.contains("Invalid metadata format"),
+                    "Error should mention invalid format, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected StorageError::Corrupted, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_corruption_detection_missing_metadata_key() {
+        // If the metadata table exists but the "db_metadata" key is absent,
+        // open_existing must return a Corrupted error.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("no_key.db");
+
+        // Create a valid database, then delete the metadata key
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+        let write_txn = storage.database().begin_write().unwrap();
+        {
+            let mut meta = write_txn.open_table(METADATA_TABLE).unwrap();
+            meta.remove(METADATA_KEY).unwrap();
+        }
+        write_txn.commit().unwrap();
+        Box::new(storage).close().unwrap();
+
+        // Reopen must detect the missing key
+        let result = RedbStorage::open(&path, &default_config());
+        assert!(result.is_err(), "Missing metadata key must be rejected");
+        let err = result.unwrap_err();
+        match err {
+            PulseDBError::Storage(StorageError::Corrupted(msg)) => {
+                assert!(
+                    msg.contains("Missing database metadata"),
+                    "Error should mention missing metadata, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected StorageError::Corrupted, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_corruption_detection_missing_metadata_table() {
+        // If the metadata table doesn't exist at all, open_existing must
+        // return a Corrupted error. We simulate this by creating a raw
+        // redb database without our schema tables.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("no_table.db");
+
+        // Create a raw redb database with a dummy table (not our schema)
+        {
+            let db = ::redb::Database::create(&path).unwrap();
+            let write_txn = db.begin_write().unwrap();
+            {
+                let dummy: ::redb::TableDefinition<&str, &str> =
+                    ::redb::TableDefinition::new("dummy");
+                let mut table = write_txn.open_table(dummy).unwrap();
+                table.insert("key", "value").unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        // Opening this as a PulseDB must detect the missing metadata table
+        let result = RedbStorage::open(&path, &default_config());
+        assert!(result.is_err(), "Missing metadata table must be rejected");
+        let err = result.unwrap_err();
+        match err {
+            PulseDBError::Storage(StorageError::Corrupted(msg)) => {
+                assert!(
+                    msg.contains("Cannot open metadata table"),
+                    "Error should mention metadata table, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected StorageError::Corrupted, got: {:?}", other),
+        }
+    }
 }
