@@ -100,7 +100,7 @@ pub use error::{NotFoundError, PulseDBError, Result, StorageError, ValidationErr
 pub use types::{AgentId, CollectiveId, Embedding, ExperienceId, TaskId, Timestamp, UserId};
 
 // Domain types
-pub use collective::Collective;
+pub use collective::{Collective, CollectiveStats};
 
 // Storage (for advanced users)
 pub use storage::DatabaseMetadata;

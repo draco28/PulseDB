@@ -54,10 +54,13 @@ use std::path::Path;
 
 use tracing::{info, instrument};
 
+use crate::collective::types::CollectiveStats;
+use crate::collective::{validate_collective_name, Collective};
 use crate::config::Config;
 use crate::embedding::{create_embedding_service, EmbeddingService};
-use crate::error::{PulseDBError, Result};
+use crate::error::{NotFoundError, PulseDBError, Result};
 use crate::storage::{open_storage, DatabaseMetadata, StorageEngine};
+use crate::types::CollectiveId;
 
 /// The main PulseDB database handle.
 ///
@@ -251,14 +254,169 @@ impl PulseDB {
     }
 
     // =========================================================================
-    // Placeholder methods for future tickets
+    // Collective Management (E1-S02)
     // =========================================================================
 
-    // E1-S02: Collective CRUD
-    // pub fn create_collective(&self, name: &str) -> Result<CollectiveId>;
-    // pub fn get_collective(&self, id: CollectiveId) -> Result<Option<Collective>>;
-    // pub fn list_collectives(&self) -> Result<Vec<Collective>>;
-    // pub fn delete_collective(&self, id: CollectiveId) -> Result<()>;
+    /// Creates a new collective with the given name.
+    ///
+    /// The collective's embedding dimension is locked to the database's
+    /// configured dimension at creation time.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Human-readable name (1-255 characters, not whitespace-only)
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error if the name is empty, whitespace-only,
+    /// or exceeds 255 characters.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let id = db.create_collective("my-project")?;
+    /// ```
+    #[instrument(skip(self))]
+    pub fn create_collective(&self, name: &str) -> Result<CollectiveId> {
+        validate_collective_name(name)?;
+
+        let dimension = self.config.embedding_dimension.size() as u16;
+        let collective = Collective::new(name, dimension);
+        let id = collective.id;
+
+        self.storage.save_collective(&collective)?;
+
+        info!(id = %id, name = %name, "Collective created");
+        Ok(id)
+    }
+
+    /// Creates a new collective with an owner for multi-tenancy.
+    ///
+    /// Same as [`create_collective`](Self::create_collective) but assigns
+    /// an owner ID, enabling filtering with
+    /// [`list_collectives_by_owner`](Self::list_collectives_by_owner).
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Human-readable name (1-255 characters)
+    /// * `owner_id` - Owner identifier (must not be empty)
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error if the name or owner_id is invalid.
+    #[instrument(skip(self))]
+    pub fn create_collective_with_owner(&self, name: &str, owner_id: &str) -> Result<CollectiveId> {
+        validate_collective_name(name)?;
+
+        if owner_id.is_empty() {
+            return Err(PulseDBError::from(
+                crate::error::ValidationError::required_field("owner_id"),
+            ));
+        }
+
+        let dimension = self.config.embedding_dimension.size() as u16;
+        let collective = Collective::with_owner(name, owner_id, dimension);
+        let id = collective.id;
+
+        self.storage.save_collective(&collective)?;
+
+        info!(id = %id, name = %name, owner = %owner_id, "Collective created with owner");
+        Ok(id)
+    }
+
+    /// Returns a collective by ID, or `None` if not found.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// if let Some(collective) = db.get_collective(id)? {
+    ///     println!("Found: {}", collective.name);
+    /// }
+    /// ```
+    #[instrument(skip(self))]
+    pub fn get_collective(&self, id: CollectiveId) -> Result<Option<Collective>> {
+        self.storage.get_collective(id)
+    }
+
+    /// Lists all collectives in the database.
+    ///
+    /// Returns an empty vector if no collectives exist.
+    pub fn list_collectives(&self) -> Result<Vec<Collective>> {
+        self.storage.list_collectives()
+    }
+
+    /// Lists collectives filtered by owner ID.
+    ///
+    /// Returns only collectives whose `owner_id` matches the given value.
+    /// Returns an empty vector if no matching collectives exist.
+    pub fn list_collectives_by_owner(&self, owner_id: &str) -> Result<Vec<Collective>> {
+        let all = self.storage.list_collectives()?;
+        Ok(all
+            .into_iter()
+            .filter(|c| c.owner_id.as_deref() == Some(owner_id))
+            .collect())
+    }
+
+    /// Returns statistics for a collective.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotFoundError::Collective`] if the collective doesn't exist.
+    #[instrument(skip(self))]
+    pub fn get_collective_stats(&self, id: CollectiveId) -> Result<CollectiveStats> {
+        // Verify collective exists
+        self.storage
+            .get_collective(id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::collective(id)))?;
+
+        let experience_count = self.storage.count_experiences_in_collective(id)?;
+
+        Ok(CollectiveStats {
+            experience_count,
+            storage_bytes: 0,
+            oldest_experience: None,
+            newest_experience: None,
+        })
+    }
+
+    /// Deletes a collective and all its associated data.
+    ///
+    /// Performs cascade deletion: removes all experiences belonging to the
+    /// collective before removing the collective record itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotFoundError::Collective`] if the collective doesn't exist.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// db.delete_collective(collective_id)?;
+    /// assert!(db.get_collective(collective_id)?.is_none());
+    /// ```
+    #[instrument(skip(self))]
+    pub fn delete_collective(&self, id: CollectiveId) -> Result<()> {
+        // Verify collective exists
+        self.storage
+            .get_collective(id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::collective(id)))?;
+
+        // Cascade: delete all experiences for this collective
+        let deleted_count = self.storage.delete_experiences_by_collective(id)?;
+        if deleted_count > 0 {
+            info!(count = deleted_count, "Cascade-deleted experiences");
+        }
+
+        // Delete the collective record
+        self.storage.delete_collective(id)?;
+
+        info!(id = %id, "Collective deleted");
+        Ok(())
+    }
+
+    // =========================================================================
+    // Placeholder methods for future tickets
+    // =========================================================================
 
     // E1-S03: Experience CRUD
     // pub fn record_experience(&self, exp: NewExperience) -> Result<ExperienceId>;

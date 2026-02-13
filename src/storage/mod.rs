@@ -123,6 +123,35 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// Returns an error if the write transaction fails.
     fn delete_collective(&self, id: CollectiveId) -> Result<bool>;
+
+    // =========================================================================
+    // Experience Index Operations (for collective stats & cascade delete)
+    // =========================================================================
+
+    /// Counts experiences belonging to a collective.
+    ///
+    /// Queries the `experiences_by_collective` multimap index.
+    /// Returns 0 if no experiences exist for the collective.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read transaction fails.
+    fn count_experiences_in_collective(&self, id: CollectiveId) -> Result<u64>;
+
+    /// Deletes all experiences and related index entries for a collective.
+    ///
+    /// Used for cascade deletion when a collective is removed. Cleans up:
+    /// - Experience records
+    /// - Embedding vectors
+    /// - By-collective index entries
+    /// - By-type index entries
+    ///
+    /// Returns the number of experiences deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write transaction fails.
+    fn delete_experiences_by_collective(&self, id: CollectiveId) -> Result<u64>;
 }
 
 /// Opens a storage engine at the given path.

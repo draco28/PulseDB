@@ -25,8 +25,9 @@ use crate::collective::Collective;
 use crate::types::CollectiveId;
 
 use super::schema::{
-    DatabaseMetadata, COLLECTIVES_TABLE, EMBEDDINGS_TABLE, EXPERIENCES_BY_COLLECTIVE_TABLE,
-    EXPERIENCES_BY_TYPE_TABLE, EXPERIENCES_TABLE, METADATA_TABLE, SCHEMA_VERSION,
+    encode_type_index_key, DatabaseMetadata, ExperienceTypeTag, COLLECTIVES_TABLE,
+    EMBEDDINGS_TABLE, EXPERIENCES_BY_COLLECTIVE_TABLE, EXPERIENCES_BY_TYPE_TABLE,
+    EXPERIENCES_TABLE, METADATA_TABLE, SCHEMA_VERSION,
 };
 use super::StorageEngine;
 use crate::config::{Config, EmbeddingDimension};
@@ -338,6 +339,77 @@ impl StorageEngine for RedbStorage {
             debug!(id = %id, "Collective deleted");
         }
         Ok(existed)
+    }
+
+    // =========================================================================
+    // Experience Index Operations
+    // =========================================================================
+
+    fn count_experiences_in_collective(&self, id: CollectiveId) -> Result<u64> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let table = read_txn.open_multimap_table(EXPERIENCES_BY_COLLECTIVE_TABLE)?;
+
+        let count = table.get(id.as_bytes())?.count() as u64;
+
+        Ok(count)
+    }
+
+    fn delete_experiences_by_collective(&self, id: CollectiveId) -> Result<u64> {
+        // Phase 1: Read — collect experience IDs to delete
+        let exp_ids: Vec<[u8; 16]> = {
+            let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+            let table = read_txn.open_multimap_table(EXPERIENCES_BY_COLLECTIVE_TABLE)?;
+
+            let mut ids = Vec::new();
+            for result in table.get(id.as_bytes())? {
+                let value = result.map_err(StorageError::from)?;
+                let entry = value.value();
+                // Entry is [timestamp: 8 bytes][experience_id: 16 bytes]
+                let mut exp_id = [0u8; 16];
+                exp_id.copy_from_slice(&entry[8..24]);
+                ids.push(exp_id);
+            }
+            ids
+        };
+
+        let count = exp_ids.len() as u64;
+        if count == 0 {
+            return Ok(0);
+        }
+
+        // Phase 2: Write — delete from all tables in a single transaction
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        {
+            // Delete experience records
+            let mut exp_table = write_txn.open_table(EXPERIENCES_TABLE)?;
+            for exp_id in &exp_ids {
+                exp_table.remove(exp_id)?;
+            }
+        }
+        {
+            // Delete embedding vectors
+            let mut emb_table = write_txn.open_table(EMBEDDINGS_TABLE)?;
+            for exp_id in &exp_ids {
+                emb_table.remove(exp_id)?;
+            }
+        }
+        {
+            // Clear the by-collective index for this collective
+            let mut idx_table = write_txn.open_multimap_table(EXPERIENCES_BY_COLLECTIVE_TABLE)?;
+            idx_table.remove_all(id.as_bytes())?;
+        }
+        {
+            // Clear the by-type index for all type variants of this collective
+            let mut type_table = write_txn.open_multimap_table(EXPERIENCES_BY_TYPE_TABLE)?;
+            for tag in ExperienceTypeTag::all() {
+                let key = encode_type_index_key(id.as_bytes(), *tag);
+                type_table.remove_all(&key)?;
+            }
+        }
+        write_txn.commit().map_err(StorageError::from)?;
+
+        debug!(id = %id, count = count, "Cascade-deleted experiences for collective");
+        Ok(count)
     }
 }
 

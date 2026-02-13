@@ -80,6 +80,22 @@ impl Collective {
     }
 }
 
+/// Statistics for a collective.
+///
+/// Returned by [`PulseDB::get_collective_stats()`](crate::PulseDB::get_collective_stats).
+/// These values are computed on-the-fly from the storage layer, not cached.
+#[derive(Clone, Debug)]
+pub struct CollectiveStats {
+    /// Number of experiences in this collective.
+    pub experience_count: u64,
+    /// Estimated storage size in bytes for this collective's data.
+    pub storage_bytes: u64,
+    /// Timestamp of the oldest experience, if any.
+    pub oldest_experience: Option<Timestamp>,
+    /// Timestamp of the newest experience, if any.
+    pub newest_experience: Option<Timestamp>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
