@@ -585,6 +585,34 @@ impl StorageEngine for RedbStorage {
         Ok(true)
     }
 
+    fn reinforce_experience(&self, id: ExperienceId) -> Result<Option<u32>> {
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        let new_count = {
+            let mut exp_table = write_txn.open_table(EXPERIENCES_TABLE)?;
+
+            let entry = match exp_table.get(id.as_bytes())? {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+
+            let mut experience: Experience = bincode::deserialize(entry.value())
+                .map_err(|e| StorageError::serialization(e.to_string()))?;
+            drop(entry);
+
+            experience.applications = experience.applications.saturating_add(1);
+            let new_count = experience.applications;
+
+            let bytes = bincode::serialize(&experience)
+                .map_err(|e| StorageError::serialization(e.to_string()))?;
+            exp_table.insert(id.as_bytes(), bytes.as_slice())?;
+            new_count
+        };
+        write_txn.commit().map_err(StorageError::from)?;
+
+        debug!(id = %id, applications = new_count, "Experience reinforced");
+        Ok(Some(new_count))
+    }
+
     fn save_embedding(&self, id: ExperienceId, embedding: &[f32]) -> Result<()> {
         let bytes = f32_slice_to_bytes(embedding);
 
@@ -1541,6 +1569,47 @@ mod tests {
                 .unwrap(),
             9
         );
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_reinforce_experience_atomic() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let collective = Collective::new("test", 384);
+        storage.save_collective(&collective).unwrap();
+
+        let exp = test_experience(collective.id, 384);
+        let exp_id = exp.id;
+        storage.save_experience(&exp).unwrap();
+
+        // Reinforce 3 times
+        assert_eq!(storage.reinforce_experience(exp_id).unwrap(), Some(1));
+        assert_eq!(storage.reinforce_experience(exp_id).unwrap(), Some(2));
+        assert_eq!(storage.reinforce_experience(exp_id).unwrap(), Some(3));
+
+        // Verify the stored value
+        let retrieved = storage.get_experience(exp_id).unwrap().unwrap();
+        assert_eq!(retrieved.applications, 3);
+
+        // Verify embedding was NOT re-written (still intact)
+        let emb = storage.get_embedding(exp_id).unwrap().unwrap();
+        assert_eq!(emb.len(), 384);
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_reinforce_experience_nonexistent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let result = storage.reinforce_experience(ExperienceId::new()).unwrap();
+        assert!(result.is_none());
 
         Box::new(storage).close().unwrap();
     }

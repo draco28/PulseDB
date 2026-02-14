@@ -196,6 +196,16 @@ pub trait StorageEngine: Send + Sync {
     /// `false` if not found.
     fn delete_experience(&self, id: ExperienceId) -> Result<bool>;
 
+    /// Atomically increments the applications counter for an experience.
+    ///
+    /// Performs a read-modify-write in a single write transaction to prevent
+    /// lost updates under concurrent access. Uses saturating arithmetic
+    /// (caps at `u32::MAX`, never panics).
+    ///
+    /// Returns `Some(new_count)` if the experience was found and updated,
+    /// `None` if no experience with the given ID exists.
+    fn reinforce_experience(&self, id: ExperienceId) -> Result<Option<u32>>;
+
     /// Saves an embedding vector to storage.
     ///
     /// The embedding is stored as raw little-endian f32 bytes.

@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn test_too_many_domain_tags_rejected() {
         let mut exp = valid_new_experience();
-        exp.domain = (0..11).map(|i| format!("tag-{}", i)).collect();
+        exp.domain = (0..51).map(|i| format!("tag-{}", i)).collect();
         let err = validate_new_experience(&exp, 384, true).unwrap_err();
         assert!(err.is_validation());
     }
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn test_too_many_related_files_rejected() {
         let mut exp = valid_new_experience();
-        exp.related_files = (0..11).map(|i| format!("file-{}.rs", i)).collect();
+        exp.related_files = (0..101).map(|i| format!("file-{}.rs", i)).collect();
         let err = validate_new_experience(&exp, 384, true).unwrap_err();
         assert!(err.is_validation());
     }
@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn test_update_too_many_domain_tags_rejected() {
         let update = ExperienceUpdate {
-            domain: Some((0..11).map(|i| format!("tag-{}", i)).collect()),
+            domain: Some((0..51).map(|i| format!("tag-{}", i)).collect()),
             ..Default::default()
         };
         assert!(validate_experience_update(&update).is_err());

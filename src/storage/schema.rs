@@ -48,13 +48,13 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const MAX_CONTENT_SIZE: usize = 100 * 1024;
 
 /// Maximum number of domain tags per experience.
-pub const MAX_DOMAIN_TAGS: usize = 10;
+pub const MAX_DOMAIN_TAGS: usize = 50;
 
 /// Maximum length of a single domain tag.
 pub const MAX_TAG_LENGTH: usize = 100;
 
 /// Maximum number of source files per experience.
-pub const MAX_SOURCE_FILES: usize = 10;
+pub const MAX_SOURCE_FILES: usize = 100;
 
 /// Maximum length of a single source file path.
 pub const MAX_FILE_PATH_LENGTH: usize = 500;

@@ -659,7 +659,7 @@ fn test_record_experience_too_many_domain_tags_rejected() {
         collective_id: cid,
         content: "valid content".to_string(),
         embedding: Some(dummy_embedding()),
-        domain: (0..11).map(|i| format!("tag-{i}")).collect(), // > 10
+        domain: (0..51).map(|i| format!("tag-{i}")).collect(), // > 50
         ..Default::default()
     });
 
@@ -1000,13 +1000,13 @@ fn test_record_experience_max_domain_tags_accepted() {
             collective_id: cid,
             content: "valid content".to_string(),
             embedding: Some(dummy_embedding()),
-            domain: (0..10).map(|i| format!("tag-{i}")).collect(), // exactly 10
+            domain: (0..50).map(|i| format!("tag-{i}")).collect(), // exactly 50
             ..Default::default()
         })
         .unwrap();
 
     let exp = db.get_experience(id).unwrap().unwrap();
-    assert_eq!(exp.domain.len(), 10);
+    assert_eq!(exp.domain.len(), 50);
 
     db.close().unwrap();
 }

@@ -580,28 +580,10 @@ impl PulseDB {
     /// Returns [`NotFoundError::Experience`] if the experience doesn't exist.
     #[instrument(skip(self))]
     pub fn reinforce_experience(&self, id: ExperienceId) -> Result<u32> {
-        // Get current experience
-        let experience = self
+        let new_count = self
             .storage
-            .get_experience(id)?
+            .reinforce_experience(id)?
             .ok_or_else(|| PulseDBError::from(NotFoundError::experience(id)))?;
-
-        let new_count = experience.applications + 1;
-
-        // We need a storage-level update that sets applications.
-        // Since ExperienceUpdate doesn't include applications (it's not user-mutable),
-        // we do a direct read-modify-write via the storage engine.
-        //
-        // For now, we create a minimal update and handle the applications field
-        // by re-saving the full experience. This is safe because content/embedding
-        // are immutable and we only change applications.
-        let write_txn_result = {
-            let mut exp = experience;
-            exp.applications = new_count;
-            // Re-save just the main record (embedding unchanged)
-            self.storage.save_experience(&exp)
-        };
-        write_txn_result?;
 
         info!(id = %id, applications = new_count, "Experience reinforced");
         Ok(new_count)
