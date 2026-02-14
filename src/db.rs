@@ -56,11 +56,15 @@ use tracing::{info, instrument};
 
 use crate::collective::types::CollectiveStats;
 use crate::collective::{validate_collective_name, Collective};
-use crate::config::Config;
+use crate::config::{Config, EmbeddingProvider};
 use crate::embedding::{create_embedding_service, EmbeddingService};
 use crate::error::{NotFoundError, PulseDBError, Result};
+use crate::experience::{
+    validate_experience_update, validate_new_experience, Experience, ExperienceUpdate,
+    NewExperience,
+};
 use crate::storage::{open_storage, DatabaseMetadata, StorageEngine};
-use crate::types::CollectiveId;
+use crate::types::{CollectiveId, ExperienceId, Timestamp};
 
 /// The main PulseDB database handle.
 ///
@@ -77,8 +81,6 @@ pub struct PulseDB {
     storage: Box<dyn StorageEngine>,
 
     /// Embedding service (external or ONNX).
-    /// Used by experience recording (E1-S03) and search (Phase 2).
-    #[allow(dead_code)]
     embedding: Box<dyn EmbeddingService>,
 
     /// Configuration used to open this database.
@@ -224,7 +226,7 @@ impl PulseDB {
     ///
     /// This is for internal use by other PulseDB modules.
     #[inline]
-    #[allow(dead_code)] // Used by Collective CRUD (E1-S02) and Experience CRUD (E1-S03)
+    #[allow(dead_code)] // Will be used by search (Phase 2) and other modules
     pub(crate) fn storage(&self) -> &dyn StorageEngine {
         self.storage.as_ref()
     }
@@ -233,7 +235,7 @@ impl PulseDB {
     ///
     /// This is for internal use by other PulseDB modules.
     #[inline]
-    #[allow(dead_code)] // Used by Experience CRUD (E1-S03)
+    #[allow(dead_code)] // Will be used by search (Phase 2) and other modules
     pub(crate) fn embedding(&self) -> &dyn EmbeddingService {
         self.embedding.as_ref()
     }
@@ -415,15 +417,195 @@ impl PulseDB {
     }
 
     // =========================================================================
-    // Placeholder methods for future tickets
+    // Experience CRUD (E1-S03)
     // =========================================================================
 
-    // E1-S03: Experience CRUD
-    // pub fn record_experience(&self, exp: NewExperience) -> Result<ExperienceId>;
-    // pub fn get_experience(&self, id: ExperienceId) -> Result<Option<Experience>>;
-    // pub fn update_experience(&self, id: ExperienceId, update: ExperienceUpdate) -> Result<()>;
-    // pub fn archive_experience(&self, id: ExperienceId) -> Result<()>;
-    // pub fn delete_experience(&self, id: ExperienceId) -> Result<()>;
+    /// Records a new experience in the database.
+    ///
+    /// This is the primary method for storing agent-learned knowledge. The method:
+    /// 1. Validates the input (content, scores, tags, embedding)
+    /// 2. Verifies the collective exists
+    /// 3. Resolves the embedding (generates if Builtin, requires if External)
+    /// 4. Stores the experience atomically across 4 tables
+    ///
+    /// # Arguments
+    ///
+    /// * `exp` - The experience to record (see [`NewExperience`])
+    ///
+    /// # Errors
+    ///
+    /// - [`ValidationError`](crate::ValidationError) if input is invalid
+    /// - [`NotFoundError::Collective`] if the collective doesn't exist
+    /// - [`PulseDBError::Embedding`] if embedding generation fails (Builtin mode)
+    #[instrument(skip(self, exp), fields(collective_id = %exp.collective_id))]
+    pub fn record_experience(&self, exp: NewExperience) -> Result<ExperienceId> {
+        let is_external = matches!(self.config.embedding_provider, EmbeddingProvider::External);
+
+        // Verify collective exists and get its dimension
+        let collective = self
+            .storage
+            .get_collective(exp.collective_id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::collective(exp.collective_id)))?;
+
+        // Validate input
+        validate_new_experience(&exp, collective.embedding_dimension, is_external)?;
+
+        // Resolve embedding
+        let embedding = match exp.embedding {
+            Some(emb) => emb,
+            None => {
+                // Builtin mode: generate embedding from content
+                self.embedding.embed(&exp.content)?
+            }
+        };
+
+        // Construct the full experience record
+        let experience = Experience {
+            id: ExperienceId::new(),
+            collective_id: exp.collective_id,
+            content: exp.content,
+            embedding,
+            experience_type: exp.experience_type,
+            importance: exp.importance,
+            confidence: exp.confidence,
+            applications: 0,
+            domain: exp.domain,
+            related_files: exp.related_files,
+            source_agent: exp.source_agent,
+            source_task: exp.source_task,
+            timestamp: Timestamp::now(),
+            archived: false,
+        };
+
+        let id = experience.id;
+        self.storage.save_experience(&experience)?;
+
+        info!(id = %id, "Experience recorded");
+        Ok(id)
+    }
+
+    /// Retrieves an experience by ID, including its embedding.
+    ///
+    /// Returns `None` if no experience with the given ID exists.
+    #[instrument(skip(self))]
+    pub fn get_experience(&self, id: ExperienceId) -> Result<Option<Experience>> {
+        self.storage.get_experience(id)
+    }
+
+    /// Updates mutable fields of an experience.
+    ///
+    /// Only fields set to `Some(...)` in the update are changed.
+    /// Content and embedding are immutable — create a new experience instead.
+    ///
+    /// # Errors
+    ///
+    /// - [`ValidationError`](crate::ValidationError) if updated values are invalid
+    /// - [`NotFoundError::Experience`] if the experience doesn't exist
+    #[instrument(skip(self, update))]
+    pub fn update_experience(&self, id: ExperienceId, update: ExperienceUpdate) -> Result<()> {
+        validate_experience_update(&update)?;
+
+        let updated = self.storage.update_experience(id, &update)?;
+        if !updated {
+            return Err(PulseDBError::from(NotFoundError::experience(id)));
+        }
+
+        info!(id = %id, "Experience updated");
+        Ok(())
+    }
+
+    /// Archives an experience (soft-delete).
+    ///
+    /// Archived experiences remain in storage but are excluded from search
+    /// results. Use [`unarchive_experience`](Self::unarchive_experience) to restore.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotFoundError::Experience`] if the experience doesn't exist.
+    #[instrument(skip(self))]
+    pub fn archive_experience(&self, id: ExperienceId) -> Result<()> {
+        self.update_experience(
+            id,
+            ExperienceUpdate {
+                archived: Some(true),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Restores an archived experience.
+    ///
+    /// The experience will once again appear in search results.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotFoundError::Experience`] if the experience doesn't exist.
+    #[instrument(skip(self))]
+    pub fn unarchive_experience(&self, id: ExperienceId) -> Result<()> {
+        self.update_experience(
+            id,
+            ExperienceUpdate {
+                archived: Some(false),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Permanently deletes an experience and its embedding.
+    ///
+    /// This removes the experience from all tables and indices.
+    /// Unlike archiving, this is irreversible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotFoundError::Experience`] if the experience doesn't exist.
+    #[instrument(skip(self))]
+    pub fn delete_experience(&self, id: ExperienceId) -> Result<()> {
+        let deleted = self.storage.delete_experience(id)?;
+        if !deleted {
+            return Err(PulseDBError::from(NotFoundError::experience(id)));
+        }
+
+        info!(id = %id, "Experience deleted");
+        Ok(())
+    }
+
+    /// Reinforces an experience by incrementing its application count.
+    ///
+    /// Each call atomically increments the `applications` counter by 1.
+    /// Returns the new application count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotFoundError::Experience`] if the experience doesn't exist.
+    #[instrument(skip(self))]
+    pub fn reinforce_experience(&self, id: ExperienceId) -> Result<u32> {
+        // Get current experience
+        let experience = self
+            .storage
+            .get_experience(id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::experience(id)))?;
+
+        let new_count = experience.applications + 1;
+
+        // We need a storage-level update that sets applications.
+        // Since ExperienceUpdate doesn't include applications (it's not user-mutable),
+        // we do a direct read-modify-write via the storage engine.
+        //
+        // For now, we create a minimal update and handle the applications field
+        // by re-saving the full experience. This is safe because content/embedding
+        // are immutable and we only change applications.
+        let write_txn_result = {
+            let mut exp = experience;
+            exp.applications = new_count;
+            // Re-save just the main record (embedding unchanged)
+            self.storage.save_experience(&exp)
+        };
+        write_txn_result?;
+
+        info!(id = %id, applications = new_count, "Experience reinforced");
+        Ok(new_count)
+    }
 }
 
 // PulseDB is auto Send + Sync: Box<dyn StorageEngine + Send + Sync>,

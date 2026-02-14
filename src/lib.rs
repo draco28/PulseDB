@@ -82,6 +82,7 @@ pub mod storage;
 
 // Domain modules
 mod collective;
+mod experience;
 
 // ============================================================================
 // Public API re-exports
@@ -101,6 +102,7 @@ pub use types::{AgentId, CollectiveId, Embedding, ExperienceId, TaskId, Timestam
 
 // Domain types
 pub use collective::{Collective, CollectiveStats};
+pub use experience::{Experience, ExperienceType, ExperienceUpdate, NewExperience, Severity};
 
 // Storage (for advanced users)
 pub use storage::DatabaseMetadata;
@@ -118,5 +120,6 @@ pub mod prelude {
     pub use crate::config::{Config, EmbeddingDimension, SyncMode};
     pub use crate::db::PulseDB;
     pub use crate::error::{PulseDBError, Result};
+    pub use crate::experience::{Experience, ExperienceType, NewExperience};
     pub use crate::types::{CollectiveId, ExperienceId, Timestamp};
 }
