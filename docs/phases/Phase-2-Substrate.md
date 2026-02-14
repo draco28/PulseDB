@@ -37,7 +37,7 @@ Week 5          Week 6          Week 7          Week 8
 **User Story:** As an agent developer, I want fast semantic search so that agents can find relevant experiences.
 
 **Acceptance Criteria:**
-- [ ] hnswlib FFI wrapper implemented
+- [ ] hnsw_rs integration via VectorIndex trait
 - [ ] Index created per collective
 - [ ] Index persisted to disk (`collective_id.hnsw`)
 - [ ] Index loaded on database open
@@ -206,7 +206,7 @@ src/
 │
 ├── vector/
 │   ├── mod.rs          # VectorIndex trait
-│   ├── hnsw.rs         # HNSW wrapper (hnswlib FFI)
+│   ├── hnsw.rs         # HNSW wrapper (hnsw_rs, pure Rust)
 │   └── tests.rs
 │
 ├── relation/
@@ -680,8 +680,7 @@ fn test_full_context_assembly() {
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| `hnswlib` | 0.8+ | HNSW vector index (FFI) |
-| `cc` | 1.0+ | C++ build for hnswlib |
+| `hnsw_rs` | 0.3+ | HNSW vector index (pure Rust, ADR-005) |
 
 ---
 

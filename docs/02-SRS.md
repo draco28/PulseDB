@@ -107,7 +107,7 @@ PulseDB is an embedded database library consumed by:
 
 **Dependencies:**
 - redb >= 1.0 (key-value storage)
-- hnswlib (C++ FFI for vector index)
+- hnsw_rs (pure Rust HNSW vector index)
 - ort (optional, for built-in embeddings)
 
 ---

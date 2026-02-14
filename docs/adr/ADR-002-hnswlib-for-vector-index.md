@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+**Superseded** by [ADR-005: Pure Rust HNSW via hnsw_rs](ADR-005-pure-rust-hnsw.md)
 
 ## Date
 

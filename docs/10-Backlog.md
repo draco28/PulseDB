@@ -192,7 +192,7 @@ As a developer, I want reliable storage with ACID transactions so that data is n
 As an agent developer, I want fast semantic search so that agents can find relevant experiences.
 
 **Acceptance Criteria:**
-- [ ] hnswlib FFI wrapper implemented
+- [ ] hnsw_rs integration via VectorIndex trait
 - [ ] Index created per collective
 - [ ] Index persisted to disk
 - [ ] Index loaded on database open

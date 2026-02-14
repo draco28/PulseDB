@@ -165,7 +165,7 @@ This document describes the internal architecture of PulseDB, an embedded databa
 | Component | Responsibility |
 |-----------|---------------|
 | **KVStore** | redb wrapper for structured data storage |
-| **VectorIndex** | HNSW index management via hnswlib FFI |
+| **VectorIndex** | HNSW index management via hnsw_rs (pure Rust) |
 
 ### 3.3 Component Diagram
 
@@ -793,7 +793,7 @@ full = ["builtin-embeddings"]
 
 [dependencies]
 redb = "2.0"
-hnswlib-rs = "0.3"  # FFI wrapper
+hnsw_rs = "0.3"  # Pure Rust HNSW (see ADR-005)
 ort = { version = "2.0", optional = true }
 ```
 

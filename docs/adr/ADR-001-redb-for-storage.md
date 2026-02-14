@@ -59,7 +59,7 @@ EXPERIENCES_BY_TYPE_TABLE       - Secondary index (collective + type tag -> expe
 
 ### Positive
 
-- Pure Rust implementation - no C/C++ build dependencies for storage (hnswlib is the only C++ dep)
+- Pure Rust implementation - no C/C++ build dependencies (entire stack is pure Rust since ADR-005)
 - Simple, well-documented API with compile-time table type checking
 - MVCC enables non-blocking concurrent reads during writes
 - Automatic crash recovery without manual WAL management

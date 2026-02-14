@@ -65,7 +65,7 @@ Week 1-2    Week 3-4    Week 5-6    Week 7-8    Week 9      Week 10
 
 | Week | Focus | Deliverables |
 |------|-------|--------------|
-| Week 5 | HNSW integration | hnswlib FFI, index per collective |
+| Week 5 | HNSW integration | hnsw_rs via VectorIndex trait, index per collective |
 | Week 6 | Search operations | search_similar, get_recent, filters |
 | Week 7 | Hive primitives | Relations, insights, activities |
 | Week 8 | Context candidates | get_context_candidates, SubstrateProvider |
@@ -177,7 +177,7 @@ Week 1-2    Week 3-4    Week 5-6    Week 7-8    Week 9      Week 10
 | Dependency | Version | Risk Level |
 |------------|---------|------------|
 | redb | 2.0+ | Low (stable) |
-| hnswlib | 0.8+ | Medium (C++ FFI) |
+| hnsw_rs | 0.3+ | Low (pure Rust) |
 | ort (ONNX) | 2.0+ | Medium (optional) |
 | bincode | 1.3+ | Low (stable) |
 | crossbeam-channel | 0.5+ | Low (stable) |
@@ -190,7 +190,7 @@ Week 1-2    Week 3-4    Week 5-6    Week 7-8    Week 9      Week 10
 
 | ID | Risk | Likelihood | Impact | Mitigation |
 |----|------|------------|--------|------------|
-| T1 | hnswlib FFI complexity | Medium | High | Start early, have pure Rust fallback |
+| T1 | hnsw_rs integration | Low | Low | Pure Rust, wrapped behind VectorIndex trait (ADR-005) |
 | T2 | ONNX model size bloats binary | Medium | Medium | Make optional, lazy loading |
 | T3 | Performance targets not met | Low | High | Early benchmarking, profiling |
 | T4 | redb limitations discovered | Low | High | Evaluate early, have backup plan |
@@ -292,7 +292,7 @@ Process:
 | Decision | Date | Rationale |
 |----------|------|-----------|
 | Use redb over SQLite | TBD | Pure Rust, simpler |
-| Use hnswlib over pure Rust | TBD | 2x performance |
+| Use hnsw_rs (pure Rust) | TBD | No FFI risks, VectorIndex trait for swappability (ADR-005) |
 | Single-writer model | TBD | Simplicity, matches redb |
 
 ---
@@ -309,9 +309,7 @@ rustup default stable
 # Required components
 rustup component add rustfmt clippy
 
-# Build dependencies (for hnswlib)
-# Linux:
-sudo apt install build-essential cmake
+# No C++ build dependencies needed - hnsw_rs is pure Rust (ADR-005)
 
 # macOS:
 xcode-select --install

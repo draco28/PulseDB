@@ -15,8 +15,7 @@
 |-------------|---------|-------|
 | Rust | 1.75+ | MSRV |
 | Cargo | Latest | Comes with Rust |
-| C++ Compiler | GCC 9+ / Clang 12+ | For hnswlib FFI |
-| CMake | 3.16+ | For hnswlib build |
+| (No C++ needed) | — | hnsw_rs is pure Rust (ADR-005) |
 
 **Platform Support:**
 - Linux (x86_64, aarch64)
@@ -313,7 +312,7 @@ What becomes easier or harder because of this change?
 **Decision:** Use redb instead of SQLite or RocksDB.
 
 **Consequences:**
-- ✓ Pure Rust, no C dependencies (except hnswlib)
+- ✓ Pure Rust, no C/C++ dependencies
 - ✓ Simple API, good performance
 - ✓ MVCC for concurrent reads
 - ✗ Less battle-tested than SQLite/RocksDB
@@ -321,17 +320,21 @@ What becomes easier or harder because of this change?
 
 #### ADR-002: Use hnswlib for Vector Index
 
+**Status:** Superseded by ADR-005
+
+#### ADR-005: Pure Rust HNSW via hnsw_rs
+
 **Status:** Accepted
 
-**Context:** Need fast approximate nearest neighbor search.
+**Context:** Need fast ANN search without C++ FFI risks.
 
-**Decision:** Use hnswlib via FFI instead of pure Rust alternatives.
+**Decision:** Use hnsw_rs (pure Rust) wrapped behind VectorIndex trait.
 
 **Consequences:**
-- ✓ 2x faster than pure Rust alternatives
-- ✓ Well-tested, production-proven
-- ✗ C++ dependency, more complex build
-- ✗ FFI boundary requires careful handling
+- ✓ No FFI risks (memory opacity, panic UB, concurrency conflicts)
+- ✓ Native filtered search via FilterT trait
+- ✓ Cross-compiles trivially (no C++ toolchain)
+- ✓ Swappable in 3-5 days via VectorIndex trait
 
 #### ADR-003: Single-Writer Concurrency Model
 

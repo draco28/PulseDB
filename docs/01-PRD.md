@@ -247,7 +247,7 @@ These are explicitly NOT goals for PulseDB:
 | Dependency | Purpose | Risk |
 |------------|---------|------|
 | redb | Key-value storage | Low (pure Rust, mature) |
-| hnswlib | HNSW vector index | Medium (C++ FFI, but well-tested) |
+| hnsw_rs | HNSW vector index | Low (pure Rust, battle-tested) |
 | ort (ONNX Runtime) | Embedding generation | Medium (large, but optional) |
 | crossbeam-channel | In-process notifications | Low (standard choice) |
 | bincode/postcard | Serialization | Low (pure Rust) |
@@ -291,7 +291,7 @@ These are explicitly NOT goals for PulseDB:
 │  │  │                   Storage Layer                        ││  │
 │  │  │  ┌─────────────┐              ┌─────────────────────┐ ││  │
 │  │  │  │    redb     │              │    HNSW Index       │ ││  │
-│  │  │  │  (KV store) │              │   (hnswlib FFI)     │ ││  │
+│  │  │  │  (KV store) │              │   (hnsw_rs)         │ ││  │
 │  │  │  └─────────────┘              └─────────────────────┘ ││  │
 │  │  └────────────────────────────────────────────────────────┘│  │
 │  └────────────────────────────────────────────────────────────┘  │
@@ -304,7 +304,7 @@ These are explicitly NOT goals for PulseDB:
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Storage engine | redb | Pure Rust, embedded, ACID, MVCC |
-| Vector index | hnswlib (C++ FFI) | 2x faster than pure Rust alternatives |
+| Vector index | hnsw_rs (pure Rust) | Native filtered search, no FFI risks (ADR-005) |
 | Embedding | ONNX (optional) | Zero runtime dependencies when external |
 | Serialization | bincode/postcard | Fast, compact, Rust-native |
 | Concurrency | Single-writer, multi-reader | Matches redb, simple mental model |
@@ -370,7 +370,7 @@ Post-Release:
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|------------|--------|------------|
-| hnswlib FFI complexity | Medium | High | Thorough testing, fallback to pure Rust |
+| hnsw_rs integration | Low | Low | Pure Rust, wrapped behind VectorIndex trait |
 | ONNX model size bloats binary | Medium | Medium | Make optional, lazy loading |
 | Performance targets not met | Low | High | Early benchmarking, profiling |
 | redb limitations discovered | Low | High | Evaluate early, have backup plan |
