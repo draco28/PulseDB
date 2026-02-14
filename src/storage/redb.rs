@@ -22,7 +22,8 @@ use ::redb::{Database, ReadableTable};
 use tracing::{debug, info, instrument, warn};
 
 use crate::collective::Collective;
-use crate::types::CollectiveId;
+use crate::experience::{Experience, ExperienceUpdate};
+use crate::types::{CollectiveId, ExperienceId};
 
 use super::schema::{
     encode_type_index_key, DatabaseMetadata, ExperienceTypeTag, COLLECTIVES_TABLE,
@@ -411,6 +412,252 @@ impl StorageEngine for RedbStorage {
         debug!(id = %id, count = count, "Cascade-deleted experiences for collective");
         Ok(count)
     }
+
+    // =========================================================================
+    // Experience Storage Operations
+    // =========================================================================
+
+    fn save_experience(&self, experience: &Experience) -> Result<()> {
+        // Serialize experience (embedding is #[serde(skip)], excluded automatically)
+        let exp_bytes = bincode::serialize(experience)
+            .map_err(|e| StorageError::serialization(e.to_string()))?;
+
+        // Convert embedding to raw little-endian bytes
+        let emb_bytes = f32_slice_to_bytes(&experience.embedding);
+
+        // Build index keys
+        let type_key = encode_type_index_key(
+            experience.collective_id.as_bytes(),
+            experience.experience_type.type_tag(),
+        );
+
+        // Write to all 4 tables in a single atomic transaction
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        {
+            // Main experience record
+            let mut exp_table = write_txn.open_table(EXPERIENCES_TABLE)?;
+            exp_table.insert(experience.id.as_bytes(), exp_bytes.as_slice())?;
+        }
+        {
+            // Embedding vector (stored separately for compactness)
+            let mut emb_table = write_txn.open_table(EMBEDDINGS_TABLE)?;
+            emb_table.insert(experience.id.as_bytes(), emb_bytes.as_slice())?;
+        }
+        {
+            // By-collective index: key=collective_id, value=timestamp+experience_id
+            let mut idx_table = write_txn.open_multimap_table(EXPERIENCES_BY_COLLECTIVE_TABLE)?;
+            // Value is [timestamp_be: 8 bytes][experience_id: 16 bytes] = 24 bytes
+            let mut value = [0u8; 24];
+            value[..8].copy_from_slice(&experience.timestamp.to_be_bytes());
+            value[8..24].copy_from_slice(experience.id.as_bytes());
+            idx_table.insert(experience.collective_id.as_bytes(), &value)?;
+        }
+        {
+            // By-type index: key=collective_id+type_tag, value=experience_id
+            let mut type_table = write_txn.open_multimap_table(EXPERIENCES_BY_TYPE_TABLE)?;
+            type_table.insert(&type_key, experience.id.as_bytes())?;
+        }
+        write_txn.commit().map_err(StorageError::from)?;
+
+        debug!(
+            id = %experience.id,
+            collective_id = %experience.collective_id,
+            "Experience saved"
+        );
+        Ok(())
+    }
+
+    fn get_experience(&self, id: ExperienceId) -> Result<Option<Experience>> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+
+        // Read main experience record
+        let exp_table = read_txn.open_table(EXPERIENCES_TABLE)?;
+        let exp_entry = match exp_table.get(id.as_bytes())? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let mut experience: Experience = bincode::deserialize(exp_entry.value())
+            .map_err(|e| StorageError::serialization(e.to_string()))?;
+
+        // Read embedding from separate table and reconstitute
+        let emb_table = read_txn.open_table(EMBEDDINGS_TABLE)?;
+        if let Some(emb_entry) = emb_table.get(id.as_bytes())? {
+            experience.embedding = bytes_to_f32_vec(emb_entry.value());
+        }
+
+        Ok(Some(experience))
+    }
+
+    fn update_experience(&self, id: ExperienceId, update: &ExperienceUpdate) -> Result<bool> {
+        // Read-modify-write: read the current record, apply updates, write back
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        {
+            let mut exp_table = write_txn.open_table(EXPERIENCES_TABLE)?;
+
+            let entry = match exp_table.get(id.as_bytes())? {
+                Some(v) => v,
+                None => return Ok(false),
+            };
+
+            let mut experience: Experience = bincode::deserialize(entry.value())
+                .map_err(|e| StorageError::serialization(e.to_string()))?;
+
+            // Drop the borrow on entry before mutating the table
+            drop(entry);
+
+            // Apply updates (only Some fields)
+            if let Some(importance) = update.importance {
+                experience.importance = importance;
+            }
+            if let Some(confidence) = update.confidence {
+                experience.confidence = confidence;
+            }
+            if let Some(ref domain) = update.domain {
+                experience.domain = domain.clone();
+            }
+            if let Some(ref related_files) = update.related_files {
+                experience.related_files = related_files.clone();
+            }
+            if let Some(archived) = update.archived {
+                experience.archived = archived;
+            }
+
+            // Re-serialize and write back
+            let bytes = bincode::serialize(&experience)
+                .map_err(|e| StorageError::serialization(e.to_string()))?;
+            exp_table.insert(id.as_bytes(), bytes.as_slice())?;
+        }
+        write_txn.commit().map_err(StorageError::from)?;
+
+        debug!(id = %id, "Experience updated");
+        Ok(true)
+    }
+
+    fn delete_experience(&self, id: ExperienceId) -> Result<bool> {
+        // First read the experience to get collective_id, timestamp, and type_tag
+        // (needed for cleaning up secondary indices)
+        let (collective_id, timestamp, type_tag) = {
+            let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+            let exp_table = read_txn.open_table(EXPERIENCES_TABLE)?;
+
+            match exp_table.get(id.as_bytes())? {
+                Some(entry) => {
+                    let exp: Experience = bincode::deserialize(entry.value())
+                        .map_err(|e| StorageError::serialization(e.to_string()))?;
+                    (
+                        exp.collective_id,
+                        exp.timestamp,
+                        exp.experience_type.type_tag(),
+                    )
+                }
+                None => return Ok(false),
+            }
+        };
+
+        // Delete from all 4 tables in a single transaction
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        {
+            let mut exp_table = write_txn.open_table(EXPERIENCES_TABLE)?;
+            exp_table.remove(id.as_bytes())?;
+        }
+        {
+            let mut emb_table = write_txn.open_table(EMBEDDINGS_TABLE)?;
+            emb_table.remove(id.as_bytes())?;
+        }
+        {
+            // Remove specific entry from by-collective multimap
+            let mut idx_table = write_txn.open_multimap_table(EXPERIENCES_BY_COLLECTIVE_TABLE)?;
+            let mut value = [0u8; 24];
+            value[..8].copy_from_slice(&timestamp.to_be_bytes());
+            value[8..24].copy_from_slice(id.as_bytes());
+            idx_table.remove(collective_id.as_bytes(), &value)?;
+        }
+        {
+            // Remove specific entry from by-type multimap
+            let mut type_table = write_txn.open_multimap_table(EXPERIENCES_BY_TYPE_TABLE)?;
+            let type_key = encode_type_index_key(collective_id.as_bytes(), type_tag);
+            type_table.remove(&type_key, id.as_bytes())?;
+        }
+        write_txn.commit().map_err(StorageError::from)?;
+
+        debug!(id = %id, "Experience deleted");
+        Ok(true)
+    }
+
+    fn reinforce_experience(&self, id: ExperienceId) -> Result<Option<u32>> {
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        let new_count = {
+            let mut exp_table = write_txn.open_table(EXPERIENCES_TABLE)?;
+
+            let entry = match exp_table.get(id.as_bytes())? {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+
+            let mut experience: Experience = bincode::deserialize(entry.value())
+                .map_err(|e| StorageError::serialization(e.to_string()))?;
+            drop(entry);
+
+            experience.applications = experience.applications.saturating_add(1);
+            let new_count = experience.applications;
+
+            let bytes = bincode::serialize(&experience)
+                .map_err(|e| StorageError::serialization(e.to_string()))?;
+            exp_table.insert(id.as_bytes(), bytes.as_slice())?;
+            new_count
+        };
+        write_txn.commit().map_err(StorageError::from)?;
+
+        debug!(id = %id, applications = new_count, "Experience reinforced");
+        Ok(Some(new_count))
+    }
+
+    fn save_embedding(&self, id: ExperienceId, embedding: &[f32]) -> Result<()> {
+        let bytes = f32_slice_to_bytes(embedding);
+
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        {
+            let mut table = write_txn.open_table(EMBEDDINGS_TABLE)?;
+            table.insert(id.as_bytes(), bytes.as_slice())?;
+        }
+        write_txn.commit().map_err(StorageError::from)?;
+
+        debug!(id = %id, dim = embedding.len(), "Embedding saved");
+        Ok(())
+    }
+
+    fn get_embedding(&self, id: ExperienceId) -> Result<Option<Vec<f32>>> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let table = read_txn.open_table(EMBEDDINGS_TABLE)?;
+
+        match table.get(id.as_bytes())? {
+            Some(entry) => Ok(Some(bytes_to_f32_vec(entry.value()))),
+            None => Ok(None),
+        }
+    }
+}
+
+// ============================================================================
+// Embedding byte conversion helpers
+// ============================================================================
+
+/// Converts a slice of f32 values to raw little-endian bytes.
+#[inline]
+fn f32_slice_to_bytes(data: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(data.len() * 4);
+    for &val in data {
+        bytes.extend_from_slice(&val.to_le_bytes());
+    }
+    bytes
+}
+
+/// Converts raw little-endian bytes back to a Vec<f32>.
+#[inline]
+fn bytes_to_f32_vec(data: &[u8]) -> Vec<f32> {
+    data.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 // RedbStorage is auto Send + Sync: Database, DatabaseMetadata, and PathBuf
@@ -963,5 +1210,407 @@ mod tests {
             }
             other => panic!("Expected StorageError::Corrupted, got: {:?}", other),
         }
+    }
+
+    // ====================================================================
+    // Experience CRUD tests
+    // ====================================================================
+
+    use crate::experience::{Experience, ExperienceType, ExperienceUpdate, Severity};
+    use crate::types::{AgentId, ExperienceId, Timestamp};
+
+    /// Creates a test experience with a given collective_id and embedding dimension.
+    fn test_experience(collective_id: CollectiveId, dim: usize) -> Experience {
+        Experience {
+            id: ExperienceId::new(),
+            collective_id,
+            content: "Test experience content".into(),
+            embedding: vec![0.42; dim],
+            experience_type: ExperienceType::Fact {
+                statement: "redb uses shadow paging".into(),
+                source: "docs".into(),
+            },
+            importance: 0.8,
+            confidence: 0.7,
+            applications: 0,
+            domain: vec!["rust".into(), "databases".into()],
+            related_files: vec!["src/storage/redb.rs".into()],
+            source_agent: AgentId::new("test-agent"),
+            source_task: None,
+            timestamp: Timestamp::now(),
+            archived: false,
+        }
+    }
+
+    #[test]
+    fn test_save_and_get_experience() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let collective = Collective::new("test", 384);
+        storage.save_collective(&collective).unwrap();
+
+        let exp = test_experience(collective.id, 384);
+        let exp_id = exp.id;
+
+        storage.save_experience(&exp).unwrap();
+
+        let retrieved = storage.get_experience(exp_id).unwrap().unwrap();
+        assert_eq!(retrieved.id, exp_id);
+        assert_eq!(retrieved.collective_id, collective.id);
+        assert_eq!(retrieved.content, "Test experience content");
+        assert_eq!(retrieved.importance, 0.8);
+        assert_eq!(retrieved.confidence, 0.7);
+        assert_eq!(retrieved.applications, 0);
+        assert_eq!(retrieved.domain, vec!["rust", "databases"]);
+        assert!(!retrieved.archived);
+        // Embedding should be reconstituted from EMBEDDINGS_TABLE
+        assert_eq!(retrieved.embedding.len(), 384);
+        assert_eq!(retrieved.embedding[0], 0.42);
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_get_nonexistent_experience_returns_none() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let result = storage.get_experience(ExperienceId::new()).unwrap();
+        assert!(result.is_none());
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_update_experience_fields() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let collective = Collective::new("test", 384);
+        storage.save_collective(&collective).unwrap();
+
+        let exp = test_experience(collective.id, 384);
+        let exp_id = exp.id;
+        storage.save_experience(&exp).unwrap();
+
+        // Update importance and domain
+        let update = ExperienceUpdate {
+            importance: Some(0.95),
+            domain: Some(vec!["updated-tag".into()]),
+            ..Default::default()
+        };
+        let updated = storage.update_experience(exp_id, &update).unwrap();
+        assert!(updated);
+
+        let retrieved = storage.get_experience(exp_id).unwrap().unwrap();
+        assert_eq!(retrieved.importance, 0.95);
+        assert_eq!(retrieved.domain, vec!["updated-tag"]);
+        // Unchanged fields
+        assert_eq!(retrieved.confidence, 0.7);
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_update_nonexistent_experience_returns_false() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let update = ExperienceUpdate {
+            importance: Some(0.5),
+            ..Default::default()
+        };
+        let result = storage
+            .update_experience(ExperienceId::new(), &update)
+            .unwrap();
+        assert!(!result);
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_delete_experience() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let collective = Collective::new("test", 384);
+        storage.save_collective(&collective).unwrap();
+
+        let exp = test_experience(collective.id, 384);
+        let exp_id = exp.id;
+        storage.save_experience(&exp).unwrap();
+
+        // Verify exists
+        assert!(storage.get_experience(exp_id).unwrap().is_some());
+
+        // Delete
+        let deleted = storage.delete_experience(exp_id).unwrap();
+        assert!(deleted);
+
+        // Verify gone
+        assert!(storage.get_experience(exp_id).unwrap().is_none());
+        assert!(storage.get_embedding(exp_id).unwrap().is_none());
+
+        // Verify index cleaned up
+        assert_eq!(
+            storage
+                .count_experiences_in_collective(collective.id)
+                .unwrap(),
+            0
+        );
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_delete_nonexistent_experience_returns_false() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let result = storage.delete_experience(ExperienceId::new()).unwrap();
+        assert!(!result);
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_save_and_get_embedding() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let id = ExperienceId::new();
+        let embedding = vec![0.1, 0.2, 0.3, -0.5, 1.0, f32::MIN_POSITIVE];
+
+        storage.save_embedding(id, &embedding).unwrap();
+
+        let retrieved = storage.get_embedding(id).unwrap().unwrap();
+        assert_eq!(retrieved, embedding);
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_experience_by_collective_index() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let collective = Collective::new("test", 384);
+        storage.save_collective(&collective).unwrap();
+
+        // Add 3 experiences
+        for _ in 0..3 {
+            let exp = test_experience(collective.id, 384);
+            storage.save_experience(&exp).unwrap();
+        }
+
+        // Count should be 3
+        assert_eq!(
+            storage
+                .count_experiences_in_collective(collective.id)
+                .unwrap(),
+            3
+        );
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_cascade_delete_includes_experiences() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let collective = Collective::new("test", 384);
+        storage.save_collective(&collective).unwrap();
+
+        let exp1 = test_experience(collective.id, 384);
+        let exp2 = test_experience(collective.id, 384);
+        let id1 = exp1.id;
+        let id2 = exp2.id;
+        storage.save_experience(&exp1).unwrap();
+        storage.save_experience(&exp2).unwrap();
+
+        // Cascade delete
+        let count = storage
+            .delete_experiences_by_collective(collective.id)
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // Verify experiences are gone
+        assert!(storage.get_experience(id1).unwrap().is_none());
+        assert!(storage.get_experience(id2).unwrap().is_none());
+        assert!(storage.get_embedding(id1).unwrap().is_none());
+        assert!(storage.get_embedding(id2).unwrap().is_none());
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_update_experience_archived_flag() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let collective = Collective::new("test", 384);
+        storage.save_collective(&collective).unwrap();
+
+        let exp = test_experience(collective.id, 384);
+        let exp_id = exp.id;
+        storage.save_experience(&exp).unwrap();
+
+        // Archive
+        let update = ExperienceUpdate {
+            archived: Some(true),
+            ..Default::default()
+        };
+        storage.update_experience(exp_id, &update).unwrap();
+
+        let retrieved = storage.get_experience(exp_id).unwrap().unwrap();
+        assert!(retrieved.archived);
+
+        // Unarchive
+        let update = ExperienceUpdate {
+            archived: Some(false),
+            ..Default::default()
+        };
+        storage.update_experience(exp_id, &update).unwrap();
+
+        let retrieved = storage.get_experience(exp_id).unwrap().unwrap();
+        assert!(!retrieved.archived);
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_f32_byte_conversion_roundtrip() {
+        let original = vec![0.0, 1.0, -1.0, f32::MAX, f32::MIN, std::f32::consts::PI];
+        let bytes = f32_slice_to_bytes(&original);
+        assert_eq!(bytes.len(), original.len() * 4);
+
+        let restored = bytes_to_f32_vec(&bytes);
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn test_experience_with_all_type_variants() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let collective = Collective::new("test", 384);
+        storage.save_collective(&collective).unwrap();
+
+        // Save one experience per type variant
+        let types = vec![
+            ExperienceType::Difficulty {
+                description: "test".into(),
+                severity: Severity::High,
+            },
+            ExperienceType::Solution {
+                problem_ref: None,
+                approach: "test".into(),
+                worked: true,
+            },
+            ExperienceType::ErrorPattern {
+                signature: "E0308".into(),
+                fix: "check types".into(),
+                prevention: "use clippy".into(),
+            },
+            ExperienceType::SuccessPattern {
+                task_type: "refactor".into(),
+                approach: "extract method".into(),
+                quality: 0.9,
+            },
+            ExperienceType::UserPreference {
+                category: "style".into(),
+                preference: "snake_case".into(),
+                strength: 1.0,
+            },
+            ExperienceType::ArchitecturalDecision {
+                decision: "use redb".into(),
+                rationale: "pure Rust".into(),
+            },
+            ExperienceType::TechInsight {
+                technology: "tokio".into(),
+                insight: "spawn_blocking".into(),
+            },
+            ExperienceType::Fact {
+                statement: "Rust is safe".into(),
+                source: "docs".into(),
+            },
+            ExperienceType::Generic { category: None },
+        ];
+
+        for experience_type in types {
+            let mut exp = test_experience(collective.id, 384);
+            exp.experience_type = experience_type;
+            storage.save_experience(&exp).unwrap();
+
+            // Verify roundtrip
+            let retrieved = storage.get_experience(exp.id).unwrap().unwrap();
+            assert_eq!(
+                retrieved.experience_type.type_tag(),
+                exp.experience_type.type_tag()
+            );
+        }
+
+        assert_eq!(
+            storage
+                .count_experiences_in_collective(collective.id)
+                .unwrap(),
+            9
+        );
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_reinforce_experience_atomic() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let collective = Collective::new("test", 384);
+        storage.save_collective(&collective).unwrap();
+
+        let exp = test_experience(collective.id, 384);
+        let exp_id = exp.id;
+        storage.save_experience(&exp).unwrap();
+
+        // Reinforce 3 times
+        assert_eq!(storage.reinforce_experience(exp_id).unwrap(), Some(1));
+        assert_eq!(storage.reinforce_experience(exp_id).unwrap(), Some(2));
+        assert_eq!(storage.reinforce_experience(exp_id).unwrap(), Some(3));
+
+        // Verify the stored value
+        let retrieved = storage.get_experience(exp_id).unwrap().unwrap();
+        assert_eq!(retrieved.applications, 3);
+
+        // Verify embedding was NOT re-written (still intact)
+        let emb = storage.get_embedding(exp_id).unwrap().unwrap();
+        assert_eq!(emb.len(), 384);
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_reinforce_experience_nonexistent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let result = storage.reinforce_experience(ExperienceId::new()).unwrap();
+        assert!(result.is_none());
+
+        Box::new(storage).close().unwrap();
     }
 }

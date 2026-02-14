@@ -48,13 +48,13 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const MAX_CONTENT_SIZE: usize = 100 * 1024;
 
 /// Maximum number of domain tags per experience.
-pub const MAX_DOMAIN_TAGS: usize = 10;
+pub const MAX_DOMAIN_TAGS: usize = 50;
 
 /// Maximum length of a single domain tag.
 pub const MAX_TAG_LENGTH: usize = 100;
 
 /// Maximum number of source files per experience.
-pub const MAX_SOURCE_FILES: usize = 10;
+pub const MAX_SOURCE_FILES: usize = 100;
 
 /// Maximum length of a single source file path.
 pub const MAX_FILE_PATH_LENGTH: usize = 500;
@@ -96,7 +96,7 @@ pub const EXPERIENCES_BY_COLLECTIVE_TABLE: MultimapTableDefinition<&[u8; 16], &[
 
 /// Index: Experiences by collective and type.
 ///
-/// Enables efficient queries like "all Lesson experiences in collective X".
+/// Enables efficient queries like "all ErrorPattern experiences in collective X".
 /// Key: (CollectiveId bytes, ExperienceTypeTag byte) = 17 bytes
 /// Value: ExperienceId as 16-byte UUID
 ///
@@ -118,34 +118,41 @@ pub const EMBEDDINGS_TABLE: TableDefinition<&[u8; 16], &[u8]> = TableDefinition:
 /// Compact discriminant for experience types, used in secondary index keys.
 ///
 /// Each variant maps to a single byte (`repr(u8)`), making index keys small
-/// and comparison fast. The full `ExperienceType` enum (with any associated
-/// data) lives in `experience/types.rs` and will derive its tag via a
-/// `type_tag()` method.
+/// and comparison fast. The full `ExperienceType` enum (with associated data)
+/// lives in `experience/types.rs` and bridges to this tag via `type_tag()`.
 ///
-/// # Variants
+/// # Variants (9, per ADR-004 / Data Model spec)
 ///
-/// These match the Phase 1 spec's `ExperienceType` enum:
-/// - `Observation` — Something the agent noticed
-/// - `Decision` — A choice the agent made
-/// - `Outcome` — Result of a decision
-/// - `Lesson` — A learned principle
-/// - `Pattern` — A recurring pattern
-/// - `Preference` — A user or agent preference
+/// - `Difficulty` — Problem encountered by the agent
+/// - `Solution` — Fix for a problem (can link to Difficulty)
+/// - `ErrorPattern` — Reusable error signature + fix + prevention
+/// - `SuccessPattern` — Proven approach with quality rating
+/// - `UserPreference` — User preference with strength
+/// - `ArchitecturalDecision` — Design decision with rationale
+/// - `TechInsight` — Technical knowledge about a technology
+/// - `Fact` — Verified factual statement with source
+/// - `Generic` — Catch-all for uncategorized experiences
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ExperienceTypeTag {
-    /// Something the agent observed.
-    Observation = 0,
-    /// A choice the agent made.
-    Decision = 1,
-    /// Result of a decision or action.
-    Outcome = 2,
-    /// A learned principle or rule.
-    Lesson = 3,
-    /// A recurring pattern.
-    Pattern = 4,
-    /// A user or agent preference.
-    Preference = 5,
+    /// Problem encountered by the agent.
+    Difficulty = 0,
+    /// Fix for a problem (can reference a Difficulty).
+    Solution = 1,
+    /// Reusable error signature with fix and prevention.
+    ErrorPattern = 2,
+    /// Proven approach with quality rating.
+    SuccessPattern = 3,
+    /// User preference with strength.
+    UserPreference = 4,
+    /// Design decision with rationale.
+    ArchitecturalDecision = 5,
+    /// Technical knowledge about a technology.
+    TechInsight = 6,
+    /// Verified factual statement with source.
+    Fact = 7,
+    /// Catch-all for uncategorized experiences.
+    Generic = 8,
 }
 
 impl ExperienceTypeTag {
@@ -154,12 +161,15 @@ impl ExperienceTypeTag {
     /// Returns `None` if the byte doesn't correspond to a known variant.
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
-            0 => Some(Self::Observation),
-            1 => Some(Self::Decision),
-            2 => Some(Self::Outcome),
-            3 => Some(Self::Lesson),
-            4 => Some(Self::Pattern),
-            5 => Some(Self::Preference),
+            0 => Some(Self::Difficulty),
+            1 => Some(Self::Solution),
+            2 => Some(Self::ErrorPattern),
+            3 => Some(Self::SuccessPattern),
+            4 => Some(Self::UserPreference),
+            5 => Some(Self::ArchitecturalDecision),
+            6 => Some(Self::TechInsight),
+            7 => Some(Self::Fact),
+            8 => Some(Self::Generic),
             _ => None,
         }
     }
@@ -167,12 +177,15 @@ impl ExperienceTypeTag {
     /// Returns all variants in discriminant order.
     pub fn all() -> &'static [Self] {
         &[
-            Self::Observation,
-            Self::Decision,
-            Self::Outcome,
-            Self::Lesson,
-            Self::Pattern,
-            Self::Preference,
+            Self::Difficulty,
+            Self::Solution,
+            Self::ErrorPattern,
+            Self::SuccessPattern,
+            Self::UserPreference,
+            Self::ArchitecturalDecision,
+            Self::TechInsight,
+            Self::Fact,
+            Self::Generic,
         ]
     }
 }
@@ -389,15 +402,16 @@ mod tests {
     #[test]
     fn test_experience_type_tag_from_u8_invalid() {
         assert!(ExperienceTypeTag::from_u8(255).is_none());
-        assert!(ExperienceTypeTag::from_u8(6).is_none());
+        assert!(ExperienceTypeTag::from_u8(9).is_none());
     }
 
     #[test]
     fn test_experience_type_tag_all_variants() {
         let all = ExperienceTypeTag::all();
-        assert_eq!(all.len(), 6);
-        assert_eq!(all[0], ExperienceTypeTag::Observation);
-        assert_eq!(all[5], ExperienceTypeTag::Preference);
+        assert_eq!(all.len(), 9);
+        assert_eq!(all[0], ExperienceTypeTag::Difficulty);
+        assert_eq!(all[5], ExperienceTypeTag::ArchitecturalDecision);
+        assert_eq!(all[8], ExperienceTypeTag::Generic);
     }
 
     #[test]
@@ -416,7 +430,7 @@ mod tests {
     #[test]
     fn test_encode_type_index_key_roundtrip() {
         let collective_id = [7u8; 16];
-        let tag = ExperienceTypeTag::Lesson;
+        let tag = ExperienceTypeTag::SuccessPattern;
 
         let key = encode_type_index_key(&collective_id, tag);
 
@@ -428,8 +442,8 @@ mod tests {
     fn test_type_index_key_different_types_produce_different_keys() {
         let collective_id = [1u8; 16];
 
-        let key_obs = encode_type_index_key(&collective_id, ExperienceTypeTag::Observation);
-        let key_les = encode_type_index_key(&collective_id, ExperienceTypeTag::Lesson);
+        let key_obs = encode_type_index_key(&collective_id, ExperienceTypeTag::Difficulty);
+        let key_les = encode_type_index_key(&collective_id, ExperienceTypeTag::SuccessPattern);
 
         assert_ne!(key_obs, key_les);
         // Same collective prefix
@@ -442,7 +456,7 @@ mod tests {
     fn test_type_index_key_different_collectives_produce_different_keys() {
         let id_a = [1u8; 16];
         let id_b = [2u8; 16];
-        let tag = ExperienceTypeTag::Decision;
+        let tag = ExperienceTypeTag::Solution;
 
         let key_a = encode_type_index_key(&id_a, tag);
         let key_b = encode_type_index_key(&id_b, tag);

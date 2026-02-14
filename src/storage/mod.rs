@@ -33,7 +33,8 @@ use std::path::Path;
 use crate::collective::Collective;
 use crate::config::Config;
 use crate::error::Result;
-use crate::types::CollectiveId;
+use crate::experience::{Experience, ExperienceUpdate};
+use crate::types::{CollectiveId, ExperienceId};
 
 /// Storage engine trait for PulseDB.
 ///
@@ -152,6 +153,68 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// Returns an error if the write transaction fails.
     fn delete_experiences_by_collective(&self, id: CollectiveId) -> Result<u64>;
+
+    // =========================================================================
+    // Experience Storage Operations
+    // =========================================================================
+
+    /// Saves an experience and its embedding to storage.
+    ///
+    /// Writes atomically to 4 tables in a single transaction:
+    /// - `EXPERIENCES_TABLE` — the experience record (without embedding)
+    /// - `EMBEDDINGS_TABLE` — the embedding vector as raw f32 bytes
+    /// - `EXPERIENCES_BY_COLLECTIVE_TABLE` — secondary index by collective+timestamp
+    /// - `EXPERIENCES_BY_TYPE_TABLE` — secondary index by collective+type
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction or serialization fails.
+    fn save_experience(&self, experience: &Experience) -> Result<()>;
+
+    /// Retrieves an experience by ID, including its embedding.
+    ///
+    /// Reads from both `EXPERIENCES_TABLE` and `EMBEDDINGS_TABLE` to
+    /// reconstitute the full experience with embedding.
+    ///
+    /// Returns `None` if no experience with the given ID exists.
+    fn get_experience(&self, id: ExperienceId) -> Result<Option<Experience>>;
+
+    /// Updates mutable fields of an experience.
+    ///
+    /// Applies only the `Some` fields from the update. Immutable fields
+    /// (content, embedding, collective_id, type) are not affected.
+    ///
+    /// Returns `true` if the experience existed and was updated,
+    /// `false` if not found.
+    fn update_experience(&self, id: ExperienceId, update: &ExperienceUpdate) -> Result<bool>;
+
+    /// Permanently deletes an experience and its embedding.
+    ///
+    /// Removes from all 4 tables in a single transaction.
+    ///
+    /// Returns `true` if the experience existed and was deleted,
+    /// `false` if not found.
+    fn delete_experience(&self, id: ExperienceId) -> Result<bool>;
+
+    /// Atomically increments the applications counter for an experience.
+    ///
+    /// Performs a read-modify-write in a single write transaction to prevent
+    /// lost updates under concurrent access. Uses saturating arithmetic
+    /// (caps at `u32::MAX`, never panics).
+    ///
+    /// Returns `Some(new_count)` if the experience was found and updated,
+    /// `None` if no experience with the given ID exists.
+    fn reinforce_experience(&self, id: ExperienceId) -> Result<Option<u32>>;
+
+    /// Saves an embedding vector to storage.
+    ///
+    /// The embedding is stored as raw little-endian f32 bytes.
+    fn save_embedding(&self, id: ExperienceId, embedding: &[f32]) -> Result<()>;
+
+    /// Retrieves an embedding vector by experience ID.
+    ///
+    /// Returns `None` if no embedding exists for the given ID.
+    fn get_embedding(&self, id: ExperienceId) -> Result<Option<Vec<f32>>>;
 }
 
 /// Opens a storage engine at the given path.
