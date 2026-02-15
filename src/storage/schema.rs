@@ -59,6 +59,9 @@ pub const MAX_SOURCE_FILES: usize = 100;
 /// Maximum length of a single source file path.
 pub const MAX_FILE_PATH_LENGTH: usize = 500;
 
+/// Maximum length of a source agent identifier.
+pub const MAX_SOURCE_AGENT_LENGTH: usize = 256;
+
 // ============================================================================
 // Table Definitions
 // ============================================================================

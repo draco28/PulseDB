@@ -5,8 +5,8 @@
 //! pre-computed embeddings of the correct dimension (384 for D384).
 
 use pulsedb::{
-    CollectiveId, Config, ExperienceId, ExperienceType, ExperienceUpdate, NewExperience, PulseDB,
-    Severity,
+    AgentId, CollectiveId, Config, ExperienceId, ExperienceType, ExperienceUpdate, NewExperience,
+    PulseDB, Severity,
 };
 use tempfile::tempdir;
 
@@ -707,6 +707,99 @@ fn test_update_experience_importance_out_of_range_rejected() {
     // Verify original value unchanged
     let exp = db.get_experience(id).unwrap().unwrap();
     assert_eq!(exp.importance, 0.5);
+
+    db.close().unwrap();
+}
+
+// ============================================================================
+// ExperienceType Variant Validation (ticket #5)
+// ============================================================================
+
+#[test]
+fn test_record_experience_success_pattern_quality_out_of_range_rejected() {
+    let (db, cid, _dir) = open_db_with_collective();
+
+    let result = db.record_experience(NewExperience {
+        collective_id: cid,
+        content: "valid content".to_string(),
+        embedding: Some(dummy_embedding()),
+        experience_type: ExperienceType::SuccessPattern {
+            task_type: "test".into(),
+            approach: "test".into(),
+            quality: 1.5,
+        },
+        ..Default::default()
+    });
+
+    assert!(result.is_err());
+    assert!(result.unwrap_err().is_validation());
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_record_experience_user_preference_strength_out_of_range_rejected() {
+    let (db, cid, _dir) = open_db_with_collective();
+
+    let result = db.record_experience(NewExperience {
+        collective_id: cid,
+        content: "valid content".to_string(),
+        embedding: Some(dummy_embedding()),
+        experience_type: ExperienceType::UserPreference {
+            category: "style".into(),
+            preference: "dark mode".into(),
+            strength: -0.1,
+        },
+        ..Default::default()
+    });
+
+    assert!(result.is_err());
+    assert!(result.unwrap_err().is_validation());
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_record_experience_source_agent_too_long_rejected() {
+    let (db, cid, _dir) = open_db_with_collective();
+
+    let result = db.record_experience(NewExperience {
+        collective_id: cid,
+        content: "valid content".to_string(),
+        embedding: Some(dummy_embedding()),
+        source_agent: AgentId::new("a".repeat(257)),
+        ..Default::default()
+    });
+
+    assert!(result.is_err());
+    assert!(result.unwrap_err().is_validation());
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_record_experience_success_pattern_valid_quality_accepted() {
+    let (db, cid, _dir) = open_db_with_collective();
+
+    let id = db
+        .record_experience(NewExperience {
+            collective_id: cid,
+            content: "valid content".to_string(),
+            embedding: Some(dummy_embedding()),
+            experience_type: ExperienceType::SuccessPattern {
+                task_type: "refactoring".into(),
+                approach: "extract method".into(),
+                quality: 0.95,
+            },
+            ..Default::default()
+        })
+        .unwrap();
+
+    let exp = db.get_experience(id).unwrap().unwrap();
+    assert!(matches!(
+        exp.experience_type,
+        ExperienceType::SuccessPattern { quality, .. } if (quality - 0.95).abs() < f32::EPSILON
+    ));
 
     db.close().unwrap();
 }
