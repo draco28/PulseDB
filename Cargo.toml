@@ -14,7 +14,7 @@ readme = "README.md"
 
 [features]
 default = []
-builtin-embeddings = ["ort"]
+builtin-embeddings = ["ort", "tokenizers", "ndarray", "dirs", "ureq"]
 
 [dependencies]
 # Storage - redb is a pure Rust embedded KV store with ACID transactions
@@ -34,7 +34,19 @@ thiserror = "1.0"
 tracing = "0.1"
 
 # Optional: ONNX runtime for builtin embedding generation
-ort = { version = "2.0.0-rc.9", optional = true }
+ort = { version = "2.0.0-rc.9", optional = true, features = ["ndarray"] }
+
+# Optional: HuggingFace tokenizer for text preprocessing (WordPiece, BPE)
+tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
+
+# Optional: N-dimensional arrays for ONNX tensor construction (must match ort's ndarray version)
+ndarray = { version = "0.17", optional = true }
+
+# Optional: Cross-platform cache directory resolution
+dirs = { version = "5.0", optional = true }
+
+# Optional: HTTP client for model downloads from HuggingFace
+ureq = { version = "3.0", optional = true }
 
 [dev-dependencies]
 # Testing utilities
