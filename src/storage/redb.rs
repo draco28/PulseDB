@@ -413,6 +413,23 @@ impl StorageEngine for RedbStorage {
         Ok(count)
     }
 
+    fn list_experience_ids_in_collective(&self, id: CollectiveId) -> Result<Vec<ExperienceId>> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let table = read_txn.open_multimap_table(EXPERIENCES_BY_COLLECTIVE_TABLE)?;
+
+        let mut ids = Vec::new();
+        for result in table.get(id.as_bytes())? {
+            let value = result.map_err(StorageError::from)?;
+            let entry = value.value();
+            // Entry is [timestamp: 8 bytes][experience_id: 16 bytes]
+            let mut exp_bytes = [0u8; 16];
+            exp_bytes.copy_from_slice(&entry[8..24]);
+            ids.push(ExperienceId::from_bytes(exp_bytes));
+        }
+
+        Ok(ids)
+    }
+
     // =========================================================================
     // Experience Storage Operations
     // =========================================================================

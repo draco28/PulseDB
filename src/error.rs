@@ -54,6 +54,10 @@ pub enum PulseDBError {
     /// Embedding generation/validation error.
     #[error("Embedding error: {0}")]
     Embedding(String),
+
+    /// Vector index error (HNSW operations).
+    #[error("Vector index error: {0}")]
+    Vector(String),
 }
 
 impl PulseDBError {
@@ -69,6 +73,11 @@ impl PulseDBError {
         Self::Embedding(msg.into())
     }
 
+    /// Creates a vector index error with the given message.
+    pub fn vector(msg: impl Into<String>) -> Self {
+        Self::Vector(msg.into())
+    }
+
     /// Returns true if this is a "not found" error.
     pub fn is_not_found(&self) -> bool {
         matches!(self, Self::NotFound(_))
@@ -82,6 +91,11 @@ impl PulseDBError {
     /// Returns true if this is a storage error.
     pub fn is_storage(&self) -> bool {
         matches!(self, Self::Storage(_))
+    }
+
+    /// Returns true if this is a vector index error.
+    pub fn is_vector(&self) -> bool {
+        matches!(self, Self::Vector(_))
     }
 }
 
@@ -405,6 +419,14 @@ mod tests {
         let err: PulseDBError = ValidationError::required_field("content").into();
         assert!(err.is_validation());
         assert!(!err.is_not_found());
+    }
+
+    #[test]
+    fn test_vector_error_display() {
+        let err = PulseDBError::vector("HNSW insert failed");
+        assert_eq!(err.to_string(), "Vector index error: HNSW insert failed");
+        assert!(err.is_vector());
+        assert!(!err.is_storage());
     }
 
     #[test]

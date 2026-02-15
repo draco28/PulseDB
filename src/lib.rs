@@ -84,6 +84,9 @@ pub mod storage;
 mod collective;
 mod experience;
 
+/// Vector index module for HNSW-based approximate nearest neighbor search.
+pub mod vector;
+
 // ============================================================================
 // Public API re-exports
 // ============================================================================
@@ -92,7 +95,7 @@ mod experience;
 pub use db::PulseDB;
 
 // Configuration
-pub use config::{Config, EmbeddingDimension, EmbeddingProvider, SyncMode};
+pub use config::{Config, EmbeddingDimension, EmbeddingProvider, HnswConfig, SyncMode};
 
 // Error handling
 pub use error::{NotFoundError, PulseDBError, Result, StorageError, ValidationError};

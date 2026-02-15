@@ -154,6 +154,12 @@ pub trait StorageEngine: Send + Sync {
     /// Returns an error if the write transaction fails.
     fn delete_experiences_by_collective(&self, id: CollectiveId) -> Result<u64>;
 
+    /// Lists all experience IDs belonging to a collective.
+    ///
+    /// Used to rebuild HNSW indexes from redb embeddings on startup.
+    /// Iterates the `experiences_by_collective` multimap index.
+    fn list_experience_ids_in_collective(&self, id: CollectiveId) -> Result<Vec<ExperienceId>>;
+
     // =========================================================================
     // Experience Storage Operations
     // =========================================================================

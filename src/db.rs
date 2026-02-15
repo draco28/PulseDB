@@ -50,9 +50,11 @@
 //! });
 //! ```
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::collective::types::CollectiveStats;
 use crate::collective::{validate_collective_name, Collective};
@@ -65,6 +67,7 @@ use crate::experience::{
 };
 use crate::storage::{open_storage, DatabaseMetadata, StorageEngine};
 use crate::types::{CollectiveId, ExperienceId, Timestamp};
+use crate::vector::HnswIndex;
 
 /// The main PulseDB database handle.
 ///
@@ -85,13 +88,21 @@ pub struct PulseDB {
 
     /// Configuration used to open this database.
     config: Config,
+
+    /// Per-collective HNSW vector indexes for semantic search.
+    ///
+    /// Outer RwLock protects the HashMap (add/remove collectives).
+    /// Each HnswIndex has its own internal RwLock for concurrent search+insert.
+    vectors: RwLock<HashMap<CollectiveId, HnswIndex>>,
 }
 
 impl std::fmt::Debug for PulseDB {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let vector_count = self.vectors.read().map(|v| v.len()).unwrap_or(0);
         f.debug_struct("PulseDB")
             .field("config", &self.config)
             .field("embedding_dimension", &self.embedding_dimension())
+            .field("vector_indexes", &vector_count)
             .finish_non_exhaustive()
     }
 }
@@ -144,9 +155,13 @@ impl PulseDB {
         // Create embedding service
         let embedding = create_embedding_service(&config)?;
 
+        // Load or rebuild HNSW indexes for all existing collectives
+        let vectors = Self::load_all_indexes(&*storage, &config)?;
+
         info!(
             dimension = config.embedding_dimension.size(),
             sync_mode = ?config.sync_mode,
+            collectives = vectors.len(),
             "PulseDB opened successfully"
         );
 
@@ -154,6 +169,7 @@ impl PulseDB {
             storage,
             embedding,
             config,
+            vectors: RwLock::new(vectors),
         })
     }
 
@@ -182,6 +198,25 @@ impl PulseDB {
     #[instrument(skip(self))]
     pub fn close(self) -> Result<()> {
         info!("Closing PulseDB");
+
+        // Persist HNSW indexes BEFORE closing storage.
+        // If HNSW save fails, storage is still open for potential recovery.
+        // On next open(), stale/missing HNSW files trigger a rebuild from redb.
+        if let Some(hnsw_dir) = self.hnsw_dir() {
+            let vectors = self
+                .vectors
+                .read()
+                .map_err(|_| PulseDBError::vector("Vectors lock poisoned during close"))?;
+            for (collective_id, index) in vectors.iter() {
+                if let Err(e) = index.save_to_dir(&hnsw_dir, &collective_id.to_string()) {
+                    warn!(
+                        collective = %collective_id,
+                        error = %e,
+                        "Failed to save HNSW index (will rebuild on next open)"
+                    );
+                }
+            }
+        }
 
         // Close storage (flushes pending writes)
         self.storage.close()?;
@@ -241,6 +276,109 @@ impl PulseDB {
     }
 
     // =========================================================================
+    // HNSW Index Lifecycle
+    // =========================================================================
+
+    /// Returns the directory for HNSW index files.
+    ///
+    /// Derives `{db_path}.hnsw/` from the storage path. Returns `None` if
+    /// the storage has no file path (e.g., in-memory tests).
+    fn hnsw_dir(&self) -> Option<PathBuf> {
+        self.storage.path().map(|p| {
+            let mut hnsw_path = p.as_os_str().to_owned();
+            hnsw_path.push(".hnsw");
+            PathBuf::from(hnsw_path)
+        })
+    }
+
+    /// Loads or rebuilds HNSW indexes for all existing collectives.
+    ///
+    /// For each collective in storage:
+    /// 1. Try loading metadata from `.hnsw.meta` file
+    /// 2. Rebuild the graph from redb embeddings (always, since we can't
+    ///    load the graph due to hnsw_rs lifetime constraints)
+    /// 3. Restore deleted set from metadata if available
+    fn load_all_indexes(
+        storage: &dyn StorageEngine,
+        config: &Config,
+    ) -> Result<HashMap<CollectiveId, HnswIndex>> {
+        let collectives = storage.list_collectives()?;
+        let mut vectors = HashMap::with_capacity(collectives.len());
+
+        let hnsw_dir = storage.path().map(|p| {
+            let mut hnsw_path = p.as_os_str().to_owned();
+            hnsw_path.push(".hnsw");
+            PathBuf::from(hnsw_path)
+        });
+
+        for collective in &collectives {
+            let dimension = collective.embedding_dimension as usize;
+
+            // List all experience IDs in this collective
+            let exp_ids = storage.list_experience_ids_in_collective(collective.id)?;
+
+            // Load embeddings from redb (source of truth)
+            let mut embeddings = Vec::with_capacity(exp_ids.len());
+            for exp_id in &exp_ids {
+                if let Some(embedding) = storage.get_embedding(*exp_id)? {
+                    embeddings.push((*exp_id, embedding));
+                }
+            }
+
+            // Try loading metadata (for deleted set and ID mappings)
+            let metadata = hnsw_dir
+                .as_ref()
+                .and_then(|dir| HnswIndex::load_metadata(dir, &collective.id.to_string()).ok())
+                .flatten();
+
+            // Rebuild the HNSW graph from embeddings
+            let index = if embeddings.is_empty() {
+                HnswIndex::new(dimension, &config.hnsw)
+            } else {
+                let start = std::time::Instant::now();
+                let idx = HnswIndex::rebuild_from_embeddings(dimension, &config.hnsw, embeddings)?;
+                info!(
+                    collective = %collective.id,
+                    vectors = idx.active_count(),
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "Rebuilt HNSW index from redb embeddings"
+                );
+                idx
+            };
+
+            // Restore deleted set from metadata if available
+            if let Some(meta) = metadata {
+                index.restore_deleted_set(&meta.deleted)?;
+            }
+
+            vectors.insert(collective.id, index);
+        }
+
+        Ok(vectors)
+    }
+
+    /// Executes a closure with the HNSW index for a collective.
+    ///
+    /// This is the primary accessor for vector search operations (used by
+    /// `search_similar()`). The closure runs while the outer RwLock guard
+    /// is held (read lock), so the HnswIndex reference stays valid.
+    /// Returns `None` if no index exists for the collective.
+    #[doc(hidden)]
+    pub fn with_vector_index<F, R>(&self, collective_id: CollectiveId, f: F) -> Result<Option<R>>
+    where
+        F: FnOnce(&HnswIndex) -> Result<R>,
+    {
+        let vectors = self
+            .vectors
+            .read()
+            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
+        match vectors.get(&collective_id) {
+            Some(index) => Ok(Some(f(index)?)),
+            None => Ok(None),
+        }
+    }
+
+    // =========================================================================
     // Test Helpers
     // =========================================================================
 
@@ -286,7 +424,15 @@ impl PulseDB {
         let collective = Collective::new(name, dimension);
         let id = collective.id;
 
+        // Persist to redb first (source of truth)
         self.storage.save_collective(&collective)?;
+
+        // Create empty HNSW index for this collective
+        let index = HnswIndex::new(dimension as usize, &self.config.hnsw);
+        self.vectors
+            .write()
+            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?
+            .insert(id, index);
 
         info!(id = %id, name = %name, "Collective created");
         Ok(id)
@@ -320,7 +466,15 @@ impl PulseDB {
         let collective = Collective::with_owner(name, owner_id, dimension);
         let id = collective.id;
 
+        // Persist to redb first (source of truth)
         self.storage.save_collective(&collective)?;
+
+        // Create empty HNSW index for this collective
+        let index = HnswIndex::new(dimension as usize, &self.config.hnsw);
+        self.vectors
+            .write()
+            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?
+            .insert(id, index);
 
         info!(id = %id, name = %name, owner = %owner_id, "Collective created with owner");
         Ok(id)
@@ -409,8 +563,25 @@ impl PulseDB {
             info!(count = deleted_count, "Cascade-deleted experiences");
         }
 
-        // Delete the collective record
+        // Delete the collective record from storage
         self.storage.delete_collective(id)?;
+
+        // Remove HNSW index from memory
+        self.vectors
+            .write()
+            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?
+            .remove(&id);
+
+        // Remove HNSW files from disk (non-fatal if fails)
+        if let Some(hnsw_dir) = self.hnsw_dir() {
+            if let Err(e) = HnswIndex::remove_files(&hnsw_dir, &id.to_string()) {
+                warn!(
+                    collective = %id,
+                    error = %e,
+                    "Failed to remove HNSW files (non-fatal)"
+                );
+            }
+        }
 
         info!(id = %id, "Collective deleted");
         Ok(())
@@ -459,10 +630,14 @@ impl PulseDB {
             }
         };
 
+        // Clone embedding for HNSW insertion (~1.5KB for 384d, negligible vs I/O)
+        let embedding_for_hnsw = embedding.clone();
+        let collective_id = exp.collective_id;
+
         // Construct the full experience record
         let experience = Experience {
             id: ExperienceId::new(),
-            collective_id: exp.collective_id,
+            collective_id,
             content: exp.content,
             embedding,
             experience_type: exp.experience_type,
@@ -478,7 +653,19 @@ impl PulseDB {
         };
 
         let id = experience.id;
+
+        // Write to redb FIRST (source of truth). If crash happens after
+        // this but before HNSW insert, rebuild on next open will include it.
         self.storage.save_experience(&experience)?;
+
+        // Insert into HNSW index (derived structure)
+        let vectors = self
+            .vectors
+            .read()
+            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
+        if let Some(index) = vectors.get(&collective_id) {
+            index.insert_experience(id, &embedding_for_hnsw)?;
+        }
 
         info!(id = %id, "Experience recorded");
         Ok(id)
@@ -561,9 +748,26 @@ impl PulseDB {
     /// Returns [`NotFoundError::Experience`] if the experience doesn't exist.
     #[instrument(skip(self))]
     pub fn delete_experience(&self, id: ExperienceId) -> Result<()> {
-        let deleted = self.storage.delete_experience(id)?;
-        if !deleted {
-            return Err(PulseDBError::from(NotFoundError::experience(id)));
+        // Read experience first to get collective_id for HNSW lookup.
+        // This adds one extra read, but delete is not a hot path.
+        let experience = self
+            .storage
+            .get_experience(id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::experience(id)))?;
+
+        // Delete from redb FIRST (source of truth). If crash happens after
+        // this but before HNSW soft-delete, on reopen the experience won't be
+        // loaded from redb, so it's automatically excluded from the rebuilt index.
+        self.storage.delete_experience(id)?;
+
+        // Soft-delete from HNSW index (mark as deleted, not removed from graph).
+        // This takes effect immediately for the current session's searches.
+        let vectors = self
+            .vectors
+            .read()
+            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
+        if let Some(index) = vectors.get(&experience.collective_id) {
+            index.delete_experience(id)?;
         }
 
         info!(id = %id, "Experience deleted");
