@@ -211,11 +211,9 @@ pub fn create_embedding_service(
 
         #[cfg(feature = "builtin-embeddings")]
         EmbeddingProvider::Builtin { model_path } => {
-            // TODO: Implement in E1-S04
-            let _ = model_path;
-            Err(PulseDBError::embedding(
-                "Builtin embeddings not yet implemented (coming in E1-S04)",
-            ))
+            let dim = config.embedding_dimension.size();
+            let service = onnx::OnnxEmbedding::with_dimension(model_path.clone(), dim)?;
+            Ok(Box::new(service))
         }
 
         #[cfg(not(feature = "builtin-embeddings"))]
@@ -278,10 +276,11 @@ mod tests {
     }
 
     #[test]
-    fn test_create_embedding_service_builtin_not_implemented() {
+    fn test_create_embedding_service_builtin_requires_model() {
         let config = crate::config::Config::with_builtin_embeddings();
         let result = create_embedding_service(&config);
-        // Should fail because builtin is not yet implemented
+        // Fails because model files aren't downloaded (expected in CI/test)
+        // In production, users call OnnxEmbedding::download_default_model() first
         assert!(result.is_err());
     }
 }
