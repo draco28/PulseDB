@@ -87,10 +87,10 @@ jobs:
         run: cargo test ${{ matrix.features }}
 
   # ─────────────────────────────────────────────
-  # Job 3: MSRV verification (Rust 1.85)
+  # Job 3: MSRV verification (Rust 1.88)
   # ─────────────────────────────────────────────
   test-msrv:
-    name: MSRV (Rust 1.85)
+    name: MSRV (Rust 1.88)
     needs: lint
     runs-on: ubuntu-latest
     steps:
@@ -98,19 +98,23 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.85"
+          toolchain: "1.88"
 
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: msrv
 
-      # MSRV applies to default features only.
-      # builtin-embeddings depends on ort which requires a newer rustc.
       - name: Build (default features)
         run: cargo build
 
       - name: Test (default features)
         run: cargo test
+
+      - name: Build (builtin-embeddings)
+        run: cargo build --features builtin-embeddings
+
+      - name: Test (builtin-embeddings)
+        run: cargo test --features builtin-embeddings
 
   # ─────────────────────────────────────────────
   # Job 4: Code coverage
