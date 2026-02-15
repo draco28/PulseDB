@@ -1,0 +1,189 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs when new commits are pushed to the same PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Job 1: Format & Lint (fast-fail gate)
+  # ─────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: lint
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy (default features)
+        run: cargo clippy -- -D warnings
+
+      - name: Clippy (builtin-embeddings)
+        run: cargo clippy --features builtin-embeddings -- -D warnings
+
+  # ─────────────────────────────────────────────
+  # Job 2: Test matrix (3 OS x 2 feature sets)
+  # ─────────────────────────────────────────────
+  test:
+    name: Test (${{ matrix.name }})
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            features: ""
+            name: Linux / default
+          - os: ubuntu-latest
+            features: "--features builtin-embeddings"
+            name: Linux / builtin-embeddings
+          - os: macos-latest
+            features: ""
+            name: macOS / default
+          - os: macos-latest
+            features: "--features builtin-embeddings"
+            name: macOS / builtin-embeddings
+          - os: windows-latest
+            features: ""
+            name: Windows / default
+          - os: windows-latest
+            features: "--features builtin-embeddings"
+            name: Windows / builtin-embeddings
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "test-${{ matrix.os }}"
+
+      - name: Build
+        run: cargo build ${{ matrix.features }}
+
+      - name: Run tests
+        run: cargo test ${{ matrix.features }}
+
+  # ─────────────────────────────────────────────
+  # Job 3: MSRV verification (Rust 1.88)
+  # ─────────────────────────────────────────────
+  test-msrv:
+    name: MSRV (Rust 1.88)
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: msrv
+
+      - name: Build (default features)
+        run: cargo build
+
+      - name: Test (default features)
+        run: cargo test
+
+      - name: Build (builtin-embeddings)
+        run: cargo build --features builtin-embeddings
+
+      - name: Test (builtin-embeddings)
+        run: cargo test --features builtin-embeddings
+
+  # ─────────────────────────────────────────────
+  # Job 4: Code coverage
+  # ─────────────────────────────────────────────
+  coverage:
+    name: Coverage
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: coverage
+
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@cargo-tarpaulin
+
+      - name: Generate coverage
+        run: cargo tarpaulin --fail-under 80 --out xml --out html
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            cobertura.xml
+            tarpaulin-report.html
+        if: always()
+
+  # ─────────────────────────────────────────────
+  # Job 5: Security audit
+  # ─────────────────────────────────────────────
+  security:
+    name: Security Audit
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Run audit
+        run: cargo audit
+
+  # ─────────────────────────────────────────────
+  # Job 6: Benchmarks
+  # ─────────────────────────────────────────────
+  bench:
+    name: Benchmarks
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: bench
+
+      - name: Run benchmarks
+        run: cargo bench
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: target/criterion/
