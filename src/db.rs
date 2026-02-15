@@ -98,11 +98,7 @@ pub struct PulseDB {
 
 impl std::fmt::Debug for PulseDB {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let vector_count = self
-            .vectors
-            .read()
-            .map(|v| v.len())
-            .unwrap_or(0);
+        let vector_count = self.vectors.read().map(|v| v.len()).unwrap_or(0);
         f.debug_struct("PulseDB")
             .field("config", &self.config)
             .field("embedding_dimension", &self.embedding_dimension())
@@ -340,8 +336,7 @@ impl PulseDB {
                 HnswIndex::new(dimension, &config.hnsw)
             } else {
                 let start = std::time::Instant::now();
-                let idx =
-                    HnswIndex::rebuild_from_embeddings(dimension, &config.hnsw, embeddings)?;
+                let idx = HnswIndex::rebuild_from_embeddings(dimension, &config.hnsw, embeddings)?;
                 info!(
                     collective = %collective.id,
                     vectors = idx.active_count(),
@@ -369,11 +364,7 @@ impl PulseDB {
     /// is held (read lock), so the HnswIndex reference stays valid.
     /// Returns `None` if no index exists for the collective.
     #[doc(hidden)]
-    pub fn with_vector_index<F, R>(
-        &self,
-        collective_id: CollectiveId,
-        f: F,
-    ) -> Result<Option<R>>
+    pub fn with_vector_index<F, R>(&self, collective_id: CollectiveId, f: F) -> Result<Option<R>>
     where
         F: FnOnce(&HnswIndex) -> Result<R>,
     {
@@ -764,7 +755,13 @@ impl PulseDB {
             .get_experience(id)?
             .ok_or_else(|| PulseDBError::from(NotFoundError::experience(id)))?;
 
-        // Soft-delete from HNSW index (mark as deleted, not removed from graph)
+        // Delete from redb FIRST (source of truth). If crash happens after
+        // this but before HNSW soft-delete, on reopen the experience won't be
+        // loaded from redb, so it's automatically excluded from the rebuilt index.
+        self.storage.delete_experience(id)?;
+
+        // Soft-delete from HNSW index (mark as deleted, not removed from graph).
+        // This takes effect immediately for the current session's searches.
         let vectors = self
             .vectors
             .read()
@@ -772,10 +769,6 @@ impl PulseDB {
         if let Some(index) = vectors.get(&experience.collective_id) {
             index.delete_experience(id)?;
         }
-        drop(vectors);
-
-        // Delete from redb (hard delete)
-        self.storage.delete_experience(id)?;
 
         info!(id = %id, "Experience deleted");
         Ok(())

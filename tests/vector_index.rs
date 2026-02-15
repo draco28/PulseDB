@@ -179,16 +179,20 @@ fn test_hnsw_rebuild_on_reopen() {
             .with_vector_index(cid, |idx| Ok(idx.active_count()))
             .unwrap()
             .unwrap();
-        assert_eq!(rebuilt_count, exp_count, "HNSW index should be rebuilt from redb");
+        assert_eq!(
+            rebuilt_count, exp_count,
+            "HNSW index should be rebuilt from redb"
+        );
 
         // Verify search still works after rebuild
         let results = db
-            .with_vector_index(cid, |idx| {
-                idx.search_experiences(&make_embedding(5), 3, 50)
-            })
+            .with_vector_index(cid, |idx| idx.search_experiences(&make_embedding(5), 3, 50))
             .unwrap()
             .unwrap();
-        assert!(!results.is_empty(), "Search should return results after rebuild");
+        assert!(
+            !results.is_empty(),
+            "Search should return results after rebuild"
+        );
         assert!(results.len() <= 3);
 
         db.close().unwrap();
@@ -272,7 +276,10 @@ fn test_hnsw_removed_on_collective_delete() {
     let result = db
         .with_vector_index(cid, |idx| Ok(idx.active_count()))
         .unwrap();
-    assert!(result.is_none(), "HNSW index should be removed with collective");
+    assert!(
+        result.is_none(),
+        "HNSW index should be removed with collective"
+    );
 
     db.close().unwrap();
 }

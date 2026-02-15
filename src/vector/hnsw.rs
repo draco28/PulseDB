@@ -91,7 +91,12 @@ pub(crate) struct IndexMetadata {
     pub(crate) next_id: usize,
     /// Vec of (ExperienceId UUID string, internal usize ID) pairs.
     pub(crate) id_map: Vec<(String, usize)>,
-    pub(crate) deleted: Vec<usize>,
+    /// Deleted ExperienceId UUID strings (not internal IDs).
+    ///
+    /// We store UUIDs instead of internal usize IDs because internal IDs
+    /// are reassigned sequentially on rebuild. Using UUIDs ensures the
+    /// correct experiences are marked as deleted after rebuild.
+    pub(crate) deleted: Vec<String>,
 }
 
 impl HnswIndex {
@@ -255,14 +260,24 @@ impl HnswIndex {
     /// Restores the deleted set from persisted metadata.
     ///
     /// Called during `PulseDB::open()` after rebuilding the graph from redb.
-    /// This marks experiences that were soft-deleted before the last shutdown.
-    pub fn restore_deleted_set(&self, deleted_ids: &[usize]) -> Result<()> {
+    /// Accepts ExperienceId UUID strings and maps them to the current
+    /// internal IDs (which may differ from the previous session's IDs
+    /// after a rebuild).
+    pub fn restore_deleted_set(&self, deleted_exp_ids: &[String]) -> Result<()> {
         let mut state = self
             .state
             .write()
             .map_err(|_| PulseDBError::vector("Index state lock poisoned"))?;
-        for &id in deleted_ids {
-            state.deleted.insert(id);
+        for exp_id_str in deleted_exp_ids {
+            // Parse UUID string back to ExperienceId
+            let uuid = uuid::Uuid::parse_str(exp_id_str)
+                .map_err(|e| PulseDBError::vector(format!("Invalid UUID in deleted set: {}", e)))?;
+            let exp_id = ExperienceId::from_bytes(*uuid.as_bytes());
+            // Map to current internal ID (skip if not found — experience
+            // may have been hard-deleted from redb since last save)
+            if let Some(&internal_id) = state.id_to_internal.get(&exp_id) {
+                state.deleted.insert(internal_id);
+            }
         }
         Ok(())
     }
@@ -274,9 +289,8 @@ impl HnswIndex {
     /// optimization (graph loading is not yet implemented due to lifetime
     /// constraints in hnsw_rs).
     pub fn save_to_dir(&self, dir: &Path, name: &str) -> Result<()> {
-        fs::create_dir_all(dir).map_err(|e| {
-            PulseDBError::vector(format!("Failed to create HNSW directory: {}", e))
-        })?;
+        fs::create_dir_all(dir)
+            .map_err(|e| PulseDBError::vector(format!("Failed to create HNSW directory: {}", e)))?;
 
         let state = self
             .state
@@ -292,7 +306,16 @@ impl HnswIndex {
                 .iter()
                 .map(|(exp_id, &internal_id)| (exp_id.to_string(), internal_id))
                 .collect(),
-            deleted: state.deleted.iter().copied().collect(),
+            deleted: state
+                .deleted
+                .iter()
+                .filter_map(|&internal_id| {
+                    state
+                        .internal_to_id
+                        .get(internal_id)
+                        .map(|exp_id| exp_id.to_string())
+                })
+                .collect(),
         };
 
         // Write metadata as JSON
@@ -300,9 +323,8 @@ impl HnswIndex {
         let json = serde_json::to_string_pretty(&metadata).map_err(|e| {
             PulseDBError::vector(format!("Failed to serialize HNSW metadata: {}", e))
         })?;
-        fs::write(&meta_path, json).map_err(|e| {
-            PulseDBError::vector(format!("Failed to write HNSW metadata: {}", e))
-        })?;
+        fs::write(&meta_path, json)
+            .map_err(|e| PulseDBError::vector(format!("Failed to write HNSW metadata: {}", e)))?;
 
         // Also dump the HNSW graph (for future direct-load optimization)
         if state.id_to_internal.is_empty() {
@@ -323,21 +345,16 @@ impl HnswIndex {
     /// create a new `HnswIndex` and re-insert embeddings using the
     /// stored ID mappings.
     #[allow(dead_code)] // Used in Step 4 (db.rs open/close lifecycle)
-    pub(crate) fn load_metadata(
-        dir: &Path,
-        name: &str,
-    ) -> Result<Option<IndexMetadata>> {
+    pub(crate) fn load_metadata(dir: &Path, name: &str) -> Result<Option<IndexMetadata>> {
         let meta_path = dir.join(format!("{}.hnsw.meta", name));
         if !meta_path.exists() {
             return Ok(None);
         }
 
-        let json = fs::read_to_string(&meta_path).map_err(|e| {
-            PulseDBError::vector(format!("Failed to read HNSW metadata: {}", e))
-        })?;
-        let metadata: IndexMetadata = serde_json::from_str(&json).map_err(|e| {
-            PulseDBError::vector(format!("Failed to parse HNSW metadata: {}", e))
-        })?;
+        let json = fs::read_to_string(&meta_path)
+            .map_err(|e| PulseDBError::vector(format!("Failed to read HNSW metadata: {}", e)))?;
+        let metadata: IndexMetadata = serde_json::from_str(&json)
+            .map_err(|e| PulseDBError::vector(format!("Failed to parse HNSW metadata: {}", e)))?;
 
         Ok(Some(metadata))
     }
@@ -443,9 +460,7 @@ impl VectorIndex for HnswIndex {
         // Wrap the dyn Fn trait object in FilterBridge to satisfy hnsw_rs's
         // FilterT requirement (trait objects can't auto-coerce between traits)
         let bridge = FilterBridge(filter);
-        let results = self
-            .hnsw
-            .search_filter(query, k, ef_search, Some(&bridge));
+        let results = self.hnsw.search_filter(query, k, ef_search, Some(&bridge));
         Ok(results.into_iter().map(|n| (n.d_id, n.distance)).collect())
     }
 
@@ -676,6 +691,8 @@ mod tests {
         assert_eq!(metadata.next_id, 5);
         assert_eq!(metadata.id_map.len(), 5);
         assert_eq!(metadata.deleted.len(), 1);
+        // Deleted set stores ExperienceId UUIDs, not internal IDs
+        assert_eq!(metadata.deleted[0], exp_ids[2].to_string());
     }
 
     #[test]
