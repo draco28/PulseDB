@@ -60,6 +60,12 @@ pub struct Config {
 
     /// Durability mode for write operations.
     pub sync_mode: SyncMode,
+
+    /// HNSW vector index parameters.
+    ///
+    /// Controls the quality and performance of semantic search.
+    /// See [`HnswConfig`] for tuning guidelines.
+    pub hnsw: HnswConfig,
 }
 
 impl Default for Config {
@@ -72,6 +78,7 @@ impl Default for Config {
             default_collective: None,
             cache_size_mb: 64,
             sync_mode: SyncMode::Normal,
+            hnsw: HnswConfig::default(),
         }
     }
 }
@@ -133,6 +140,26 @@ impl Config {
         if self.cache_size_mb == 0 {
             return Err(ValidationError::invalid_field(
                 "cache_size_mb",
+                "must be greater than 0",
+            ));
+        }
+
+        // Validate HNSW parameters
+        if self.hnsw.max_nb_connection == 0 {
+            return Err(ValidationError::invalid_field(
+                "hnsw.max_nb_connection",
+                "must be greater than 0",
+            ));
+        }
+        if self.hnsw.ef_construction == 0 {
+            return Err(ValidationError::invalid_field(
+                "hnsw.ef_construction",
+                "must be greater than 0",
+            ));
+        }
+        if self.hnsw.ef_search == 0 {
+            return Err(ValidationError::invalid_field(
+                "hnsw.ef_search",
                 "must be greater than 0",
             ));
         }
@@ -272,6 +299,69 @@ impl SyncMode {
     }
 }
 
+/// Configuration for the HNSW vector index.
+///
+/// Controls the trade-off between index build time, memory usage,
+/// and search accuracy. The defaults are tuned for PulseDB's target
+/// scale (10K-500K experiences per collective).
+///
+/// # Tuning Guide
+///
+/// | Use Case     | M  | ef_construction | ef_search |
+/// |--------------|----|-----------------|-----------|
+/// | Low memory   |  8 |             100 |        30 |
+/// | Balanced     | 16 |             200 |        50 |
+/// | High recall  | 32 |             400 |       100 |
+#[derive(Clone, Debug)]
+pub struct HnswConfig {
+    /// Maximum bidirectional connections per node (M parameter).
+    ///
+    /// Higher values improve recall but increase memory and build time.
+    /// Each node stores up to M links, so memory per node is O(M).
+    /// Default: 16
+    pub max_nb_connection: usize,
+
+    /// Number of candidates tracked during index construction.
+    ///
+    /// Higher values produce a better quality graph but slow down insertion.
+    /// Rule of thumb: ef_construction >= 2 * max_nb_connection.
+    /// Default: 200
+    pub ef_construction: usize,
+
+    /// Number of candidates tracked during search.
+    ///
+    /// Higher values improve recall but increase search latency.
+    /// Must be >= k (the number of results requested).
+    /// Default: 50
+    pub ef_search: usize,
+
+    /// Maximum number of layers in the skip-list structure.
+    ///
+    /// Lower layers are dense, upper layers are sparse "express lanes."
+    /// Default 16 handles datasets up to ~1M vectors with M=16.
+    /// Default: 16
+    pub max_layer: usize,
+
+    /// Initial pre-allocated capacity (number of vectors).
+    ///
+    /// The index grows beyond this automatically, but pre-allocation
+    /// avoids reallocations for known workloads.
+    /// Default: 10_000
+    pub max_elements: usize,
+}
+
+impl Default for HnswConfig {
+    fn default() -> Self {
+        Self {
+            max_nb_connection: 16,
+            ef_construction: 200,
+            ef_search: 50,
+            max_layer: 16,
+            max_elements: 10_000,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,6 +447,62 @@ mod tests {
         assert!(!SyncMode::Normal.is_paranoid());
         assert!(SyncMode::Fast.is_fast());
         assert!(SyncMode::Paranoid.is_paranoid());
+    }
+
+    #[test]
+    fn test_hnsw_config_defaults() {
+        let config = HnswConfig::default();
+        assert_eq!(config.max_nb_connection, 16);
+        assert_eq!(config.ef_construction, 200);
+        assert_eq!(config.ef_search, 50);
+        assert_eq!(config.max_layer, 16);
+        assert_eq!(config.max_elements, 10_000);
+    }
+
+    #[test]
+    fn test_config_includes_hnsw() {
+        let config = Config::default();
+        assert_eq!(config.hnsw.max_nb_connection, 16);
+    }
+
+    #[test]
+    fn test_validate_hnsw_zero_max_nb_connection() {
+        let config = Config {
+            hnsw: HnswConfig {
+                max_nb_connection: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ValidationError::InvalidField { field, .. } if field == "hnsw.max_nb_connection"
+        ));
+    }
+
+    #[test]
+    fn test_validate_hnsw_zero_ef_construction() {
+        let config = Config {
+            hnsw: HnswConfig {
+                ef_construction: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_hnsw_zero_ef_search() {
+        let config = Config {
+            hnsw: HnswConfig {
+                ef_search: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
     }
 
     #[test]
