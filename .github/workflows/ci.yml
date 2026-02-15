@@ -104,17 +104,13 @@ jobs:
         with:
           prefix-key: msrv
 
+      # MSRV applies to default features only.
+      # builtin-embeddings depends on ort which requires a newer rustc.
       - name: Build (default features)
         run: cargo build
 
       - name: Test (default features)
         run: cargo test
-
-      - name: Build (builtin-embeddings)
-        run: cargo build --features builtin-embeddings
-
-      - name: Test (builtin-embeddings)
-        run: cargo test --features builtin-embeddings
 
   # ─────────────────────────────────────────────
   # Job 4: Code coverage
