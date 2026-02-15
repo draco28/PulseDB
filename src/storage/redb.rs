@@ -23,7 +23,7 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::collective::Collective;
 use crate::experience::{Experience, ExperienceUpdate};
-use crate::types::{CollectiveId, ExperienceId};
+use crate::types::{CollectiveId, ExperienceId, Timestamp};
 
 use super::schema::{
     encode_type_index_key, DatabaseMetadata, ExperienceTypeTag, COLLECTIVES_TABLE,
@@ -428,6 +428,39 @@ impl StorageEngine for RedbStorage {
         }
 
         Ok(ids)
+    }
+
+    fn get_recent_experience_ids(
+        &self,
+        collective_id: CollectiveId,
+        limit: usize,
+    ) -> Result<Vec<(ExperienceId, Timestamp)>> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let table = read_txn.open_multimap_table(EXPERIENCES_BY_COLLECTIVE_TABLE)?;
+
+        // Collect all (ExperienceId, Timestamp) pairs for this collective.
+        // Multimap values are sorted ascending by [timestamp_be][exp_id],
+        // so we collect all and then take from the end for newest-first.
+        let mut entries = Vec::new();
+        for result in table.get(collective_id.as_bytes())? {
+            let value = result.map_err(StorageError::from)?;
+            let entry = value.value();
+            // Entry layout: [timestamp_be: 8 bytes][experience_id: 16 bytes]
+            let mut ts_bytes = [0u8; 8];
+            ts_bytes.copy_from_slice(&entry[..8]);
+            let timestamp = Timestamp::from_millis(i64::from_be_bytes(ts_bytes));
+
+            let mut exp_bytes = [0u8; 16];
+            exp_bytes.copy_from_slice(&entry[8..24]);
+            entries.push((ExperienceId::from_bytes(exp_bytes), timestamp));
+        }
+
+        // Take the last `limit` entries (newest) and reverse to get descending order
+        let start = entries.len().saturating_sub(limit);
+        let mut recent = entries.split_off(start);
+        recent.reverse();
+
+        Ok(recent)
     }
 
     // =========================================================================

@@ -83,6 +83,7 @@ pub mod storage;
 // Domain modules
 mod collective;
 mod experience;
+mod search;
 
 /// Vector index module for HNSW-based approximate nearest neighbor search.
 pub mod vector;
@@ -107,6 +108,9 @@ pub use types::{AgentId, CollectiveId, Embedding, ExperienceId, TaskId, Timestam
 pub use collective::{Collective, CollectiveStats};
 pub use experience::{Experience, ExperienceType, ExperienceUpdate, NewExperience, Severity};
 
+// Search
+pub use search::SearchFilter;
+
 // Storage (for advanced users)
 pub use storage::DatabaseMetadata;
 
@@ -124,5 +128,6 @@ pub mod prelude {
     pub use crate::db::PulseDB;
     pub use crate::error::{PulseDBError, Result};
     pub use crate::experience::{Experience, ExperienceType, NewExperience};
+    pub use crate::search::SearchFilter;
     pub use crate::types::{CollectiveId, ExperienceId, Timestamp};
 }

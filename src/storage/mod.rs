@@ -34,7 +34,7 @@ use crate::collective::Collective;
 use crate::config::Config;
 use crate::error::Result;
 use crate::experience::{Experience, ExperienceUpdate};
-use crate::types::{CollectiveId, ExperienceId};
+use crate::types::{CollectiveId, ExperienceId, Timestamp};
 
 /// Storage engine trait for PulseDB.
 ///
@@ -159,6 +159,26 @@ pub trait StorageEngine: Send + Sync {
     /// Used to rebuild HNSW indexes from redb embeddings on startup.
     /// Iterates the `experiences_by_collective` multimap index.
     fn list_experience_ids_in_collective(&self, id: CollectiveId) -> Result<Vec<ExperienceId>>;
+
+    /// Retrieves the most recent experience IDs in a collective.
+    ///
+    /// Performs a reverse iteration on `EXPERIENCES_BY_COLLECTIVE_TABLE`
+    /// to get IDs ordered by timestamp descending (newest first).
+    /// The multimap values are `[timestamp_be: 8 bytes][experience_id: 16 bytes]`,
+    /// and since timestamps are big-endian, reverse lexicographic order = newest first.
+    ///
+    /// Returns `(ExperienceId, Timestamp)` pairs for the caller to fetch full
+    /// records and apply post-filters.
+    ///
+    /// # Arguments
+    ///
+    /// * `collective_id` - The collective to query
+    /// * `limit` - Maximum number of entries to return
+    fn get_recent_experience_ids(
+        &self,
+        collective_id: CollectiveId,
+        limit: usize,
+    ) -> Result<Vec<(ExperienceId, Timestamp)>>;
 
     // =========================================================================
     // Experience Storage Operations
