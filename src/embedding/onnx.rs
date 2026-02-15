@@ -564,18 +564,36 @@ fn l2_normalize(v: &[f32]) -> Vec<f32> {
 }
 
 /// Downloads a file from a URL to a local path.
+///
+/// Uses atomic write (temp file + rename) to prevent partial downloads
+/// from leaving corrupted files that block future retry attempts.
 fn download_file(url: &str, dest: &Path) -> Result<()> {
     let response = ureq::get(url)
         .call()
         .map_err(|e| PulseDBError::embedding(format!("Download failed for {url}: {e}")))?;
 
+    // Write to temp file first — rename on success prevents partial corruption
+    let temp = dest.with_extension("tmp");
     let mut reader = response.into_body().into_reader();
-    let mut file = std::fs::File::create(dest).map_err(|e| {
-        PulseDBError::embedding(format!("Failed to create file {}: {e}", dest.display()))
+    let mut file = std::fs::File::create(&temp).map_err(|e| {
+        PulseDBError::embedding(format!("Failed to create file {}: {e}", temp.display()))
     })?;
 
-    std::io::copy(&mut reader, &mut file).map_err(|e| {
-        PulseDBError::embedding(format!("Failed to write to {}: {e}", dest.display()))
+    if let Err(e) = std::io::copy(&mut reader, &mut file) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(PulseDBError::embedding(format!(
+            "Failed to write to {}: {e}",
+            dest.display()
+        )));
+    }
+
+    // Atomic rename — only the complete file appears at the destination
+    std::fs::rename(&temp, dest).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        PulseDBError::embedding(format!(
+            "Failed to finalize download {}: {e}",
+            dest.display()
+        ))
     })?;
 
     Ok(())
