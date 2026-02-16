@@ -109,7 +109,7 @@ pub use collective::{Collective, CollectiveStats};
 pub use experience::{Experience, ExperienceType, ExperienceUpdate, NewExperience, Severity};
 
 // Search
-pub use search::SearchFilter;
+pub use search::{SearchFilter, SearchResult};
 
 // Storage (for advanced users)
 pub use storage::DatabaseMetadata;
@@ -128,6 +128,6 @@ pub mod prelude {
     pub use crate::db::PulseDB;
     pub use crate::error::{PulseDBError, Result};
     pub use crate::experience::{Experience, ExperienceType, NewExperience};
-    pub use crate::search::SearchFilter;
+    pub use crate::search::{SearchFilter, SearchResult};
     pub use crate::types::{CollectiveId, ExperienceId, Timestamp};
 }

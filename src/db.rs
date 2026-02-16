@@ -65,7 +65,7 @@ use crate::experience::{
     validate_experience_update, validate_new_experience, Experience, ExperienceUpdate,
     NewExperience,
 };
-use crate::search::SearchFilter;
+use crate::search::{SearchFilter, SearchResult};
 use crate::storage::{open_storage, DatabaseMetadata, StorageEngine};
 use crate::types::{CollectiveId, ExperienceId, Timestamp};
 use crate::vector::HnswIndex;
@@ -885,6 +885,149 @@ impl PulseDB {
             if let Some(experience) = self.storage.get_experience(exp_id)? {
                 if filter.matches(&experience) {
                     results.push(experience);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    // =========================================================================
+    // Similarity Search (E2-S02)
+    // =========================================================================
+
+    /// Searches for experiences semantically similar to the query embedding.
+    ///
+    /// Uses the HNSW vector index for approximate nearest neighbor search,
+    /// then fetches full experience records from storage. Archived experiences
+    /// are excluded by default.
+    ///
+    /// Results are sorted by similarity descending (most similar first).
+    /// Similarity is computed as `1.0 - cosine_distance`.
+    ///
+    /// # Arguments
+    ///
+    /// * `collective_id` - The collective to search within
+    /// * `query` - Query embedding vector (must match collective's dimension)
+    /// * `k` - Maximum number of results to return (1-1000)
+    ///
+    /// # Errors
+    ///
+    /// - [`ValidationError::InvalidField`] if `k` is 0 or > 1000
+    /// - [`ValidationError::DimensionMismatch`] if `query.len()` doesn't match
+    ///   the collective's embedding dimension
+    /// - [`NotFoundError::Collective`] if the collective doesn't exist
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let query = vec![0.1f32; 384]; // Your query embedding
+    /// let results = db.search_similar(collective_id, &query, 10)?;
+    /// for result in &results {
+    ///     println!(
+    ///         "[{:.3}] {}",
+    ///         result.similarity, result.experience.content
+    ///     );
+    /// }
+    /// ```
+    #[instrument(skip(self, query))]
+    pub fn search_similar(
+        &self,
+        collective_id: CollectiveId,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<SearchResult>> {
+        self.search_similar_filtered(collective_id, query, k, SearchFilter::default())
+    }
+
+    /// Searches for semantically similar experiences with additional filtering.
+    ///
+    /// Like [`search_similar()`](Self::search_similar), but applies additional
+    /// filters on domain, experience type, importance, confidence, and timestamp.
+    ///
+    /// Over-fetches from the HNSW index (2x `k`) to account for entries removed
+    /// by post-filtering, then truncates to the requested `k`.
+    ///
+    /// # Arguments
+    ///
+    /// * `collective_id` - The collective to search within
+    /// * `query` - Query embedding vector (must match collective's dimension)
+    /// * `k` - Maximum number of results to return (1-1000)
+    /// * `filter` - Filter criteria to apply after vector search
+    ///
+    /// # Errors
+    ///
+    /// - [`ValidationError::InvalidField`] if `k` is 0 or > 1000
+    /// - [`ValidationError::DimensionMismatch`] if `query.len()` doesn't match
+    ///   the collective's embedding dimension
+    /// - [`NotFoundError::Collective`] if the collective doesn't exist
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use pulsedb::SearchFilter;
+    ///
+    /// let filter = SearchFilter {
+    ///     domains: Some(vec!["rust".to_string()]),
+    ///     min_importance: Some(0.5),
+    ///     ..SearchFilter::default()
+    /// };
+    /// let results = db.search_similar_filtered(
+    ///     collective_id,
+    ///     &query_embedding,
+    ///     10,
+    ///     filter,
+    /// )?;
+    /// ```
+    #[instrument(skip(self, query, filter))]
+    pub fn search_similar_filtered(
+        &self,
+        collective_id: CollectiveId,
+        query: &[f32],
+        k: usize,
+        filter: SearchFilter,
+    ) -> Result<Vec<SearchResult>> {
+        // Validate k
+        if k == 0 || k > 1000 {
+            return Err(ValidationError::invalid_field("k", "must be between 1 and 1000").into());
+        }
+
+        // Verify collective exists and check embedding dimension
+        let collective = self
+            .storage
+            .get_collective(collective_id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::collective(collective_id)))?;
+
+        let expected_dim = collective.embedding_dimension as usize;
+        if query.len() != expected_dim {
+            return Err(ValidationError::dimension_mismatch(expected_dim, query.len()).into());
+        }
+
+        // Over-fetch from HNSW to compensate for post-filtering losses
+        let over_fetch = k.saturating_mul(2).min(2000);
+        let ef_search = self.config.hnsw.ef_search;
+
+        // Search HNSW index — returns (ExperienceId, cosine_distance) sorted
+        // by distance ascending (closest first)
+        let candidates = self
+            .with_vector_index(collective_id, |index| {
+                index.search_experiences(query, over_fetch, ef_search)
+            })?
+            .unwrap_or_default();
+
+        // Fetch full experiences, apply filter, convert distance → similarity
+        let mut results = Vec::with_capacity(k);
+        for (exp_id, distance) in candidates {
+            if results.len() >= k {
+                break;
+            }
+
+            if let Some(experience) = self.storage.get_experience(exp_id)? {
+                if filter.matches(&experience) {
+                    results.push(SearchResult {
+                        experience,
+                        similarity: 1.0 - distance,
+                    });
                 }
             }
         }
