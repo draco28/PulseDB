@@ -60,11 +60,12 @@ use crate::collective::types::CollectiveStats;
 use crate::collective::{validate_collective_name, Collective};
 use crate::config::{Config, EmbeddingProvider};
 use crate::embedding::{create_embedding_service, EmbeddingService};
-use crate::error::{NotFoundError, PulseDBError, Result};
+use crate::error::{NotFoundError, PulseDBError, Result, ValidationError};
 use crate::experience::{
     validate_experience_update, validate_new_experience, Experience, ExperienceUpdate,
     NewExperience,
 };
+use crate::search::SearchFilter;
 use crate::storage::{open_storage, DatabaseMetadata, StorageEngine};
 use crate::types::{CollectiveId, ExperienceId, Timestamp};
 use crate::vector::HnswIndex;
@@ -791,6 +792,104 @@ impl PulseDB {
 
         info!(id = %id, applications = new_count, "Experience reinforced");
         Ok(new_count)
+    }
+
+    // =========================================================================
+    // Recent Experiences
+    // =========================================================================
+
+    /// Retrieves the most recent experiences in a collective, newest first.
+    ///
+    /// Returns up to `limit` non-archived experiences ordered by timestamp
+    /// descending (newest first). Uses the by-collective timestamp index
+    /// for efficient retrieval.
+    ///
+    /// # Arguments
+    ///
+    /// * `collective_id` - The collective to query
+    /// * `limit` - Maximum number of experiences to return (1-1000)
+    ///
+    /// # Errors
+    ///
+    /// - [`ValidationError::InvalidField`] if `limit` is 0 or > 1000
+    /// - [`NotFoundError::Collective`] if the collective doesn't exist
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let recent = db.get_recent_experiences(collective_id, 50)?;
+    /// for exp in &recent {
+    ///     println!("{}: {}", exp.timestamp, exp.content);
+    /// }
+    /// ```
+    #[instrument(skip(self))]
+    pub fn get_recent_experiences(
+        &self,
+        collective_id: CollectiveId,
+        limit: usize,
+    ) -> Result<Vec<Experience>> {
+        self.get_recent_experiences_filtered(collective_id, limit, SearchFilter::default())
+    }
+
+    /// Retrieves the most recent experiences in a collective with filtering.
+    ///
+    /// Like [`get_recent_experiences()`](Self::get_recent_experiences), but
+    /// applies additional filters on domain, experience type, importance,
+    /// confidence, and timestamp.
+    ///
+    /// Over-fetches from storage (2x `limit`) to account for entries removed
+    /// by post-filtering, then truncates to the requested `limit`.
+    ///
+    /// # Arguments
+    ///
+    /// * `collective_id` - The collective to query
+    /// * `limit` - Maximum number of experiences to return (1-1000)
+    /// * `filter` - Filter criteria to apply
+    ///
+    /// # Errors
+    ///
+    /// - [`ValidationError::InvalidField`] if `limit` is 0 or > 1000
+    /// - [`NotFoundError::Collective`] if the collective doesn't exist
+    #[instrument(skip(self, filter))]
+    pub fn get_recent_experiences_filtered(
+        &self,
+        collective_id: CollectiveId,
+        limit: usize,
+        filter: SearchFilter,
+    ) -> Result<Vec<Experience>> {
+        // Validate limit
+        if limit == 0 || limit > 1000 {
+            return Err(
+                ValidationError::invalid_field("limit", "must be between 1 and 1000").into(),
+            );
+        }
+
+        // Verify collective exists
+        self.storage
+            .get_collective(collective_id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::collective(collective_id)))?;
+
+        // Over-fetch IDs to account for post-filtering losses
+        let over_fetch = limit.saturating_mul(2).min(2000);
+        let recent_ids = self
+            .storage
+            .get_recent_experience_ids(collective_id, over_fetch)?;
+
+        // Load full experiences and apply filter
+        let mut results = Vec::with_capacity(limit);
+        for (exp_id, _timestamp) in recent_ids {
+            if results.len() >= limit {
+                break;
+            }
+
+            if let Some(experience) = self.storage.get_experience(exp_id)? {
+                if filter.matches(&experience) {
+                    results.push(experience);
+                }
+            }
+        }
+
+        Ok(results)
     }
 }
 
