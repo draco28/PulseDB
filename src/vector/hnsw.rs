@@ -210,16 +210,25 @@ impl HnswIndex {
             .read()
             .map_err(|_| PulseDBError::vector("Index state lock poisoned"))?;
 
+        // Cap k to the number of active items. HNSW's probabilistic graph
+        // traversal can miss nodes in very small graphs when k >> n.
+        let active_count = state.next_id - state.deleted.len();
+        if active_count == 0 {
+            return Ok(vec![]);
+        }
+        let effective_k = k.min(active_count);
+        let effective_ef = ef_search.max(effective_k);
+
         // Use filtered search to exclude soft-deleted entries.
         // We create a concrete closure (not a trait object) so it
         // auto-implements hnsw_rs::FilterT via the blanket impl.
         let deleted_ref = &state.deleted;
         let filter_fn = |id: &usize| -> bool { !deleted_ref.contains(id) };
         let results = if state.deleted.is_empty() {
-            self.hnsw.search(query, k, ef_search)
+            self.hnsw.search(query, effective_k, effective_ef)
         } else {
             self.hnsw
-                .search_filter(query, k, ef_search, Some(&filter_fn))
+                .search_filter(query, effective_k, effective_ef, Some(&filter_fn))
         };
 
         // Map internal IDs back to ExperienceIds
