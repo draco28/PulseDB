@@ -368,6 +368,11 @@ impl NotFoundError {
     pub fn experience(id: impl ToString) -> Self {
         Self::Experience(id.to_string())
     }
+
+    /// Creates a relation not found error.
+    pub fn relation(id: impl ToString) -> Self {
+        Self::Relation(id.to_string())
+    }
 }
 
 #[cfg(test)]

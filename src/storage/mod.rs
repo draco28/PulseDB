@@ -34,7 +34,8 @@ use crate::collective::Collective;
 use crate::config::Config;
 use crate::error::Result;
 use crate::experience::{Experience, ExperienceUpdate};
-use crate::types::{CollectiveId, ExperienceId, Timestamp};
+use crate::relation::{ExperienceRelation, RelationType};
+use crate::types::{CollectiveId, ExperienceId, RelationId, Timestamp};
 
 /// Storage engine trait for PulseDB.
 ///
@@ -241,6 +242,57 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// Returns `None` if no embedding exists for the given ID.
     fn get_embedding(&self, id: ExperienceId) -> Result<Option<Vec<f32>>>;
+
+    // =========================================================================
+    // Relation Storage Operations (E3-S01)
+    // =========================================================================
+
+    /// Saves a relation and its index entries atomically.
+    ///
+    /// Writes to 3 tables in a single transaction:
+    /// - `RELATIONS_TABLE` — the relation record
+    /// - `RELATIONS_BY_SOURCE_TABLE` — index by source experience
+    /// - `RELATIONS_BY_TARGET_TABLE` — index by target experience
+    fn save_relation(&self, relation: &ExperienceRelation) -> Result<()>;
+
+    /// Retrieves a relation by ID.
+    ///
+    /// Returns `None` if no relation with the given ID exists.
+    fn get_relation(&self, id: RelationId) -> Result<Option<ExperienceRelation>>;
+
+    /// Deletes a relation and its index entries atomically.
+    ///
+    /// Returns `true` if the relation existed and was deleted,
+    /// `false` if not found.
+    fn delete_relation(&self, id: RelationId) -> Result<bool>;
+
+    /// Finds all relation IDs where the given experience is the source.
+    ///
+    /// Iterates the `RELATIONS_BY_SOURCE_TABLE` multimap for the experience.
+    fn get_relation_ids_by_source(&self, experience_id: ExperienceId) -> Result<Vec<RelationId>>;
+
+    /// Finds all relation IDs where the given experience is the target.
+    ///
+    /// Iterates the `RELATIONS_BY_TARGET_TABLE` multimap for the experience.
+    fn get_relation_ids_by_target(&self, experience_id: ExperienceId) -> Result<Vec<RelationId>>;
+
+    /// Deletes all relations where the given experience is source or target.
+    ///
+    /// Used for cascade deletion when an experience is removed.
+    /// Returns the count of deleted relations.
+    fn delete_relations_for_experience(&self, experience_id: ExperienceId) -> Result<u64>;
+
+    /// Checks if a relation with the same (source, target, type) already exists.
+    ///
+    /// Scans the source index, loads each relation, and checks for a matching
+    /// target and type. Efficient for the expected cardinality (few relations
+    /// per experience).
+    fn relation_exists(
+        &self,
+        source_id: ExperienceId,
+        target_id: ExperienceId,
+        relation_type: RelationType,
+    ) -> Result<bool>;
 }
 
 /// Opens a storage engine at the given path.

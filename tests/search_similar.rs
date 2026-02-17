@@ -13,10 +13,19 @@ use tempfile::tempdir;
 const DIM: usize = 384;
 
 /// Generates a deterministic embedding from a seed.
-/// Vectors with close seeds produce similar embeddings (smooth sin curve).
+///
+/// Uses a hash-based pseudo-random generator to produce well-separated vectors
+/// in the 384-dimensional space. Adjacent seeds are NOT correlated, which
+/// prevents HNSW neighbor pruning issues that occur with highly similar vectors.
 fn make_embedding(seed: u64) -> Vec<f32> {
     (0..DIM)
-        .map(|i| (seed as f32 * 0.1 + i as f32 * 0.01).sin())
+        .map(|i| {
+            let h = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(i as u64)
+                .wrapping_mul(1442695040888963407);
+            (h >> 33) as f32 / (u32::MAX as f32) - 0.5
+        })
         .collect()
 }
 

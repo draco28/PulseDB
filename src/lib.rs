@@ -83,6 +83,7 @@ pub mod storage;
 // Domain modules
 mod collective;
 mod experience;
+mod relation;
 mod search;
 
 /// Vector index module for HNSW-based approximate nearest neighbor search.
@@ -102,11 +103,16 @@ pub use config::{Config, EmbeddingDimension, EmbeddingProvider, HnswConfig, Sync
 pub use error::{NotFoundError, PulseDBError, Result, StorageError, ValidationError};
 
 // Core types
-pub use types::{AgentId, CollectiveId, Embedding, ExperienceId, TaskId, Timestamp, UserId};
+pub use types::{
+    AgentId, CollectiveId, Embedding, ExperienceId, RelationId, TaskId, Timestamp, UserId,
+};
 
 // Domain types
 pub use collective::{Collective, CollectiveStats};
 pub use experience::{Experience, ExperienceType, ExperienceUpdate, NewExperience, Severity};
+
+// Relations
+pub use relation::{ExperienceRelation, NewExperienceRelation, RelationDirection, RelationType};
 
 // Search
 pub use search::{SearchFilter, SearchResult};
