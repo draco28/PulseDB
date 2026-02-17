@@ -65,6 +65,12 @@ pub const MAX_SOURCE_AGENT_LENGTH: usize = 256;
 /// Maximum relation metadata size in bytes (10 KB).
 pub const MAX_RELATION_METADATA_SIZE: usize = 10 * 1024;
 
+/// Maximum insight content size in bytes (50 KB).
+pub const MAX_INSIGHT_CONTENT_SIZE: usize = 50 * 1024;
+
+/// Maximum number of source experiences per insight.
+pub const MAX_INSIGHT_SOURCES: usize = 100;
+
 // ============================================================================
 // Table Definitions
 // ============================================================================
@@ -146,6 +152,25 @@ pub const RELATIONS_BY_SOURCE_TABLE: MultimapTableDefinition<&[u8; 16], &[u8; 16
 /// Value (multimap): RelationId as 16-byte UUID
 pub const RELATIONS_BY_TARGET_TABLE: MultimapTableDefinition<&[u8; 16], &[u8; 16]> =
     MultimapTableDefinition::new("relations_by_target");
+
+// ============================================================================
+// Insight Tables (E3-S02)
+// ============================================================================
+
+/// Insights table.
+///
+/// Primary storage for derived insights.
+/// Key: InsightId as 16-byte UUID
+/// Value: bincode-serialized DerivedInsight struct (with inline embedding)
+pub const INSIGHTS_TABLE: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("insights");
+
+/// Index: Insights by collective.
+///
+/// Enables efficient queries like "find all insights in collective X".
+/// Key: CollectiveId as 16-byte UUID
+/// Value (multimap): InsightId as 16-byte UUID
+pub const INSIGHTS_BY_COLLECTIVE_TABLE: MultimapTableDefinition<&[u8; 16], &[u8; 16]> =
+    MultimapTableDefinition::new("insights_by_collective");
 
 // ============================================================================
 // Experience Type Tag

@@ -373,6 +373,11 @@ impl NotFoundError {
     pub fn relation(id: impl ToString) -> Self {
         Self::Relation(id.to_string())
     }
+
+    /// Creates an insight not found error.
+    pub fn insight(id: impl ToString) -> Self {
+        Self::Insight(id.to_string())
+    }
 }
 
 #[cfg(test)]

@@ -206,6 +206,62 @@ impl fmt::Display for RelationId {
     }
 }
 
+/// Insight identifier (UUID v7 for time-ordering).
+///
+/// Insights are derived knowledge synthesized from multiple experiences.
+/// Each insight belongs to exactly one collective.
+///
+/// # Example
+/// ```
+/// use pulsedb::InsightId;
+///
+/// let id = InsightId::new();
+/// println!("Created insight: {}", id);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct InsightId(pub Uuid);
+
+impl InsightId {
+    /// Creates a new InsightId with a UUID v7 (time-ordered).
+    #[inline]
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    /// Creates a nil (all zeros) InsightId.
+    #[inline]
+    pub fn nil() -> Self {
+        Self(Uuid::nil())
+    }
+
+    /// Returns the raw UUID bytes for storage.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        self.0.as_bytes()
+    }
+
+    /// Creates an InsightId from raw bytes.
+    #[inline]
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Uuid::from_bytes(bytes))
+    }
+}
+
+impl Default for InsightId {
+    /// Returns a nil (all zeros) InsightId.
+    ///
+    /// For a new unique ID, use [`InsightId::new()`].
+    fn default() -> Self {
+        Self::nil()
+    }
+}
+
+impl fmt::Display for InsightId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Opaque user identifier.
 ///
 /// PulseDB doesn't handle authentication - the consumer provides user IDs.
@@ -360,6 +416,35 @@ mod tests {
         let id = RelationId::new();
         let bytes = bincode::serialize(&id).unwrap();
         let restored: RelationId = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(id, restored);
+    }
+
+    #[test]
+    fn test_insight_id_new_is_unique() {
+        let id1 = InsightId::new();
+        let id2 = InsightId::new();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_insight_id_nil() {
+        let id = InsightId::nil();
+        assert_eq!(id.0, Uuid::nil());
+    }
+
+    #[test]
+    fn test_insight_id_bytes_roundtrip() {
+        let id = InsightId::new();
+        let bytes = *id.as_bytes();
+        let restored = InsightId::from_bytes(bytes);
+        assert_eq!(id, restored);
+    }
+
+    #[test]
+    fn test_insight_id_serialization() {
+        let id = InsightId::new();
+        let bytes = bincode::serialize(&id).unwrap();
+        let restored: InsightId = bincode::deserialize(&bytes).unwrap();
         assert_eq!(id, restored);
     }
 
