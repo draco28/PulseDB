@@ -439,6 +439,93 @@ fn test_relation_different_type_allowed() {
     assert_eq!(related.len(), 2);
 }
 
+// ============================================================================
+// Relation type filtering
+// ============================================================================
+
+#[test]
+fn test_relation_type_filter() {
+    let (db, cid, _dir) = open_db_with_collective();
+
+    let exp_a = db.record_experience(minimal_experience(cid)).unwrap();
+    let exp_b = db
+        .record_experience(NewExperience {
+            content: "B experience".to_string(),
+            ..minimal_experience(cid)
+        })
+        .unwrap();
+    let exp_c = db
+        .record_experience(NewExperience {
+            content: "C experience".to_string(),
+            ..minimal_experience(cid)
+        })
+        .unwrap();
+
+    // A -> B (Supports)
+    db.store_relation(NewExperienceRelation {
+        source_id: exp_a,
+        target_id: exp_b,
+        relation_type: RelationType::Supports,
+        strength: 0.9,
+        metadata: None,
+    })
+    .unwrap();
+
+    // A -> C (Contradicts)
+    db.store_relation(NewExperienceRelation {
+        source_id: exp_a,
+        target_id: exp_c,
+        relation_type: RelationType::Contradicts,
+        strength: 0.6,
+        metadata: None,
+    })
+    .unwrap();
+
+    // Filter: only Supports — should find B
+    let supports = db
+        .get_related_experiences_filtered(
+            exp_a,
+            RelationDirection::Outgoing,
+            Some(RelationType::Supports),
+        )
+        .unwrap();
+    assert_eq!(supports.len(), 1);
+    assert_eq!(supports[0].0.id, exp_b);
+    assert_eq!(supports[0].1.relation_type, RelationType::Supports);
+
+    // Filter: only Contradicts — should find C
+    let contradicts = db
+        .get_related_experiences_filtered(
+            exp_a,
+            RelationDirection::Outgoing,
+            Some(RelationType::Contradicts),
+        )
+        .unwrap();
+    assert_eq!(contradicts.len(), 1);
+    assert_eq!(contradicts[0].0.id, exp_c);
+    assert_eq!(contradicts[0].1.relation_type, RelationType::Contradicts);
+
+    // Filter: Elaborates — should find nothing
+    let elaborates = db
+        .get_related_experiences_filtered(
+            exp_a,
+            RelationDirection::Outgoing,
+            Some(RelationType::Elaborates),
+        )
+        .unwrap();
+    assert!(elaborates.is_empty());
+
+    // No filter (None) — should find both
+    let all = db
+        .get_related_experiences_filtered(exp_a, RelationDirection::Outgoing, None)
+        .unwrap();
+    assert_eq!(all.len(), 2);
+}
+
+// ============================================================================
+// Nonexistent experience error paths
+// ============================================================================
+
 #[test]
 fn test_relation_nonexistent_source() {
     let (db, cid, _dir) = open_db_with_collective();

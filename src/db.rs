@@ -1141,6 +1141,9 @@ impl PulseDB {
     /// - `Incoming`: experiences that point TO this experience (as target)
     /// - `Both`: union of outgoing and incoming
     ///
+    /// To filter by relation type, use
+    /// [`get_related_experiences_filtered`](Self::get_related_experiences_filtered).
+    ///
     /// Silently skips relations where the related experience no longer exists
     /// (orphan tolerance).
     ///
@@ -1152,6 +1155,41 @@ impl PulseDB {
         &self,
         experience_id: ExperienceId,
         direction: crate::relation::RelationDirection,
+    ) -> Result<Vec<(Experience, crate::relation::ExperienceRelation)>> {
+        self.get_related_experiences_filtered(experience_id, direction, None)
+    }
+
+    /// Retrieves experiences related to the given experience, with optional
+    /// type filtering.
+    ///
+    /// Like [`get_related_experiences()`](Self::get_related_experiences), but
+    /// accepts an optional [`RelationType`](crate::RelationType) filter.
+    /// When `Some(rt)`, only relations matching that type are returned.
+    ///
+    /// # Arguments
+    ///
+    /// * `experience_id` - The experience to query relations for
+    /// * `direction` - Which direction(s) to traverse
+    /// * `relation_type` - If `Some`, only return relations of this type
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use pulsedb::RelationType;
+    ///
+    /// // Only "Supports" relations outgoing from exp_a
+    /// let supports = db.get_related_experiences_filtered(
+    ///     exp_a,
+    ///     RelationDirection::Outgoing,
+    ///     Some(RelationType::Supports),
+    /// )?;
+    /// ```
+    #[instrument(skip(self))]
+    pub fn get_related_experiences_filtered(
+        &self,
+        experience_id: ExperienceId,
+        direction: crate::relation::RelationDirection,
+        relation_type: Option<crate::relation::RelationType>,
     ) -> Result<Vec<(Experience, crate::relation::ExperienceRelation)>> {
         use crate::relation::RelationDirection;
 
@@ -1165,6 +1203,9 @@ impl PulseDB {
             let rel_ids = self.storage.get_relation_ids_by_source(experience_id)?;
             for rel_id in rel_ids {
                 if let Some(relation) = self.storage.get_relation(rel_id)? {
+                    if relation_type.is_some_and(|rt| rt != relation.relation_type) {
+                        continue;
+                    }
                     if let Some(experience) = self.storage.get_experience(relation.target_id)? {
                         results.push((experience, relation));
                     }
@@ -1180,6 +1221,9 @@ impl PulseDB {
             let rel_ids = self.storage.get_relation_ids_by_target(experience_id)?;
             for rel_id in rel_ids {
                 if let Some(relation) = self.storage.get_relation(rel_id)? {
+                    if relation_type.is_some_and(|rt| rt != relation.relation_type) {
+                        continue;
+                    }
                     if let Some(experience) = self.storage.get_experience(relation.source_id)? {
                         results.push((experience, relation));
                     }
