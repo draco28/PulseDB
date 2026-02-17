@@ -756,6 +756,16 @@ impl PulseDB {
             .get_experience(id)?
             .ok_or_else(|| PulseDBError::from(NotFoundError::experience(id)))?;
 
+        // Cascade-delete any relations involving this experience.
+        // Done before experience deletion so we can still look up relation data.
+        let rel_count = self.storage.delete_relations_for_experience(id)?;
+        if rel_count > 0 {
+            info!(
+                count = rel_count,
+                "Cascade-deleted relations for experience"
+            );
+        }
+
         // Delete from redb FIRST (source of truth). If crash happens after
         // this but before HNSW soft-delete, on reopen the experience won't be
         // loaded from redb, so it's automatically excluded from the rebuilt index.
@@ -1033,6 +1043,176 @@ impl PulseDB {
         }
 
         Ok(results)
+    }
+
+    // =========================================================================
+    // Experience Relations (E3-S01)
+    // =========================================================================
+
+    /// Stores a new relation between two experiences.
+    ///
+    /// Relations are typed, directed edges connecting a source experience to a
+    /// target experience. Both experiences must exist and belong to the same
+    /// collective. Duplicate relations (same source, target, and type) are
+    /// rejected.
+    ///
+    /// # Arguments
+    ///
+    /// * `relation` - The relation to create (source, target, type, strength)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Source or target experience doesn't exist ([`NotFoundError::Experience`])
+    /// - Experiences belong to different collectives ([`ValidationError::InvalidField`])
+    /// - A relation with the same (source, target, type) already exists
+    /// - Self-relation attempted (source == target)
+    /// - Strength is out of range `[0.0, 1.0]`
+    #[instrument(skip(self, relation))]
+    pub fn store_relation(
+        &self,
+        relation: crate::relation::NewExperienceRelation,
+    ) -> Result<crate::types::RelationId> {
+        use crate::relation::{validate_new_relation, ExperienceRelation};
+        use crate::types::RelationId;
+
+        // Validate input fields (self-relation, strength bounds, metadata size)
+        validate_new_relation(&relation)?;
+
+        // Load source and target experiences to verify existence
+        let source = self
+            .storage
+            .get_experience(relation.source_id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::experience(relation.source_id)))?;
+        let target = self
+            .storage
+            .get_experience(relation.target_id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::experience(relation.target_id)))?;
+
+        // Verify same collective
+        if source.collective_id != target.collective_id {
+            return Err(PulseDBError::from(ValidationError::invalid_field(
+                "target_id",
+                "source and target experiences must belong to the same collective",
+            )));
+        }
+
+        // Check for duplicate (same source, target, type)
+        if self.storage.relation_exists(
+            relation.source_id,
+            relation.target_id,
+            relation.relation_type,
+        )? {
+            return Err(PulseDBError::from(ValidationError::invalid_field(
+                "relation_type",
+                "a relation with this source, target, and type already exists",
+            )));
+        }
+
+        // Construct the full relation
+        let id = RelationId::new();
+        let full_relation = ExperienceRelation {
+            id,
+            source_id: relation.source_id,
+            target_id: relation.target_id,
+            relation_type: relation.relation_type,
+            strength: relation.strength,
+            metadata: relation.metadata,
+            created_at: Timestamp::now(),
+        };
+
+        self.storage.save_relation(&full_relation)?;
+
+        info!(
+            id = %id,
+            source = %relation.source_id,
+            target = %relation.target_id,
+            relation_type = ?full_relation.relation_type,
+            "Relation stored"
+        );
+        Ok(id)
+    }
+
+    /// Retrieves experiences related to the given experience.
+    ///
+    /// Returns pairs of `(Experience, ExperienceRelation)` based on the
+    /// requested direction:
+    /// - `Outgoing`: experiences that this experience points TO (as source)
+    /// - `Incoming`: experiences that point TO this experience (as target)
+    /// - `Both`: union of outgoing and incoming
+    ///
+    /// Silently skips relations where the related experience no longer exists
+    /// (orphan tolerance).
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if the read transaction fails.
+    #[instrument(skip(self))]
+    pub fn get_related_experiences(
+        &self,
+        experience_id: ExperienceId,
+        direction: crate::relation::RelationDirection,
+    ) -> Result<Vec<(Experience, crate::relation::ExperienceRelation)>> {
+        use crate::relation::RelationDirection;
+
+        let mut results = Vec::new();
+
+        // Outgoing: this experience is the source → fetch target experiences
+        if matches!(
+            direction,
+            RelationDirection::Outgoing | RelationDirection::Both
+        ) {
+            let rel_ids = self.storage.get_relation_ids_by_source(experience_id)?;
+            for rel_id in rel_ids {
+                if let Some(relation) = self.storage.get_relation(rel_id)? {
+                    if let Some(experience) = self.storage.get_experience(relation.target_id)? {
+                        results.push((experience, relation));
+                    }
+                }
+            }
+        }
+
+        // Incoming: this experience is the target → fetch source experiences
+        if matches!(
+            direction,
+            RelationDirection::Incoming | RelationDirection::Both
+        ) {
+            let rel_ids = self.storage.get_relation_ids_by_target(experience_id)?;
+            for rel_id in rel_ids {
+                if let Some(relation) = self.storage.get_relation(rel_id)? {
+                    if let Some(experience) = self.storage.get_experience(relation.source_id)? {
+                        results.push((experience, relation));
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Retrieves a relation by ID.
+    ///
+    /// Returns `None` if no relation with the given ID exists.
+    pub fn get_relation(
+        &self,
+        id: crate::types::RelationId,
+    ) -> Result<Option<crate::relation::ExperienceRelation>> {
+        self.storage.get_relation(id)
+    }
+
+    /// Deletes a relation by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotFoundError::Relation`] if no relation with the given ID exists.
+    #[instrument(skip(self))]
+    pub fn delete_relation(&self, id: crate::types::RelationId) -> Result<()> {
+        let deleted = self.storage.delete_relation(id)?;
+        if !deleted {
+            return Err(PulseDBError::from(NotFoundError::relation(id)));
+        }
+        info!(id = %id, "Relation deleted");
+        Ok(())
     }
 }
 

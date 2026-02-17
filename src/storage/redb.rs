@@ -23,12 +23,14 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::collective::Collective;
 use crate::experience::{Experience, ExperienceUpdate};
-use crate::types::{CollectiveId, ExperienceId, Timestamp};
+use crate::relation::{ExperienceRelation, RelationType};
+use crate::types::{CollectiveId, ExperienceId, RelationId, Timestamp};
 
 use super::schema::{
     encode_type_index_key, DatabaseMetadata, ExperienceTypeTag, COLLECTIVES_TABLE,
     EMBEDDINGS_TABLE, EXPERIENCES_BY_COLLECTIVE_TABLE, EXPERIENCES_BY_TYPE_TABLE,
-    EXPERIENCES_TABLE, METADATA_TABLE, SCHEMA_VERSION,
+    EXPERIENCES_TABLE, METADATA_TABLE, RELATIONS_BY_SOURCE_TABLE, RELATIONS_BY_TARGET_TABLE,
+    RELATIONS_TABLE, SCHEMA_VERSION,
 };
 use super::StorageEngine;
 use crate::config::{Config, EmbeddingDimension};
@@ -149,6 +151,9 @@ impl RedbStorage {
             let _ = write_txn.open_table(EMBEDDINGS_TABLE)?;
             let _ = write_txn.open_multimap_table(EXPERIENCES_BY_COLLECTIVE_TABLE)?;
             let _ = write_txn.open_multimap_table(EXPERIENCES_BY_TYPE_TABLE)?;
+            let _ = write_txn.open_table(RELATIONS_TABLE)?;
+            let _ = write_txn.open_multimap_table(RELATIONS_BY_SOURCE_TABLE)?;
+            let _ = write_txn.open_multimap_table(RELATIONS_BY_TARGET_TABLE)?;
         }
 
         write_txn.commit().map_err(StorageError::from)?;
@@ -356,8 +361,8 @@ impl StorageEngine for RedbStorage {
     }
 
     fn delete_experiences_by_collective(&self, id: CollectiveId) -> Result<u64> {
-        // Phase 1: Read — collect experience IDs to delete
-        let exp_ids: Vec<[u8; 16]> = {
+        // Phase 1: Read — collect experience IDs and relation IDs to delete
+        let (exp_ids, relation_ids): (Vec<[u8; 16]>, Vec<[u8; 16]>) = {
             let read_txn = self.db.begin_read().map_err(StorageError::from)?;
             let table = read_txn.open_multimap_table(EXPERIENCES_BY_COLLECTIVE_TABLE)?;
 
@@ -370,7 +375,23 @@ impl StorageEngine for RedbStorage {
                 exp_id.copy_from_slice(&entry[8..24]);
                 ids.push(exp_id);
             }
-            ids
+
+            // Collect all relation IDs for these experiences (deduplicated)
+            let mut rel_ids = std::collections::HashSet::new();
+            let source_table = read_txn.open_multimap_table(RELATIONS_BY_SOURCE_TABLE)?;
+            let target_table = read_txn.open_multimap_table(RELATIONS_BY_TARGET_TABLE)?;
+            for exp_id in &ids {
+                for result in source_table.get(exp_id)? {
+                    let value = result.map_err(StorageError::from)?;
+                    rel_ids.insert(*value.value());
+                }
+                for result in target_table.get(exp_id)? {
+                    let value = result.map_err(StorageError::from)?;
+                    rel_ids.insert(*value.value());
+                }
+            }
+
+            (ids, rel_ids.into_iter().collect())
         };
 
         let count = exp_ids.len() as u64;
@@ -405,6 +426,29 @@ impl StorageEngine for RedbStorage {
             for tag in ExperienceTypeTag::all() {
                 let key = encode_type_index_key(id.as_bytes(), *tag);
                 type_table.remove_all(&key)?;
+            }
+        }
+        {
+            // Delete relations and their index entries
+            if !relation_ids.is_empty() {
+                let mut rel_table = write_txn.open_table(RELATIONS_TABLE)?;
+                let mut source_idx = write_txn.open_multimap_table(RELATIONS_BY_SOURCE_TABLE)?;
+                let mut target_idx = write_txn.open_multimap_table(RELATIONS_BY_TARGET_TABLE)?;
+
+                // Clear relation indexes for all affected experiences
+                for exp_id in &exp_ids {
+                    source_idx.remove_all(exp_id)?;
+                    target_idx.remove_all(exp_id)?;
+                }
+                // Delete the relation records themselves
+                for rel_id in &relation_ids {
+                    rel_table.remove(rel_id)?;
+                }
+
+                debug!(
+                    count = relation_ids.len(),
+                    "Cascade-deleted relations for collective"
+                );
             }
         }
         write_txn.commit().map_err(StorageError::from)?;
@@ -685,6 +729,213 @@ impl StorageEngine for RedbStorage {
             Some(entry) => Ok(Some(bytes_to_f32_vec(entry.value()))),
             None => Ok(None),
         }
+    }
+
+    // =========================================================================
+    // Relation Storage Operations (E3-S01)
+    // =========================================================================
+
+    fn save_relation(&self, relation: &ExperienceRelation) -> Result<()> {
+        let bytes =
+            bincode::serialize(relation).map_err(|e| StorageError::serialization(e.to_string()))?;
+
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        {
+            let mut table = write_txn.open_table(RELATIONS_TABLE)?;
+            table.insert(relation.id.as_bytes(), bytes.as_slice())?;
+        }
+        {
+            let mut table = write_txn.open_multimap_table(RELATIONS_BY_SOURCE_TABLE)?;
+            table.insert(relation.source_id.as_bytes(), relation.id.as_bytes())?;
+        }
+        {
+            let mut table = write_txn.open_multimap_table(RELATIONS_BY_TARGET_TABLE)?;
+            table.insert(relation.target_id.as_bytes(), relation.id.as_bytes())?;
+        }
+        write_txn.commit().map_err(StorageError::from)?;
+
+        debug!(id = %relation.id, "Relation saved");
+        Ok(())
+    }
+
+    fn get_relation(&self, id: RelationId) -> Result<Option<ExperienceRelation>> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let table = read_txn.open_table(RELATIONS_TABLE)?;
+
+        match table.get(id.as_bytes())? {
+            Some(value) => {
+                let relation: ExperienceRelation = bincode::deserialize(value.value())
+                    .map_err(|e| StorageError::serialization(e.to_string()))?;
+                Ok(Some(relation))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn delete_relation(&self, id: RelationId) -> Result<bool> {
+        // Read the relation first to get source/target IDs for index cleanup
+        let (source_id, target_id) = {
+            let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+            let table = read_txn.open_table(RELATIONS_TABLE)?;
+
+            match table.get(id.as_bytes())? {
+                Some(entry) => {
+                    let rel: ExperienceRelation = bincode::deserialize(entry.value())
+                        .map_err(|e| StorageError::serialization(e.to_string()))?;
+                    (rel.source_id, rel.target_id)
+                }
+                None => return Ok(false),
+            }
+        };
+
+        // Delete from all 3 tables atomically
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        {
+            let mut table = write_txn.open_table(RELATIONS_TABLE)?;
+            table.remove(id.as_bytes())?;
+        }
+        {
+            let mut table = write_txn.open_multimap_table(RELATIONS_BY_SOURCE_TABLE)?;
+            table.remove(source_id.as_bytes(), id.as_bytes())?;
+        }
+        {
+            let mut table = write_txn.open_multimap_table(RELATIONS_BY_TARGET_TABLE)?;
+            table.remove(target_id.as_bytes(), id.as_bytes())?;
+        }
+        write_txn.commit().map_err(StorageError::from)?;
+
+        debug!(id = %id, "Relation deleted");
+        Ok(true)
+    }
+
+    fn get_relation_ids_by_source(&self, experience_id: ExperienceId) -> Result<Vec<RelationId>> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let table = read_txn.open_multimap_table(RELATIONS_BY_SOURCE_TABLE)?;
+
+        let mut ids = Vec::new();
+        for result in table.get(experience_id.as_bytes())? {
+            let value = result.map_err(StorageError::from)?;
+            let bytes = value.value();
+            ids.push(RelationId::from_bytes(*bytes));
+        }
+
+        Ok(ids)
+    }
+
+    fn get_relation_ids_by_target(&self, experience_id: ExperienceId) -> Result<Vec<RelationId>> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let table = read_txn.open_multimap_table(RELATIONS_BY_TARGET_TABLE)?;
+
+        let mut ids = Vec::new();
+        for result in table.get(experience_id.as_bytes())? {
+            let value = result.map_err(StorageError::from)?;
+            let bytes = value.value();
+            ids.push(RelationId::from_bytes(*bytes));
+        }
+
+        Ok(ids)
+    }
+
+    fn delete_relations_for_experience(&self, experience_id: ExperienceId) -> Result<u64> {
+        // Phase 1: Read — collect all relation IDs from both indexes
+        let relation_ids: Vec<RelationId> = {
+            let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+            let source_table = read_txn.open_multimap_table(RELATIONS_BY_SOURCE_TABLE)?;
+            let target_table = read_txn.open_multimap_table(RELATIONS_BY_TARGET_TABLE)?;
+
+            let mut ids = std::collections::HashSet::new();
+
+            // Outgoing relations (this experience is source)
+            for result in source_table.get(experience_id.as_bytes())? {
+                let value = result.map_err(StorageError::from)?;
+                ids.insert(RelationId::from_bytes(*value.value()));
+            }
+
+            // Incoming relations (this experience is target)
+            for result in target_table.get(experience_id.as_bytes())? {
+                let value = result.map_err(StorageError::from)?;
+                ids.insert(RelationId::from_bytes(*value.value()));
+            }
+
+            ids.into_iter().collect()
+        };
+
+        let count = relation_ids.len() as u64;
+        if count == 0 {
+            return Ok(0);
+        }
+
+        // Phase 2: Read each relation to get source/target IDs for index cleanup
+        let relations: Vec<ExperienceRelation> = {
+            let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+            let table = read_txn.open_table(RELATIONS_TABLE)?;
+
+            let mut rels = Vec::with_capacity(relation_ids.len());
+            for rel_id in &relation_ids {
+                if let Some(entry) = table.get(rel_id.as_bytes())? {
+                    let rel: ExperienceRelation = bincode::deserialize(entry.value())
+                        .map_err(|e| StorageError::serialization(e.to_string()))?;
+                    rels.push(rel);
+                }
+            }
+            rels
+        };
+
+        // Phase 3: Write — delete from all 3 tables atomically
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        {
+            let mut rel_table = write_txn.open_table(RELATIONS_TABLE)?;
+            for rel in &relations {
+                rel_table.remove(rel.id.as_bytes())?;
+            }
+        }
+        {
+            let mut source_table = write_txn.open_multimap_table(RELATIONS_BY_SOURCE_TABLE)?;
+            for rel in &relations {
+                source_table.remove(rel.source_id.as_bytes(), rel.id.as_bytes())?;
+            }
+        }
+        {
+            let mut target_table = write_txn.open_multimap_table(RELATIONS_BY_TARGET_TABLE)?;
+            for rel in &relations {
+                target_table.remove(rel.target_id.as_bytes(), rel.id.as_bytes())?;
+            }
+        }
+        write_txn.commit().map_err(StorageError::from)?;
+
+        debug!(
+            experience_id = %experience_id,
+            count = count,
+            "Cascade-deleted relations for experience"
+        );
+        Ok(count)
+    }
+
+    fn relation_exists(
+        &self,
+        source_id: ExperienceId,
+        target_id: ExperienceId,
+        relation_type: RelationType,
+    ) -> Result<bool> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let index_table = read_txn.open_multimap_table(RELATIONS_BY_SOURCE_TABLE)?;
+        let rel_table = read_txn.open_table(RELATIONS_TABLE)?;
+
+        // Scan all relations for this source and check each
+        for result in index_table.get(source_id.as_bytes())? {
+            let value = result.map_err(StorageError::from)?;
+            let rel_id = RelationId::from_bytes(*value.value());
+
+            if let Some(entry) = rel_table.get(rel_id.as_bytes())? {
+                let rel: ExperienceRelation = bincode::deserialize(entry.value())
+                    .map_err(|e| StorageError::serialization(e.to_string()))?;
+                if rel.target_id == target_id && rel.relation_type == relation_type {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
     }
 }
 

@@ -158,6 +158,54 @@ impl fmt::Display for Timestamp {
     }
 }
 
+/// Relation identifier (UUID v7 for time-ordering).
+///
+/// Relations connect two experiences within the same collective,
+/// enabling agents to understand how knowledge connects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RelationId(pub Uuid);
+
+impl RelationId {
+    /// Creates a new RelationId with a UUID v7 (time-ordered).
+    #[inline]
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    /// Creates a nil (all zeros) RelationId.
+    #[inline]
+    pub fn nil() -> Self {
+        Self(Uuid::nil())
+    }
+
+    /// Returns the raw UUID bytes for storage.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        self.0.as_bytes()
+    }
+
+    /// Creates a RelationId from raw bytes.
+    #[inline]
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Uuid::from_bytes(bytes))
+    }
+}
+
+impl Default for RelationId {
+    /// Returns a nil (all zeros) RelationId.
+    ///
+    /// For a new unique ID, use [`RelationId::new()`].
+    fn default() -> Self {
+        Self::nil()
+    }
+}
+
+impl fmt::Display for RelationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Opaque user identifier.
 ///
 /// PulseDB doesn't handle authentication - the consumer provides user IDs.
@@ -283,6 +331,35 @@ mod tests {
         let id = ExperienceId::new();
         let bytes = bincode::serialize(&id).unwrap();
         let restored: ExperienceId = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(id, restored);
+    }
+
+    #[test]
+    fn test_relation_id_new_is_unique() {
+        let id1 = RelationId::new();
+        let id2 = RelationId::new();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_relation_id_nil() {
+        let id = RelationId::nil();
+        assert_eq!(id.0, Uuid::nil());
+    }
+
+    #[test]
+    fn test_relation_id_bytes_roundtrip() {
+        let id = RelationId::new();
+        let bytes = *id.as_bytes();
+        let restored = RelationId::from_bytes(bytes);
+        assert_eq!(id, restored);
+    }
+
+    #[test]
+    fn test_relation_id_serialization() {
+        let id = RelationId::new();
+        let bytes = bincode::serialize(&id).unwrap();
+        let restored: RelationId = bincode::deserialize(&bytes).unwrap();
         assert_eq!(id, restored);
     }
 

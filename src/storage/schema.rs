@@ -62,6 +62,9 @@ pub const MAX_FILE_PATH_LENGTH: usize = 500;
 /// Maximum length of a source agent identifier.
 pub const MAX_SOURCE_AGENT_LENGTH: usize = 256;
 
+/// Maximum relation metadata size in bytes (10 KB).
+pub const MAX_RELATION_METADATA_SIZE: usize = 10 * 1024;
+
 // ============================================================================
 // Table Definitions
 // ============================================================================
@@ -113,6 +116,36 @@ pub const EXPERIENCES_BY_TYPE_TABLE: MultimapTableDefinition<&[u8; 17], &[u8; 16
 /// Key: ExperienceId as 16-byte UUID
 /// Value: raw f32 bytes (dimension * 4 bytes)
 pub const EMBEDDINGS_TABLE: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("embeddings");
+
+// ============================================================================
+// Relation Tables (E3-S01)
+// ============================================================================
+
+/// Relations table.
+///
+/// Primary storage for experience relations.
+/// Key: RelationId as 16-byte UUID
+/// Value: bincode-serialized ExperienceRelation struct
+pub const RELATIONS_TABLE: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("relations");
+
+/// Index: Relations by source experience.
+///
+/// Enables efficient queries like "find all outgoing relations from experience X".
+/// Key: ExperienceId (source) as 16-byte UUID
+/// Value (multimap): RelationId as 16-byte UUID
+///
+/// Multiple relations per source experience. Iterate values with
+/// `table.get(source_id)?` to find all outgoing relation IDs.
+pub const RELATIONS_BY_SOURCE_TABLE: MultimapTableDefinition<&[u8; 16], &[u8; 16]> =
+    MultimapTableDefinition::new("relations_by_source");
+
+/// Index: Relations by target experience.
+///
+/// Enables efficient queries like "find all incoming relations to experience X".
+/// Key: ExperienceId (target) as 16-byte UUID
+/// Value (multimap): RelationId as 16-byte UUID
+pub const RELATIONS_BY_TARGET_TABLE: MultimapTableDefinition<&[u8; 16], &[u8; 16]> =
+    MultimapTableDefinition::new("relations_by_target");
 
 // ============================================================================
 // Experience Type Tag
