@@ -24,6 +24,13 @@ use crate::types::ExperienceId;
 
 use super::VectorIndex;
 
+/// Below this threshold, search uses brute-force linear scan instead of HNSW
+/// graph traversal. hnsw_rs stores each point only in its assigned layer, so
+/// points placed in upper layers are unreachable during layer-0 search. For
+/// small collections this causes missed results. Linear scan is both more
+/// reliable (100% recall) and faster (no graph overhead) at this scale.
+const BRUTE_FORCE_THRESHOLD: usize = 128;
+
 /// Newtype wrapper that bridges `&dyn Fn(&usize) -> bool` to `FilterT`.
 ///
 /// Rust's blanket impl `impl<F: Fn(&DataId) -> bool> FilterT for F` only
@@ -210,18 +217,38 @@ impl HnswIndex {
             .read()
             .map_err(|_| PulseDBError::vector("Index state lock poisoned"))?;
 
-        // Cap k to the number of active items. HNSW's probabilistic graph
-        // traversal can miss nodes in very small graphs when k >> n.
         let active_count = state.next_id - state.deleted.len();
         if active_count == 0 {
             return Ok(vec![]);
         }
         let effective_k = k.min(active_count);
-        let effective_ef = ef_search.max(effective_k);
 
-        // Use filtered search to exclude soft-deleted entries.
-        // We create a concrete closure (not a trait object) so it
-        // auto-implements hnsw_rs::FilterT via the blanket impl.
+        if active_count <= BRUTE_FORCE_THRESHOLD {
+            // Linear scan: iterate all stored vectors and compute exact distances.
+            // Guarantees 100% recall for small collections where HNSW's layer
+            // fragmentation causes missed results.
+            let dist_fn = DistCosine;
+            let mut all_distances: Vec<(ExperienceId, f32)> = Vec::with_capacity(active_count);
+
+            for point in self.hnsw.get_point_indexation().into_iter() {
+                let origin_id = point.get_origin_id();
+                if state.deleted.contains(&origin_id) {
+                    continue;
+                }
+                let distance = dist_fn.eval(query, point.get_v());
+                if let Some(&exp_id) = state.internal_to_id.get(origin_id) {
+                    all_distances.push((exp_id, distance));
+                }
+            }
+
+            all_distances
+                .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            all_distances.truncate(effective_k);
+            return Ok(all_distances);
+        }
+
+        // HNSW graph search for larger collections
+        let effective_ef = ef_search.max(effective_k);
         let deleted_ref = &state.deleted;
         let filter_fn = |id: &usize| -> bool { !deleted_ref.contains(id) };
         let results = if state.deleted.is_empty() {
@@ -722,6 +749,73 @@ mod tests {
         // Remove files
         HnswIndex::remove_files(dir.path(), "test_coll").unwrap();
         assert!(!meta_path.exists());
+    }
+
+    #[test]
+    fn test_brute_force_search_returns_all_items() {
+        let dim = 8;
+        let config = test_config();
+        let index = HnswIndex::new(dim, &config);
+
+        // Insert 20 items (well below BRUTE_FORCE_THRESHOLD of 128)
+        let mut ids = Vec::new();
+        for i in 0..20u64 {
+            let exp_id = ExperienceId::new();
+            index
+                .insert_experience(exp_id, &make_embedding(i, dim))
+                .unwrap();
+            ids.push(exp_id);
+        }
+
+        // Search for all 20 — brute-force path must return every one
+        let query = make_embedding(10, dim);
+        let results = index.search_experiences(&query, 20, 50).unwrap();
+        assert_eq!(results.len(), 20, "Brute-force must return all 20 items");
+
+        // Results sorted by distance ascending
+        for w in results.windows(2) {
+            assert!(
+                w[0].1 <= w[1].1,
+                "Brute-force results not sorted: {} > {}",
+                w[0].1,
+                w[1].1
+            );
+        }
+
+        // The exact query match (seed=10) should be first with distance ≈ 0
+        assert_eq!(results[0].0, ids[10]);
+        assert!(
+            results[0].1 < 0.001,
+            "Expected near-zero distance for exact match, got {}",
+            results[0].1
+        );
+    }
+
+    #[test]
+    fn test_brute_force_excludes_deleted() {
+        let dim = 8;
+        let index = HnswIndex::new(dim, &test_config());
+
+        let mut ids = Vec::new();
+        for i in 0..5u64 {
+            let exp_id = ExperienceId::new();
+            index
+                .insert_experience(exp_id, &make_embedding(i, dim))
+                .unwrap();
+            ids.push(exp_id);
+        }
+
+        // Delete one
+        index.delete_experience(ids[2]).unwrap();
+
+        let query = make_embedding(2, dim);
+        let results = index.search_experiences(&query, 10, 50).unwrap();
+        assert_eq!(results.len(), 4, "Should return 4 after deleting 1 of 5");
+        let result_ids: Vec<ExperienceId> = results.iter().map(|r| r.0).collect();
+        assert!(
+            !result_ids.contains(&ids[2]),
+            "Deleted item must be excluded"
+        );
     }
 
     #[test]
