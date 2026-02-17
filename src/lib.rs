@@ -81,6 +81,7 @@ pub mod embedding;
 pub mod storage;
 
 // Domain modules
+mod activity;
 mod collective;
 mod experience;
 mod insight;
@@ -98,7 +99,9 @@ pub mod vector;
 pub use db::PulseDB;
 
 // Configuration
-pub use config::{Config, EmbeddingDimension, EmbeddingProvider, HnswConfig, SyncMode};
+pub use config::{
+    ActivityConfig, Config, EmbeddingDimension, EmbeddingProvider, HnswConfig, SyncMode,
+};
 
 // Error handling
 pub use error::{NotFoundError, PulseDBError, Result, StorageError, ValidationError};
@@ -118,6 +121,9 @@ pub use relation::{ExperienceRelation, NewExperienceRelation, RelationDirection,
 
 // Insights
 pub use insight::{DerivedInsight, InsightType, NewDerivedInsight};
+
+// Activities
+pub use activity::{Activity, NewActivity};
 
 // Search
 pub use search::{SearchFilter, SearchResult};

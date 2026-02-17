@@ -56,6 +56,7 @@ use std::sync::RwLock;
 
 use tracing::{info, instrument, warn};
 
+use crate::activity::{validate_new_activity, Activity, NewActivity};
 use crate::collective::types::CollectiveStats;
 use crate::collective::{validate_collective_name, Collective};
 use crate::config::{Config, EmbeddingProvider};
@@ -674,6 +675,12 @@ impl PulseDB {
         let deleted_insights = self.storage.delete_insights_by_collective(id)?;
         if deleted_insights > 0 {
             info!(count = deleted_insights, "Cascade-deleted insights");
+        }
+
+        // Cascade: delete all activities for this collective
+        let deleted_activities = self.storage.delete_activities_by_collective(id)?;
+        if deleted_activities > 0 {
+            info!(count = deleted_activities, "Cascade-deleted activities");
         }
 
         // Delete the collective record from storage
@@ -1592,6 +1599,150 @@ impl PulseDB {
 
         info!(id = %id, "Insight deleted");
         Ok(())
+    }
+
+    // =========================================================================
+    // Activity Tracking (E3-S03)
+    // =========================================================================
+
+    /// Registers an agent's presence in a collective.
+    ///
+    /// Creates a new activity record or replaces an existing one for the
+    /// same `(collective_id, agent_id)` pair (upsert semantics). Both
+    /// `started_at` and `last_heartbeat` are set to `Timestamp::now()`.
+    ///
+    /// # Arguments
+    ///
+    /// * `activity` - The activity registration (see [`NewActivity`])
+    ///
+    /// # Errors
+    ///
+    /// - [`ValidationError`] if agent_id is empty or fields exceed size limits
+    /// - [`NotFoundError::Collective`] if the collective doesn't exist
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// db.register_activity(NewActivity {
+    ///     agent_id: "claude-opus".to_string(),
+    ///     collective_id,
+    ///     current_task: Some("Reviewing pull request".to_string()),
+    ///     context_summary: None,
+    /// })?;
+    /// ```
+    #[instrument(skip(self, activity), fields(agent_id = %activity.agent_id, collective_id = %activity.collective_id))]
+    pub fn register_activity(&self, activity: NewActivity) -> Result<()> {
+        // Validate input
+        validate_new_activity(&activity)?;
+
+        // Verify collective exists
+        self.storage
+            .get_collective(activity.collective_id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::collective(activity.collective_id)))?;
+
+        // Build stored activity with timestamps
+        let now = Timestamp::now();
+        let stored = Activity {
+            agent_id: activity.agent_id,
+            collective_id: activity.collective_id,
+            current_task: activity.current_task,
+            context_summary: activity.context_summary,
+            started_at: now,
+            last_heartbeat: now,
+        };
+
+        self.storage.save_activity(&stored)?;
+
+        info!(
+            agent_id = %stored.agent_id,
+            collective_id = %stored.collective_id,
+            "Activity registered"
+        );
+        Ok(())
+    }
+
+    /// Updates an agent's heartbeat timestamp.
+    ///
+    /// Refreshes the `last_heartbeat` to `Timestamp::now()` without changing
+    /// any other fields. The agent must have an existing activity registered.
+    ///
+    /// # Errors
+    ///
+    /// - [`NotFoundError::Activity`] if no activity exists for the agent/collective pair
+    #[instrument(skip(self))]
+    pub fn update_heartbeat(&self, agent_id: &str, collective_id: CollectiveId) -> Result<()> {
+        let mut activity = self
+            .storage
+            .get_activity(agent_id, collective_id)?
+            .ok_or_else(|| {
+                PulseDBError::from(NotFoundError::activity(format!(
+                    "{} in {}",
+                    agent_id, collective_id
+                )))
+            })?;
+
+        activity.last_heartbeat = Timestamp::now();
+        self.storage.save_activity(&activity)?;
+
+        info!(agent_id = %agent_id, collective_id = %collective_id, "Heartbeat updated");
+        Ok(())
+    }
+
+    /// Ends an agent's activity in a collective.
+    ///
+    /// Removes the activity record. After calling this, the agent will no
+    /// longer appear in `get_active_agents()` results.
+    ///
+    /// # Errors
+    ///
+    /// - [`NotFoundError::Activity`] if no activity exists for the agent/collective pair
+    #[instrument(skip(self))]
+    pub fn end_activity(&self, agent_id: &str, collective_id: CollectiveId) -> Result<()> {
+        let deleted = self.storage.delete_activity(agent_id, collective_id)?;
+
+        if !deleted {
+            return Err(PulseDBError::from(NotFoundError::activity(format!(
+                "{} in {}",
+                agent_id, collective_id
+            ))));
+        }
+
+        info!(agent_id = %agent_id, collective_id = %collective_id, "Activity ended");
+        Ok(())
+    }
+
+    /// Returns all active (non-stale) agents in a collective.
+    ///
+    /// Fetches all activities, filters out those whose `last_heartbeat` is
+    /// older than `config.activity.stale_threshold`, and returns the rest
+    /// sorted by `last_heartbeat` descending (most recently active first).
+    ///
+    /// # Errors
+    ///
+    /// - [`NotFoundError::Collective`] if the collective doesn't exist
+    #[instrument(skip(self))]
+    pub fn get_active_agents(&self, collective_id: CollectiveId) -> Result<Vec<Activity>> {
+        // Verify collective exists
+        self.storage
+            .get_collective(collective_id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::collective(collective_id)))?;
+
+        let all_activities = self.storage.list_activities_in_collective(collective_id)?;
+
+        // Filter stale activities
+        let now = Timestamp::now();
+        let threshold_ms = self.config.activity.stale_threshold.as_millis() as i64;
+        let cutoff = now.as_millis() - threshold_ms;
+
+        let mut active: Vec<Activity> = all_activities
+            .into_iter()
+            .filter(|a| a.last_heartbeat.as_millis() >= cutoff)
+            .collect();
+
+        // Sort by last_heartbeat descending (most recently active first)
+        active.sort_by(|a, b| b.last_heartbeat.cmp(&a.last_heartbeat));
+
+        Ok(active)
     }
 }
 
