@@ -23,14 +23,15 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::collective::Collective;
 use crate::experience::{Experience, ExperienceUpdate};
+use crate::insight::DerivedInsight;
 use crate::relation::{ExperienceRelation, RelationType};
-use crate::types::{CollectiveId, ExperienceId, RelationId, Timestamp};
+use crate::types::{CollectiveId, ExperienceId, InsightId, RelationId, Timestamp};
 
 use super::schema::{
     encode_type_index_key, DatabaseMetadata, ExperienceTypeTag, COLLECTIVES_TABLE,
     EMBEDDINGS_TABLE, EXPERIENCES_BY_COLLECTIVE_TABLE, EXPERIENCES_BY_TYPE_TABLE,
-    EXPERIENCES_TABLE, METADATA_TABLE, RELATIONS_BY_SOURCE_TABLE, RELATIONS_BY_TARGET_TABLE,
-    RELATIONS_TABLE, SCHEMA_VERSION,
+    EXPERIENCES_TABLE, INSIGHTS_BY_COLLECTIVE_TABLE, INSIGHTS_TABLE, METADATA_TABLE,
+    RELATIONS_BY_SOURCE_TABLE, RELATIONS_BY_TARGET_TABLE, RELATIONS_TABLE, SCHEMA_VERSION,
 };
 use super::StorageEngine;
 use crate::config::{Config, EmbeddingDimension};
@@ -154,6 +155,8 @@ impl RedbStorage {
             let _ = write_txn.open_table(RELATIONS_TABLE)?;
             let _ = write_txn.open_multimap_table(RELATIONS_BY_SOURCE_TABLE)?;
             let _ = write_txn.open_multimap_table(RELATIONS_BY_TARGET_TABLE)?;
+            let _ = write_txn.open_table(INSIGHTS_TABLE)?;
+            let _ = write_txn.open_multimap_table(INSIGHTS_BY_COLLECTIVE_TABLE)?;
         }
 
         write_txn.commit().map_err(StorageError::from)?;
@@ -936,6 +939,125 @@ impl StorageEngine for RedbStorage {
         }
 
         Ok(false)
+    }
+
+    // =========================================================================
+    // Insight Storage Operations (E3-S02)
+    // =========================================================================
+
+    fn save_insight(&self, insight: &DerivedInsight) -> Result<()> {
+        let bytes =
+            bincode::serialize(insight).map_err(|e| StorageError::serialization(e.to_string()))?;
+
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        {
+            let mut table = write_txn.open_table(INSIGHTS_TABLE)?;
+            table.insert(insight.id.as_bytes(), bytes.as_slice())?;
+        }
+        {
+            let mut table = write_txn.open_multimap_table(INSIGHTS_BY_COLLECTIVE_TABLE)?;
+            table.insert(insight.collective_id.as_bytes(), insight.id.as_bytes())?;
+        }
+        write_txn.commit().map_err(StorageError::from)?;
+
+        debug!(id = %insight.id, collective_id = %insight.collective_id, "Insight saved");
+        Ok(())
+    }
+
+    fn get_insight(&self, id: InsightId) -> Result<Option<DerivedInsight>> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let table = read_txn.open_table(INSIGHTS_TABLE)?;
+
+        match table.get(id.as_bytes())? {
+            Some(value) => {
+                let insight: DerivedInsight = bincode::deserialize(value.value())
+                    .map_err(|e| StorageError::serialization(e.to_string()))?;
+                Ok(Some(insight))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn delete_insight(&self, id: InsightId) -> Result<bool> {
+        // Read the insight first to get collective_id for index cleanup
+        let collective_id = {
+            let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+            let table = read_txn.open_table(INSIGHTS_TABLE)?;
+
+            match table.get(id.as_bytes())? {
+                Some(entry) => {
+                    let insight: DerivedInsight = bincode::deserialize(entry.value())
+                        .map_err(|e| StorageError::serialization(e.to_string()))?;
+                    insight.collective_id
+                }
+                None => return Ok(false),
+            }
+        };
+
+        // Delete from both tables atomically
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        {
+            let mut table = write_txn.open_table(INSIGHTS_TABLE)?;
+            table.remove(id.as_bytes())?;
+        }
+        {
+            let mut table = write_txn.open_multimap_table(INSIGHTS_BY_COLLECTIVE_TABLE)?;
+            table.remove(collective_id.as_bytes(), id.as_bytes())?;
+        }
+        write_txn.commit().map_err(StorageError::from)?;
+
+        debug!(id = %id, "Insight deleted");
+        Ok(true)
+    }
+
+    fn list_insight_ids_in_collective(&self, id: CollectiveId) -> Result<Vec<InsightId>> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let table = read_txn.open_multimap_table(INSIGHTS_BY_COLLECTIVE_TABLE)?;
+
+        let mut ids = Vec::new();
+        for result in table.get(id.as_bytes())? {
+            let value = result.map_err(StorageError::from)?;
+            ids.push(InsightId::from_bytes(*value.value()));
+        }
+
+        Ok(ids)
+    }
+
+    fn delete_insights_by_collective(&self, id: CollectiveId) -> Result<u64> {
+        // Phase 1: Read — collect insight IDs
+        let insight_ids: Vec<[u8; 16]> = {
+            let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+            let table = read_txn.open_multimap_table(INSIGHTS_BY_COLLECTIVE_TABLE)?;
+
+            let mut ids = Vec::new();
+            for result in table.get(id.as_bytes())? {
+                let value = result.map_err(StorageError::from)?;
+                ids.push(*value.value());
+            }
+            ids
+        };
+
+        let count = insight_ids.len() as u64;
+        if count == 0 {
+            return Ok(0);
+        }
+
+        // Phase 2: Write — delete from both tables atomically
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        {
+            let mut table = write_txn.open_table(INSIGHTS_TABLE)?;
+            for insight_id in &insight_ids {
+                table.remove(insight_id)?;
+            }
+        }
+        {
+            let mut table = write_txn.open_multimap_table(INSIGHTS_BY_COLLECTIVE_TABLE)?;
+            table.remove_all(id.as_bytes())?;
+        }
+        write_txn.commit().map_err(StorageError::from)?;
+
+        debug!(id = %id, count = count, "Cascade-deleted insights for collective");
+        Ok(count)
     }
 }
 

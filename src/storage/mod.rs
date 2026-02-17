@@ -34,8 +34,9 @@ use crate::collective::Collective;
 use crate::config::Config;
 use crate::error::Result;
 use crate::experience::{Experience, ExperienceUpdate};
+use crate::insight::DerivedInsight;
 use crate::relation::{ExperienceRelation, RelationType};
-use crate::types::{CollectiveId, ExperienceId, RelationId, Timestamp};
+use crate::types::{CollectiveId, ExperienceId, InsightId, RelationId, Timestamp};
 
 /// Storage engine trait for PulseDB.
 ///
@@ -293,6 +294,40 @@ pub trait StorageEngine: Send + Sync {
         target_id: ExperienceId,
         relation_type: RelationType,
     ) -> Result<bool>;
+
+    // =========================================================================
+    // Insight Storage Operations (E3-S02)
+    // =========================================================================
+
+    /// Saves a derived insight and its index entries atomically.
+    ///
+    /// Writes to 2 tables in a single transaction:
+    /// - `INSIGHTS_TABLE` — the insight record (with inline embedding)
+    /// - `INSIGHTS_BY_COLLECTIVE_TABLE` — index by collective
+    fn save_insight(&self, insight: &DerivedInsight) -> Result<()>;
+
+    /// Retrieves a derived insight by ID.
+    ///
+    /// Returns `None` if no insight with the given ID exists.
+    fn get_insight(&self, id: InsightId) -> Result<Option<DerivedInsight>>;
+
+    /// Deletes a derived insight and its index entries atomically.
+    ///
+    /// Returns `true` if the insight existed and was deleted,
+    /// `false` if not found.
+    fn delete_insight(&self, id: InsightId) -> Result<bool>;
+
+    /// Lists all insight IDs belonging to a collective.
+    ///
+    /// Used to rebuild HNSW indexes from stored insights on startup.
+    /// Iterates the `INSIGHTS_BY_COLLECTIVE_TABLE` multimap.
+    fn list_insight_ids_in_collective(&self, id: CollectiveId) -> Result<Vec<InsightId>>;
+
+    /// Deletes all insights belonging to a collective.
+    ///
+    /// Used for cascade deletion when a collective is removed.
+    /// Returns the count of deleted insights.
+    fn delete_insights_by_collective(&self, id: CollectiveId) -> Result<u64>;
 }
 
 /// Opens a storage engine at the given path.

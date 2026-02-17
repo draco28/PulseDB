@@ -65,9 +65,10 @@ use crate::experience::{
     validate_experience_update, validate_new_experience, Experience, ExperienceUpdate,
     NewExperience,
 };
+use crate::insight::{validate_new_insight, DerivedInsight, NewDerivedInsight};
 use crate::search::{SearchFilter, SearchResult};
 use crate::storage::{open_storage, DatabaseMetadata, StorageEngine};
-use crate::types::{CollectiveId, ExperienceId, Timestamp};
+use crate::types::{CollectiveId, ExperienceId, InsightId, Timestamp};
 use crate::vector::HnswIndex;
 
 /// The main PulseDB database handle.
@@ -90,20 +91,29 @@ pub struct PulseDB {
     /// Configuration used to open this database.
     config: Config,
 
-    /// Per-collective HNSW vector indexes for semantic search.
+    /// Per-collective HNSW vector indexes for experience semantic search.
     ///
     /// Outer RwLock protects the HashMap (add/remove collectives).
     /// Each HnswIndex has its own internal RwLock for concurrent search+insert.
     vectors: RwLock<HashMap<CollectiveId, HnswIndex>>,
+
+    /// Per-collective HNSW vector indexes for insight semantic search.
+    ///
+    /// Separate from `vectors` to prevent ID collisions between experiences
+    /// and insights. Uses InsightId→ExperienceId byte conversion for the
+    /// HNSW API (safe because indexes are isolated per collective).
+    insight_vectors: RwLock<HashMap<CollectiveId, HnswIndex>>,
 }
 
 impl std::fmt::Debug for PulseDB {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let vector_count = self.vectors.read().map(|v| v.len()).unwrap_or(0);
+        let insight_vector_count = self.insight_vectors.read().map(|v| v.len()).unwrap_or(0);
         f.debug_struct("PulseDB")
             .field("config", &self.config)
             .field("embedding_dimension", &self.embedding_dimension())
             .field("vector_indexes", &vector_count)
+            .field("insight_vector_indexes", &insight_vector_count)
             .finish_non_exhaustive()
     }
 }
@@ -158,6 +168,7 @@ impl PulseDB {
 
         // Load or rebuild HNSW indexes for all existing collectives
         let vectors = Self::load_all_indexes(&*storage, &config)?;
+        let insight_vectors = Self::load_all_insight_indexes(&*storage, &config)?;
 
         info!(
             dimension = config.embedding_dimension.size(),
@@ -171,6 +182,7 @@ impl PulseDB {
             embedding,
             config,
             vectors: RwLock::new(vectors),
+            insight_vectors: RwLock::new(insight_vectors),
         })
     }
 
@@ -204,6 +216,7 @@ impl PulseDB {
         // If HNSW save fails, storage is still open for potential recovery.
         // On next open(), stale/missing HNSW files trigger a rebuild from redb.
         if let Some(hnsw_dir) = self.hnsw_dir() {
+            // Experience HNSW indexes
             let vectors = self
                 .vectors
                 .read()
@@ -214,6 +227,23 @@ impl PulseDB {
                         collective = %collective_id,
                         error = %e,
                         "Failed to save HNSW index (will rebuild on next open)"
+                    );
+                }
+            }
+            drop(vectors);
+
+            // Insight HNSW indexes (separate files with _insights suffix)
+            let insight_vectors = self
+                .insight_vectors
+                .read()
+                .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned during close"))?;
+            for (collective_id, index) in insight_vectors.iter() {
+                let name = format!("{}_insights", collective_id);
+                if let Err(e) = index.save_to_dir(&hnsw_dir, &name) {
+                    warn!(
+                        collective = %collective_id,
+                        error = %e,
+                        "Failed to save insight HNSW index (will rebuild on next open)"
                     );
                 }
             }
@@ -358,6 +388,72 @@ impl PulseDB {
         Ok(vectors)
     }
 
+    /// Loads or rebuilds insight HNSW indexes for all existing collectives.
+    ///
+    /// For each collective, loads all insights from storage and rebuilds
+    /// the HNSW graph from their inline embeddings. Uses InsightId→ExperienceId
+    /// byte conversion for the HNSW API.
+    fn load_all_insight_indexes(
+        storage: &dyn StorageEngine,
+        config: &Config,
+    ) -> Result<HashMap<CollectiveId, HnswIndex>> {
+        let collectives = storage.list_collectives()?;
+        let mut insight_vectors = HashMap::with_capacity(collectives.len());
+
+        let hnsw_dir = storage.path().map(|p| {
+            let mut hnsw_path = p.as_os_str().to_owned();
+            hnsw_path.push(".hnsw");
+            PathBuf::from(hnsw_path)
+        });
+
+        for collective in &collectives {
+            let dimension = collective.embedding_dimension as usize;
+
+            // List all insight IDs in this collective
+            let insight_ids = storage.list_insight_ids_in_collective(collective.id)?;
+
+            // Load insights and extract embeddings (converting InsightId → ExperienceId)
+            let mut embeddings = Vec::with_capacity(insight_ids.len());
+            for insight_id in &insight_ids {
+                if let Some(insight) = storage.get_insight(*insight_id)? {
+                    let exp_id = ExperienceId::from_bytes(*insight_id.as_bytes());
+                    embeddings.push((exp_id, insight.embedding));
+                }
+            }
+
+            // Try loading metadata (for deleted set)
+            let name = format!("{}_insights", collective.id);
+            let metadata = hnsw_dir
+                .as_ref()
+                .and_then(|dir| HnswIndex::load_metadata(dir, &name).ok())
+                .flatten();
+
+            // Rebuild HNSW graph from embeddings
+            let index = if embeddings.is_empty() {
+                HnswIndex::new(dimension, &config.hnsw)
+            } else {
+                let start = std::time::Instant::now();
+                let idx = HnswIndex::rebuild_from_embeddings(dimension, &config.hnsw, embeddings)?;
+                info!(
+                    collective = %collective.id,
+                    insights = idx.active_count(),
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "Rebuilt insight HNSW index from stored insights"
+                );
+                idx
+            };
+
+            // Restore deleted set from metadata if available
+            if let Some(meta) = metadata {
+                index.restore_deleted_set(&meta.deleted)?;
+            }
+
+            insight_vectors.insert(collective.id, index);
+        }
+
+        Ok(insight_vectors)
+    }
+
     /// Executes a closure with the HNSW index for a collective.
     ///
     /// This is the primary accessor for vector search operations (used by
@@ -428,12 +524,17 @@ impl PulseDB {
         // Persist to redb first (source of truth)
         self.storage.save_collective(&collective)?;
 
-        // Create empty HNSW index for this collective
-        let index = HnswIndex::new(dimension as usize, &self.config.hnsw);
+        // Create empty HNSW indexes for this collective
+        let exp_index = HnswIndex::new(dimension as usize, &self.config.hnsw);
+        let insight_index = HnswIndex::new(dimension as usize, &self.config.hnsw);
         self.vectors
             .write()
             .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?
-            .insert(id, index);
+            .insert(id, exp_index);
+        self.insight_vectors
+            .write()
+            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?
+            .insert(id, insight_index);
 
         info!(id = %id, name = %name, "Collective created");
         Ok(id)
@@ -470,12 +571,17 @@ impl PulseDB {
         // Persist to redb first (source of truth)
         self.storage.save_collective(&collective)?;
 
-        // Create empty HNSW index for this collective
-        let index = HnswIndex::new(dimension as usize, &self.config.hnsw);
+        // Create empty HNSW indexes for this collective
+        let exp_index = HnswIndex::new(dimension as usize, &self.config.hnsw);
+        let insight_index = HnswIndex::new(dimension as usize, &self.config.hnsw);
         self.vectors
             .write()
             .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?
-            .insert(id, index);
+            .insert(id, exp_index);
+        self.insight_vectors
+            .write()
+            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?
+            .insert(id, insight_index);
 
         info!(id = %id, name = %name, owner = %owner_id, "Collective created with owner");
         Ok(id)
@@ -564,13 +670,23 @@ impl PulseDB {
             info!(count = deleted_count, "Cascade-deleted experiences");
         }
 
+        // Cascade: delete all insights for this collective
+        let deleted_insights = self.storage.delete_insights_by_collective(id)?;
+        if deleted_insights > 0 {
+            info!(count = deleted_insights, "Cascade-deleted insights");
+        }
+
         // Delete the collective record from storage
         self.storage.delete_collective(id)?;
 
-        // Remove HNSW index from memory
+        // Remove HNSW indexes from memory
         self.vectors
             .write()
             .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?
+            .remove(&id);
+        self.insight_vectors
+            .write()
+            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?
             .remove(&id);
 
         // Remove HNSW files from disk (non-fatal if fails)
@@ -579,7 +695,15 @@ impl PulseDB {
                 warn!(
                     collective = %id,
                     error = %e,
-                    "Failed to remove HNSW files (non-fatal)"
+                    "Failed to remove experience HNSW files (non-fatal)"
+                );
+            }
+            let insight_name = format!("{}_insights", id);
+            if let Err(e) = HnswIndex::remove_files(&hnsw_dir, &insight_name) {
+                warn!(
+                    collective = %id,
+                    error = %e,
+                    "Failed to remove insight HNSW files (non-fatal)"
                 );
             }
         }
@@ -1256,6 +1380,217 @@ impl PulseDB {
             return Err(PulseDBError::from(NotFoundError::relation(id)));
         }
         info!(id = %id, "Relation deleted");
+        Ok(())
+    }
+
+    // =========================================================================
+    // Derived Insights (E3-S02)
+    // =========================================================================
+
+    /// Stores a new derived insight.
+    ///
+    /// Creates a synthesized knowledge record from multiple source experiences.
+    /// The method:
+    /// 1. Validates the input (content, confidence, sources)
+    /// 2. Verifies the collective exists
+    /// 3. Verifies all source experiences exist and belong to the same collective
+    /// 4. Resolves the embedding (generates if Builtin, requires if External)
+    /// 5. Stores the insight with inline embedding
+    /// 6. Inserts into the insight HNSW index
+    ///
+    /// # Arguments
+    ///
+    /// * `insight` - The insight to store (see [`NewDerivedInsight`])
+    ///
+    /// # Errors
+    ///
+    /// - [`ValidationError`](crate::ValidationError) if input is invalid
+    /// - [`NotFoundError::Collective`] if the collective doesn't exist
+    /// - [`NotFoundError::Experience`] if any source experience doesn't exist
+    /// - [`ValidationError::InvalidField`] if source experiences belong to
+    ///   different collectives
+    /// - [`ValidationError::DimensionMismatch`] if embedding dimension is wrong
+    #[instrument(skip(self, insight), fields(collective_id = %insight.collective_id))]
+    pub fn store_insight(&self, insight: NewDerivedInsight) -> Result<InsightId> {
+        let is_external = matches!(self.config.embedding_provider, EmbeddingProvider::External);
+
+        // Validate input fields
+        validate_new_insight(&insight)?;
+
+        // Verify collective exists
+        let collective = self
+            .storage
+            .get_collective(insight.collective_id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::collective(insight.collective_id)))?;
+
+        // Verify all source experiences exist and belong to this collective
+        for source_id in &insight.source_experience_ids {
+            let source_exp = self
+                .storage
+                .get_experience(*source_id)?
+                .ok_or_else(|| PulseDBError::from(NotFoundError::experience(*source_id)))?;
+            if source_exp.collective_id != insight.collective_id {
+                return Err(PulseDBError::from(ValidationError::invalid_field(
+                    "source_experience_ids",
+                    format!(
+                        "experience {} belongs to collective {}, not {}",
+                        source_id, source_exp.collective_id, insight.collective_id
+                    ),
+                )));
+            }
+        }
+
+        // Resolve embedding
+        let embedding = match insight.embedding {
+            Some(ref emb) => {
+                // Validate dimension
+                let expected_dim = collective.embedding_dimension as usize;
+                if emb.len() != expected_dim {
+                    return Err(ValidationError::dimension_mismatch(expected_dim, emb.len()).into());
+                }
+                emb.clone()
+            }
+            None => {
+                if is_external {
+                    return Err(PulseDBError::embedding(
+                        "embedding is required when using External embedding provider",
+                    ));
+                }
+                self.embedding.embed(&insight.content)?
+            }
+        };
+
+        let embedding_for_hnsw = embedding.clone();
+        let now = Timestamp::now();
+        let id = InsightId::new();
+
+        // Construct the full insight record
+        let derived_insight = DerivedInsight {
+            id,
+            collective_id: insight.collective_id,
+            content: insight.content,
+            embedding,
+            source_experience_ids: insight.source_experience_ids,
+            insight_type: insight.insight_type,
+            confidence: insight.confidence,
+            domain: insight.domain,
+            created_at: now,
+            updated_at: now,
+        };
+
+        // Write to redb FIRST (source of truth)
+        self.storage.save_insight(&derived_insight)?;
+
+        // Insert into insight HNSW index (using InsightId→ExperienceId byte conversion)
+        let exp_id = ExperienceId::from_bytes(*id.as_bytes());
+        let insight_vectors = self
+            .insight_vectors
+            .read()
+            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
+        if let Some(index) = insight_vectors.get(&insight.collective_id) {
+            index.insert_experience(exp_id, &embedding_for_hnsw)?;
+        }
+
+        info!(id = %id, "Insight stored");
+        Ok(id)
+    }
+
+    /// Retrieves a derived insight by ID.
+    ///
+    /// Returns `None` if no insight with the given ID exists.
+    #[instrument(skip(self))]
+    pub fn get_insight(&self, id: InsightId) -> Result<Option<DerivedInsight>> {
+        self.storage.get_insight(id)
+    }
+
+    /// Searches for insights semantically similar to the query embedding.
+    ///
+    /// Uses the insight-specific HNSW index for approximate nearest neighbor
+    /// search, then fetches full insight records from storage.
+    ///
+    /// # Arguments
+    ///
+    /// * `collective_id` - The collective to search within
+    /// * `query` - Query embedding vector (must match collective's dimension)
+    /// * `k` - Maximum number of results to return
+    ///
+    /// # Errors
+    ///
+    /// - [`ValidationError::DimensionMismatch`] if `query.len()` doesn't match
+    /// - [`NotFoundError::Collective`] if the collective doesn't exist
+    #[instrument(skip(self, query))]
+    pub fn get_insights(
+        &self,
+        collective_id: CollectiveId,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<DerivedInsight>> {
+        // Verify collective exists and check embedding dimension
+        let collective = self
+            .storage
+            .get_collective(collective_id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::collective(collective_id)))?;
+
+        let expected_dim = collective.embedding_dimension as usize;
+        if query.len() != expected_dim {
+            return Err(ValidationError::dimension_mismatch(expected_dim, query.len()).into());
+        }
+
+        let ef_search = self.config.hnsw.ef_search;
+
+        // Search insight HNSW — returns (ExperienceId, distance) pairs
+        let insight_vectors = self
+            .insight_vectors
+            .read()
+            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
+
+        let candidates = match insight_vectors.get(&collective_id) {
+            Some(index) => index.search_experiences(query, k, ef_search)?,
+            None => return Ok(vec![]),
+        };
+        drop(insight_vectors);
+
+        // Convert ExperienceId back to InsightId and fetch records
+        let mut results = Vec::with_capacity(candidates.len());
+        for (exp_id, _distance) in candidates {
+            let insight_id = InsightId::from_bytes(*exp_id.as_bytes());
+            if let Some(insight) = self.storage.get_insight(insight_id)? {
+                results.push(insight);
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Deletes a derived insight by ID.
+    ///
+    /// Removes the insight from storage and soft-deletes it from the HNSW index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotFoundError::Insight`] if no insight with the given ID exists.
+    #[instrument(skip(self))]
+    pub fn delete_insight(&self, id: InsightId) -> Result<()> {
+        // Read insight first to get collective_id for HNSW lookup
+        let insight = self
+            .storage
+            .get_insight(id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::insight(id)))?;
+
+        // Delete from redb FIRST (source of truth)
+        self.storage.delete_insight(id)?;
+
+        // Soft-delete from insight HNSW (using InsightId→ExperienceId byte conversion)
+        let exp_id = ExperienceId::from_bytes(*id.as_bytes());
+        let insight_vectors = self
+            .insight_vectors
+            .read()
+            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
+        if let Some(index) = insight_vectors.get(&insight.collective_id) {
+            index.delete_experience(exp_id)?;
+        }
+
+        info!(id = %id, "Insight deleted");
         Ok(())
     }
 }

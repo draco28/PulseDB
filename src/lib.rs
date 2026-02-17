@@ -83,6 +83,7 @@ pub mod storage;
 // Domain modules
 mod collective;
 mod experience;
+mod insight;
 mod relation;
 mod search;
 
@@ -104,7 +105,8 @@ pub use error::{NotFoundError, PulseDBError, Result, StorageError, ValidationErr
 
 // Core types
 pub use types::{
-    AgentId, CollectiveId, Embedding, ExperienceId, RelationId, TaskId, Timestamp, UserId,
+    AgentId, CollectiveId, Embedding, ExperienceId, InsightId, RelationId, TaskId, Timestamp,
+    UserId,
 };
 
 // Domain types
@@ -113,6 +115,9 @@ pub use experience::{Experience, ExperienceType, ExperienceUpdate, NewExperience
 
 // Relations
 pub use relation::{ExperienceRelation, NewExperienceRelation, RelationDirection, RelationType};
+
+// Insights
+pub use insight::{DerivedInsight, InsightType, NewDerivedInsight};
 
 // Search
 pub use search::{SearchFilter, SearchResult};
