@@ -30,6 +30,7 @@ pub use schema::{DatabaseMetadata, SCHEMA_VERSION};
 
 use std::path::Path;
 
+use crate::activity::Activity;
 use crate::collective::Collective;
 use crate::config::Config;
 use crate::error::Result;
@@ -328,6 +329,41 @@ pub trait StorageEngine: Send + Sync {
     /// Used for cascade deletion when a collective is removed.
     /// Returns the count of deleted insights.
     fn delete_insights_by_collective(&self, id: CollectiveId) -> Result<u64>;
+
+    // =========================================================================
+    // Activity Storage Operations (E3-S03)
+    // =========================================================================
+
+    /// Saves an agent activity to storage (upsert).
+    ///
+    /// If an activity for the same `(collective_id, agent_id)` already exists,
+    /// it is replaced. Uses the composite key encoding from `schema::encode_activity_key`.
+    fn save_activity(&self, activity: &Activity) -> Result<()>;
+
+    /// Retrieves an agent activity by agent ID and collective.
+    ///
+    /// Returns `None` if no activity exists for the given pair.
+    fn get_activity(&self, agent_id: &str, collective_id: CollectiveId)
+        -> Result<Option<Activity>>;
+
+    /// Deletes an agent activity.
+    ///
+    /// Returns `true` if the activity existed and was deleted,
+    /// `false` if no activity was found for the given pair.
+    fn delete_activity(&self, agent_id: &str, collective_id: CollectiveId) -> Result<bool>;
+
+    /// Lists all activities in a collective.
+    ///
+    /// Iterates the `ACTIVITIES_TABLE` and filters entries whose key
+    /// starts with the collective's 16-byte ID. Returns activities in
+    /// no guaranteed order.
+    fn list_activities_in_collective(&self, collective_id: CollectiveId) -> Result<Vec<Activity>>;
+
+    /// Deletes all activities belonging to a collective.
+    ///
+    /// Used for cascade deletion when a collective is removed.
+    /// Returns the count of deleted activities.
+    fn delete_activities_by_collective(&self, collective_id: CollectiveId) -> Result<u64>;
 }
 
 /// Opens a storage engine at the given path.

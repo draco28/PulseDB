@@ -22,6 +22,7 @@
 //! ```
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,12 @@ pub struct Config {
     /// Controls the quality and performance of semantic search.
     /// See [`HnswConfig`] for tuning guidelines.
     pub hnsw: HnswConfig,
+
+    /// Agent activity tracking parameters.
+    ///
+    /// Controls staleness detection for agent heartbeats.
+    /// See [`ActivityConfig`] for details.
+    pub activity: ActivityConfig,
 }
 
 impl Default for Config {
@@ -79,6 +86,7 @@ impl Default for Config {
             cache_size_mb: 64,
             sync_mode: SyncMode::Normal,
             hnsw: HnswConfig::default(),
+            activity: ActivityConfig::default(),
         }
     }
 }
@@ -358,6 +366,42 @@ impl Default for HnswConfig {
             ef_search: 50,
             max_layer: 16,
             max_elements: 10_000,
+        }
+    }
+}
+
+/// Configuration for agent activity tracking.
+///
+/// Controls how stale activities are detected and filtered.
+///
+/// # Example
+/// ```rust
+/// use std::time::Duration;
+/// use pulsedb::Config;
+///
+/// let config = Config {
+///     activity: pulsedb::ActivityConfig {
+///         stale_threshold: Duration::from_secs(120), // 2 minutes
+///     },
+///     ..Default::default()
+/// };
+/// ```
+#[derive(Clone, Debug)]
+pub struct ActivityConfig {
+    /// Duration after which an activity with no heartbeat is considered stale.
+    ///
+    /// Activities whose `last_heartbeat` is older than `now - stale_threshold`
+    /// are excluded from `get_active_agents()` results. They remain in storage
+    /// until explicitly ended or the collective is deleted.
+    ///
+    /// Default: 5 minutes (300 seconds)
+    pub stale_threshold: Duration,
+}
+
+impl Default for ActivityConfig {
+    fn default() -> Self {
+        Self {
+            stale_threshold: Duration::from_secs(300),
         }
     }
 }

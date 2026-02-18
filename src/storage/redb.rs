@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use ::redb::{Database, ReadableTable};
 use tracing::{debug, info, instrument, warn};
 
+use crate::activity::Activity;
 use crate::collective::Collective;
 use crate::experience::{Experience, ExperienceUpdate};
 use crate::insight::DerivedInsight;
@@ -28,10 +29,11 @@ use crate::relation::{ExperienceRelation, RelationType};
 use crate::types::{CollectiveId, ExperienceId, InsightId, RelationId, Timestamp};
 
 use super::schema::{
-    encode_type_index_key, DatabaseMetadata, ExperienceTypeTag, COLLECTIVES_TABLE,
-    EMBEDDINGS_TABLE, EXPERIENCES_BY_COLLECTIVE_TABLE, EXPERIENCES_BY_TYPE_TABLE,
-    EXPERIENCES_TABLE, INSIGHTS_BY_COLLECTIVE_TABLE, INSIGHTS_TABLE, METADATA_TABLE,
-    RELATIONS_BY_SOURCE_TABLE, RELATIONS_BY_TARGET_TABLE, RELATIONS_TABLE, SCHEMA_VERSION,
+    decode_collective_from_activity_key, encode_activity_key, encode_type_index_key,
+    DatabaseMetadata, ExperienceTypeTag, ACTIVITIES_TABLE, COLLECTIVES_TABLE, EMBEDDINGS_TABLE,
+    EXPERIENCES_BY_COLLECTIVE_TABLE, EXPERIENCES_BY_TYPE_TABLE, EXPERIENCES_TABLE,
+    INSIGHTS_BY_COLLECTIVE_TABLE, INSIGHTS_TABLE, METADATA_TABLE, RELATIONS_BY_SOURCE_TABLE,
+    RELATIONS_BY_TARGET_TABLE, RELATIONS_TABLE, SCHEMA_VERSION,
 };
 use super::StorageEngine;
 use crate::config::{Config, EmbeddingDimension};
@@ -157,6 +159,7 @@ impl RedbStorage {
             let _ = write_txn.open_multimap_table(RELATIONS_BY_TARGET_TABLE)?;
             let _ = write_txn.open_table(INSIGHTS_TABLE)?;
             let _ = write_txn.open_multimap_table(INSIGHTS_BY_COLLECTIVE_TABLE)?;
+            let _ = write_txn.open_table(ACTIVITIES_TABLE)?;
         }
 
         write_txn.commit().map_err(StorageError::from)?;
@@ -1057,6 +1060,134 @@ impl StorageEngine for RedbStorage {
         write_txn.commit().map_err(StorageError::from)?;
 
         debug!(id = %id, count = count, "Cascade-deleted insights for collective");
+        Ok(count)
+    }
+
+    // =========================================================================
+    // Activity Storage Operations (E3-S03)
+    // =========================================================================
+
+    fn save_activity(&self, activity: &Activity) -> Result<()> {
+        let key = encode_activity_key(activity.collective_id.as_bytes(), &activity.agent_id);
+        let bytes =
+            bincode::serialize(activity).map_err(|e| StorageError::serialization(e.to_string()))?;
+
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        {
+            let mut table = write_txn.open_table(ACTIVITIES_TABLE)?;
+            table.insert(key.as_slice(), bytes.as_slice())?;
+        }
+        write_txn.commit().map_err(StorageError::from)?;
+
+        debug!(
+            agent_id = %activity.agent_id,
+            collective_id = %activity.collective_id,
+            "Activity saved"
+        );
+        Ok(())
+    }
+
+    fn get_activity(
+        &self,
+        agent_id: &str,
+        collective_id: CollectiveId,
+    ) -> Result<Option<Activity>> {
+        let key = encode_activity_key(collective_id.as_bytes(), agent_id);
+
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let table = read_txn.open_table(ACTIVITIES_TABLE)?;
+
+        match table.get(key.as_slice())? {
+            Some(value) => {
+                let activity: Activity = bincode::deserialize(value.value())
+                    .map_err(|e| StorageError::serialization(e.to_string()))?;
+                Ok(Some(activity))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn delete_activity(&self, agent_id: &str, collective_id: CollectiveId) -> Result<bool> {
+        let key = encode_activity_key(collective_id.as_bytes(), agent_id);
+
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        let existed = {
+            let mut table = write_txn.open_table(ACTIVITIES_TABLE)?;
+            let removed = table.remove(key.as_slice())?;
+            removed.is_some()
+        };
+        write_txn.commit().map_err(StorageError::from)?;
+
+        if existed {
+            debug!(agent_id = %agent_id, collective_id = %collective_id, "Activity deleted");
+        }
+        Ok(existed)
+    }
+
+    fn list_activities_in_collective(&self, collective_id: CollectiveId) -> Result<Vec<Activity>> {
+        let prefix = collective_id.as_bytes();
+
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let table = read_txn.open_table(ACTIVITIES_TABLE)?;
+
+        let mut activities = Vec::new();
+        for result in table.iter()? {
+            let (key, value) = result.map_err(StorageError::from)?;
+            let key_bytes = key.value();
+
+            // Check if this key belongs to the requested collective (16-byte prefix)
+            if key_bytes.len() >= 16 && decode_collective_from_activity_key(key_bytes) == *prefix {
+                let activity: Activity = bincode::deserialize(value.value())
+                    .map_err(|e| StorageError::serialization(e.to_string()))?;
+                activities.push(activity);
+            }
+        }
+
+        Ok(activities)
+    }
+
+    fn delete_activities_by_collective(&self, collective_id: CollectiveId) -> Result<u64> {
+        let prefix = collective_id.as_bytes();
+
+        // Phase 1: Read — collect matching keys
+        let keys_to_delete: Vec<Vec<u8>> = {
+            let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+            let table = read_txn.open_table(ACTIVITIES_TABLE)?;
+
+            let mut keys = Vec::new();
+            for result in table.iter()? {
+                let (key, _) = result.map_err(StorageError::from)?;
+                let key_bytes = key.value();
+
+                if key_bytes.len() >= 16
+                    && decode_collective_from_activity_key(key_bytes) == *prefix
+                {
+                    keys.push(key_bytes.to_vec());
+                }
+            }
+            keys
+        };
+
+        let count = keys_to_delete.len() as u64;
+        if count == 0 {
+            return Ok(0);
+        }
+
+        // Phase 2: Write — delete all collected keys
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        {
+            let mut table = write_txn.open_table(ACTIVITIES_TABLE)?;
+            for key in &keys_to_delete {
+                table.remove(key.as_slice())?;
+            }
+        }
+        write_txn.commit().map_err(StorageError::from)?;
+
+        debug!(
+            collective_id = %collective_id,
+            count = count,
+            "Cascade-deleted activities for collective"
+        );
         Ok(count)
     }
 }

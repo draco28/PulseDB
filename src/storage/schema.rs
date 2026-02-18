@@ -71,6 +71,18 @@ pub const MAX_INSIGHT_CONTENT_SIZE: usize = 50 * 1024;
 /// Maximum number of source experiences per insight.
 pub const MAX_INSIGHT_SOURCES: usize = 100;
 
+/// Maximum agent ID length in bytes.
+///
+/// Agent IDs are UTF-8 strings identifying a specific AI agent instance.
+/// 255 bytes is generous for identifiers like "claude-opus-4" or UUIDs.
+pub const MAX_ACTIVITY_AGENT_ID_LENGTH: usize = 255;
+
+/// Maximum size for activity optional fields (current_task, context_summary) in bytes (1 KB).
+///
+/// These fields are short descriptions, not full content — 1KB is sufficient
+/// for a task name or brief context summary.
+pub const MAX_ACTIVITY_FIELD_SIZE: usize = 1024;
+
 // ============================================================================
 // Table Definitions
 // ============================================================================
@@ -171,6 +183,20 @@ pub const INSIGHTS_TABLE: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::n
 /// Value (multimap): InsightId as 16-byte UUID
 pub const INSIGHTS_BY_COLLECTIVE_TABLE: MultimapTableDefinition<&[u8; 16], &[u8; 16]> =
     MultimapTableDefinition::new("insights_by_collective");
+
+// ============================================================================
+// Activity Tables (E3-S03)
+// ============================================================================
+
+/// Activities table — agent presence tracking.
+///
+/// First PulseDB table using variable-length keys. Activities are keyed by
+/// a composite `(collective_id, agent_id)` rather than a UUID, since each
+/// agent can have at most one active session per collective.
+///
+/// Key: `[collective_id: 16B][agent_id_len: 2B BE][agent_id: NB]`
+/// Value: bincode-serialized Activity struct
+pub const ACTIVITIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("activities");
 
 // ============================================================================
 // Experience Type Tag
@@ -376,6 +402,54 @@ pub fn decode_collective_from_type_key(key: &[u8; 17]) -> [u8; 16] {
     id
 }
 
+// ============================================================================
+// Activity Key Encoding (E3-S03)
+// ============================================================================
+
+/// Encodes a `(collective_id, agent_id)` composite key for the activities table.
+///
+/// Format: `[collective_id: 16 bytes][agent_id_len: 2 bytes BE u16][agent_id: N bytes]`
+///
+/// The collective_id prefix allows efficient filtering by collective (prefix scan).
+/// The 2-byte length field enables safe decoding of the variable-length agent_id.
+#[inline]
+pub fn encode_activity_key(collective_id: &[u8; 16], agent_id: &str) -> Vec<u8> {
+    let agent_bytes = agent_id.as_bytes();
+    let len = agent_bytes.len() as u16;
+    let mut key = Vec::with_capacity(16 + 2 + agent_bytes.len());
+    key.extend_from_slice(collective_id);
+    key.extend_from_slice(&len.to_be_bytes());
+    key.extend_from_slice(agent_bytes);
+    key
+}
+
+/// Extracts the 16-byte CollectiveId from an activity key.
+///
+/// # Panics
+///
+/// Panics if the key is shorter than 16 bytes (should never happen with
+/// properly encoded keys from `encode_activity_key`).
+#[inline]
+pub fn decode_collective_from_activity_key(key: &[u8]) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&key[..16]);
+    id
+}
+
+/// Extracts the agent_id string from an activity key.
+///
+/// Reads the 2-byte length at offset 16, then slices the UTF-8 agent_id.
+///
+/// # Panics
+///
+/// Panics if the key is malformed (insufficient length or invalid UTF-8).
+/// This should never happen with keys created by `encode_activity_key`.
+#[inline]
+pub fn decode_agent_id_from_activity_key(key: &[u8]) -> &str {
+    let len = u16::from_be_bytes([key[16], key[17]]) as usize;
+    std::str::from_utf8(&key[18..18 + len]).expect("activity key contains invalid UTF-8")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,5 +599,65 @@ mod tests {
         assert_ne!(key_a, key_b);
         // Same type byte
         assert_eq!(key_a[16], key_b[16]);
+    }
+
+    // ====================================================================
+    // Activity key encoding tests (E3-S03)
+    // ====================================================================
+
+    #[test]
+    fn test_activity_key_encode_decode_roundtrip() {
+        let collective_id = [42u8; 16];
+        let agent_id = "claude-opus";
+
+        let key = encode_activity_key(&collective_id, agent_id);
+
+        assert_eq!(decode_collective_from_activity_key(&key), collective_id);
+        assert_eq!(decode_agent_id_from_activity_key(&key), agent_id);
+    }
+
+    #[test]
+    fn test_activity_key_different_agents_produce_different_keys() {
+        let collective_id = [1u8; 16];
+
+        let key_a = encode_activity_key(&collective_id, "agent-alpha");
+        let key_b = encode_activity_key(&collective_id, "agent-beta");
+
+        assert_ne!(key_a, key_b);
+        // Same collective prefix
+        assert_eq!(&key_a[..16], &key_b[..16]);
+    }
+
+    #[test]
+    fn test_activity_key_different_collectives_produce_different_keys() {
+        let id_a = [1u8; 16];
+        let id_b = [2u8; 16];
+
+        let key_a = encode_activity_key(&id_a, "same-agent");
+        let key_b = encode_activity_key(&id_b, "same-agent");
+
+        assert_ne!(key_a, key_b);
+        // Same agent_id suffix
+        assert_eq!(
+            decode_agent_id_from_activity_key(&key_a),
+            decode_agent_id_from_activity_key(&key_b)
+        );
+    }
+
+    #[test]
+    fn test_activity_key_format() {
+        let collective_id = [0xAB; 16];
+        let agent_id = "hi";
+
+        let key = encode_activity_key(&collective_id, agent_id);
+
+        // 16 (collective) + 2 (len) + 2 (agent "hi") = 20 bytes
+        assert_eq!(key.len(), 20);
+        // Collective prefix
+        assert_eq!(&key[..16], &[0xAB; 16]);
+        // Length field (big-endian u16 = 2)
+        assert_eq!(&key[16..18], &[0, 2]);
+        // Agent ID bytes
+        assert_eq!(&key[18..], b"hi");
     }
 }

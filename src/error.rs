@@ -356,6 +356,10 @@ pub enum NotFoundError {
     /// Insight with given ID not found.
     #[error("Insight not found: {0}")]
     Insight(String),
+
+    /// Activity not found for given agent/collective pair.
+    #[error("Activity not found: {0}")]
+    Activity(String),
 }
 
 impl NotFoundError {
@@ -377,6 +381,11 @@ impl NotFoundError {
     /// Creates an insight not found error.
     pub fn insight(id: impl ToString) -> Self {
         Self::Insight(id.to_string())
+    }
+
+    /// Creates an activity not found error.
+    pub fn activity(id: impl ToString) -> Self {
+        Self::Activity(id.to_string())
     }
 }
 
