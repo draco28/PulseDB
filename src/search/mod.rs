@@ -3,8 +3,10 @@
 //! This module provides search filtering and query building for experience
 //! retrieval operations (recent, similarity, context candidates).
 
+mod context;
 mod filter;
 
+pub use context::{ContextCandidates, ContextRequest};
 pub use filter::SearchFilter;
 
 use crate::experience::Experience;
