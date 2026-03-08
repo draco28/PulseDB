@@ -67,7 +67,7 @@ use crate::experience::{
     NewExperience,
 };
 use crate::insight::{validate_new_insight, DerivedInsight, NewDerivedInsight};
-use crate::search::{SearchFilter, SearchResult};
+use crate::search::{ContextCandidates, ContextRequest, SearchFilter, SearchResult};
 use crate::storage::{open_storage, DatabaseMetadata, StorageEngine};
 use crate::types::{CollectiveId, ExperienceId, InsightId, Timestamp};
 use crate::vector::HnswIndex;
@@ -1743,6 +1743,158 @@ impl PulseDB {
         active.sort_by(|a, b| b.last_heartbeat.cmp(&a.last_heartbeat));
 
         Ok(active)
+    }
+
+    // =========================================================================
+    // Context Candidates (E2-S04)
+    // =========================================================================
+
+    /// Retrieves unified context candidates from all retrieval primitives.
+    ///
+    /// This is the primary API for context assembly. It orchestrates:
+    /// 1. Similarity search ([`search_similar_filtered`](Self::search_similar_filtered))
+    /// 2. Recent experiences ([`get_recent_experiences_filtered`](Self::get_recent_experiences_filtered))
+    /// 3. Insight search ([`get_insights`](Self::get_insights)) — if requested
+    /// 4. Relation collection ([`get_related_experiences`](Self::get_related_experiences)) — if requested
+    /// 5. Active agents ([`get_active_agents`](Self::get_active_agents)) — if requested
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - Configuration for which primitives to query and limits
+    ///
+    /// # Errors
+    ///
+    /// - [`ValidationError::InvalidField`] if `max_similar` or `max_recent` is 0 or > 1000
+    /// - [`ValidationError::DimensionMismatch`] if `query_embedding.len()` doesn't match
+    ///   the collective's embedding dimension
+    /// - [`NotFoundError::Collective`] if the collective doesn't exist
+    ///
+    /// # Performance
+    ///
+    /// Target: < 100ms at 100K experiences. The similarity search (~50ms) dominates;
+    /// all other sub-calls are < 10ms each.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use pulsedb::{ContextRequest, SearchFilter};
+    ///
+    /// let candidates = db.get_context_candidates(ContextRequest {
+    ///     collective_id,
+    ///     query_embedding: query_vec,
+    ///     max_similar: 10,
+    ///     max_recent: 5,
+    ///     include_insights: true,
+    ///     include_relations: true,
+    ///     include_active_agents: true,
+    ///     filter: SearchFilter {
+    ///         domains: Some(vec!["rust".to_string()]),
+    ///         ..SearchFilter::default()
+    ///     },
+    ///     ..ContextRequest::default()
+    /// })?;
+    /// ```
+    #[instrument(skip(self, request), fields(collective_id = %request.collective_id))]
+    pub fn get_context_candidates(&self, request: ContextRequest) -> Result<ContextCandidates> {
+        // ── Validate limits ──────────────────────────────────────
+        if request.max_similar == 0 || request.max_similar > 1000 {
+            return Err(ValidationError::invalid_field(
+                "max_similar",
+                "must be between 1 and 1000",
+            )
+            .into());
+        }
+        if request.max_recent == 0 || request.max_recent > 1000 {
+            return Err(
+                ValidationError::invalid_field("max_recent", "must be between 1 and 1000").into(),
+            );
+        }
+
+        // ── Verify collective exists and check dimension ─────────
+        let collective = self
+            .storage
+            .get_collective(request.collective_id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::collective(request.collective_id)))?;
+
+        let expected_dim = collective.embedding_dimension as usize;
+        if request.query_embedding.len() != expected_dim {
+            return Err(ValidationError::dimension_mismatch(
+                expected_dim,
+                request.query_embedding.len(),
+            )
+            .into());
+        }
+
+        // ── 1. Similar experiences (HNSW vector search) ──────────
+        let similar_experiences = self.search_similar_filtered(
+            request.collective_id,
+            &request.query_embedding,
+            request.max_similar,
+            request.filter.clone(),
+        )?;
+
+        // ── 2. Recent experiences (timestamp index scan) ─────────
+        let recent_experiences = self.get_recent_experiences_filtered(
+            request.collective_id,
+            request.max_recent,
+            request.filter,
+        )?;
+
+        // ── 3. Insights (HNSW vector search on insight index) ────
+        let insights = if request.include_insights {
+            self.get_insights(
+                request.collective_id,
+                &request.query_embedding,
+                request.max_similar,
+            )?
+        } else {
+            vec![]
+        };
+
+        // ── 4. Relations (graph traversal from result experiences) ─
+        let relations = if request.include_relations {
+            use std::collections::HashSet;
+
+            let mut seen = HashSet::new();
+            let mut all_relations = Vec::new();
+
+            // Collect unique experience IDs from both result sets
+            let exp_ids: Vec<_> = similar_experiences
+                .iter()
+                .map(|r| r.experience.id)
+                .chain(recent_experiences.iter().map(|e| e.id))
+                .collect();
+
+            for exp_id in exp_ids {
+                let related =
+                    self.get_related_experiences(exp_id, crate::relation::RelationDirection::Both)?;
+
+                for (_experience, relation) in related {
+                    if seen.insert(relation.id) {
+                        all_relations.push(relation);
+                    }
+                }
+            }
+
+            all_relations
+        } else {
+            vec![]
+        };
+
+        // ── 5. Active agents (staleness-filtered activity records) ─
+        let active_agents = if request.include_active_agents {
+            self.get_active_agents(request.collective_id)?
+        } else {
+            vec![]
+        };
+
+        Ok(ContextCandidates {
+            similar_experiences,
+            recent_experiences,
+            insights,
+            relations,
+            active_agents,
+        })
     }
 }
 

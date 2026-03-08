@@ -125,8 +125,8 @@ pub use insight::{DerivedInsight, InsightType, NewDerivedInsight};
 // Activities
 pub use activity::{Activity, NewActivity};
 
-// Search
-pub use search::{SearchFilter, SearchResult};
+// Search & Context
+pub use search::{ContextCandidates, ContextRequest, SearchFilter, SearchResult};
 
 // Storage (for advanced users)
 pub use storage::DatabaseMetadata;
@@ -145,6 +145,6 @@ pub mod prelude {
     pub use crate::db::PulseDB;
     pub use crate::error::{PulseDBError, Result};
     pub use crate::experience::{Experience, ExperienceType, NewExperience};
-    pub use crate::search::{SearchFilter, SearchResult};
+    pub use crate::search::{ContextCandidates, ContextRequest, SearchFilter, SearchResult};
     pub use crate::types::{CollectiveId, ExperienceId, Timestamp};
 }
