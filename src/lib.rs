@@ -89,6 +89,9 @@ mod relation;
 mod search;
 mod watch;
 
+/// SubstrateProvider async trait for PulseHive integration.
+pub mod substrate;
+
 /// Vector index module for HNSW-based approximate nearest neighbor search.
 pub mod vector;
 
@@ -133,6 +136,9 @@ pub use search::{ContextCandidates, ContextRequest, SearchFilter, SearchResult};
 // Watch (real-time notifications)
 pub use watch::{WatchEvent, WatchEventType, WatchFilter, WatchStream};
 
+// Substrate (async PulseHive integration)
+pub use substrate::{PulseDBSubstrate, SubstrateProvider};
+
 // Storage (for advanced users)
 pub use storage::DatabaseMetadata;
 
@@ -151,6 +157,7 @@ pub mod prelude {
     pub use crate::error::{PulseDBError, Result};
     pub use crate::experience::{Experience, ExperienceType, NewExperience};
     pub use crate::search::{ContextCandidates, ContextRequest, SearchFilter, SearchResult};
+    pub use crate::substrate::{PulseDBSubstrate, SubstrateProvider};
     pub use crate::types::{CollectiveId, ExperienceId, Timestamp};
     pub use crate::watch::{WatchEvent, WatchEventType, WatchFilter};
 }

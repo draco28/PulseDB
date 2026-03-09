@@ -1598,7 +1598,7 @@ impl PulseDB {
         collective_id: CollectiveId,
         query: &[f32],
         k: usize,
-    ) -> Result<Vec<DerivedInsight>> {
+    ) -> Result<Vec<(DerivedInsight, f32)>> {
         // Verify collective exists and check embedding dimension
         let collective = self
             .storage
@@ -1626,10 +1626,11 @@ impl PulseDB {
 
         // Convert ExperienceId back to InsightId and fetch records
         let mut results = Vec::with_capacity(candidates.len());
-        for (exp_id, _distance) in candidates {
+        for (exp_id, distance) in candidates {
             let insight_id = InsightId::from_bytes(*exp_id.as_bytes());
             if let Some(insight) = self.storage.get_insight(insight_id)? {
-                results.push(insight);
+                // Convert HNSW distance to similarity (1.0 - distance), matching search_similar pattern
+                results.push((insight, 1.0 - distance));
             }
         }
 
@@ -1914,6 +1915,9 @@ impl PulseDB {
                 &request.query_embedding,
                 request.max_similar,
             )?
+            .into_iter()
+            .map(|(insight, _score)| insight)
+            .collect()
         } else {
             vec![]
         };

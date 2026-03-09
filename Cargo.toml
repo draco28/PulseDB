@@ -51,6 +51,12 @@ futures-core = "0.3"
 # Efficient async waker integration for crossbeam→Stream bridge
 atomic-waker = "1"
 
+# Async trait support for SubstrateProvider (object-safe async traits)
+async-trait = "0.1"
+
+# Async runtime for spawn_blocking in SubstrateProvider wrappers
+tokio = { version = "1", features = ["rt"] }
+
 # Optional: ONNX runtime for builtin embedding generation
 ort = { version = "2.0.0-rc.9", optional = true, features = ["ndarray"] }
 
@@ -72,6 +78,9 @@ tempfile = "3.0"
 
 # Stream combinators for watch integration tests (StreamExt::next, block_on)
 futures = "0.3"
+
+# Async runtime for integration tests (multi-thread + macros for #[tokio::test])
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 # Benchmarking framework
 criterion = { version = "0.5", features = ["html_reports"] }

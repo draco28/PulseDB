@@ -172,7 +172,9 @@ fn test_get_insights_similar() {
     // Search with emb_a as query — should find Insight A as most similar
     let results = db.get_insights(cid, &emb_a, 3).unwrap();
     assert_eq!(results.len(), 3);
-    assert_eq!(results[0].content, "Insight A");
+    assert_eq!(results[0].0.content, "Insight A");
+    // Verify similarity scores are present and reasonable (0.0-1.0 range)
+    assert!(results[0].1 > 0.0 && results[0].1 <= 1.0);
 }
 
 // ============================================================================

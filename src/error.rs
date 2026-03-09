@@ -62,6 +62,10 @@ pub enum PulseDBError {
     /// Watch system error (subscription or event delivery).
     #[error("Watch error: {0}")]
     Watch(String),
+
+    /// Internal error (e.g., async runtime failure, task join error).
+    #[error("Internal error: {0}")]
+    Internal(String),
 }
 
 impl PulseDBError {
@@ -80,6 +84,11 @@ impl PulseDBError {
     /// Creates a vector index error with the given message.
     pub fn vector(msg: impl Into<String>) -> Self {
         Self::Vector(msg.into())
+    }
+
+    /// Creates an internal error with the given message.
+    pub fn internal(msg: impl Into<String>) -> Self {
+        Self::Internal(msg.into())
     }
 
     /// Returns true if this is a "not found" error.
