@@ -73,6 +73,12 @@ pub struct Config {
     /// Controls staleness detection for agent heartbeats.
     /// See [`ActivityConfig`] for details.
     pub activity: ActivityConfig,
+
+    /// Watch system parameters.
+    ///
+    /// Controls the in-process event notification channel.
+    /// See [`WatchConfig`] for details.
+    pub watch: WatchConfig,
 }
 
 impl Default for Config {
@@ -87,6 +93,7 @@ impl Default for Config {
             sync_mode: SyncMode::Normal,
             hnsw: HnswConfig::default(),
             activity: ActivityConfig::default(),
+            watch: WatchConfig::default(),
         }
     }
 }
@@ -168,6 +175,14 @@ impl Config {
         if self.hnsw.ef_search == 0 {
             return Err(ValidationError::invalid_field(
                 "hnsw.ef_search",
+                "must be greater than 0",
+            ));
+        }
+
+        // Validate watch buffer size
+        if self.watch.buffer_size == 0 {
+            return Err(ValidationError::invalid_field(
+                "watch.buffer_size",
                 "must be greater than 0",
             ));
         }
@@ -403,6 +418,39 @@ impl Default for ActivityConfig {
         Self {
             stale_threshold: Duration::from_secs(300),
         }
+    }
+}
+
+/// Configuration for the in-process watch system.
+///
+/// Controls the channel buffer size for real-time experience notifications.
+/// Subscribers that fall behind will have events dropped (non-blocking).
+///
+/// # Example
+/// ```rust
+/// use pulsedb::Config;
+///
+/// let config = Config {
+///     watch: pulsedb::WatchConfig {
+///         buffer_size: 500,
+///     },
+///     ..Default::default()
+/// };
+/// ```
+#[derive(Clone, Debug)]
+pub struct WatchConfig {
+    /// Maximum number of events buffered per subscriber.
+    ///
+    /// When a subscriber's channel is full, new events are dropped for
+    /// that subscriber (with a warning log). The publisher never blocks.
+    ///
+    /// Default: 1000
+    pub buffer_size: usize,
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self { buffer_size: 1000 }
     }
 }
 

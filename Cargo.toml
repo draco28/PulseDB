@@ -42,6 +42,15 @@ anndists = "0.1"
 # JSON serialization for HNSW metadata files (human-readable for debugging)
 serde_json = "1.0"
 
+# Watch system - bounded sync channels for in-process event delivery (<100ns per event)
+crossbeam-channel = "0.5"
+
+# Stream trait for async watch API (trait-only crate, no executor/runtime)
+futures-core = "0.3"
+
+# Efficient async waker integration for crossbeam→Stream bridge
+atomic-waker = "1"
+
 # Optional: ONNX runtime for builtin embedding generation
 ort = { version = "2.0.0-rc.9", optional = true, features = ["ndarray"] }
 
@@ -60,6 +69,9 @@ ureq = { version = "3.0", optional = true }
 [dev-dependencies]
 # Testing utilities
 tempfile = "3.0"
+
+# Stream combinators for watch integration tests (StreamExt::next, block_on)
+futures = "0.3"
 
 # Benchmarking framework
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -52,7 +52,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use tracing::{info, instrument, warn};
 
@@ -71,6 +71,7 @@ use crate::search::{ContextCandidates, ContextRequest, SearchFilter, SearchResul
 use crate::storage::{open_storage, DatabaseMetadata, StorageEngine};
 use crate::types::{CollectiveId, ExperienceId, InsightId, Timestamp};
 use crate::vector::HnswIndex;
+use crate::watch::{WatchEvent, WatchEventType, WatchFilter, WatchService, WatchStream};
 
 /// The main PulseDB database handle.
 ///
@@ -104,6 +105,12 @@ pub struct PulseDB {
     /// and insights. Uses InsightId→ExperienceId byte conversion for the
     /// HNSW API (safe because indexes are isolated per collective).
     insight_vectors: RwLock<HashMap<CollectiveId, HnswIndex>>,
+
+    /// Watch service for real-time experience change notifications.
+    ///
+    /// Arc-wrapped because [`WatchStream`] holds a weak reference for
+    /// cleanup on drop.
+    watch: Arc<WatchService>,
 }
 
 impl std::fmt::Debug for PulseDB {
@@ -178,12 +185,15 @@ impl PulseDB {
             "PulseDB opened successfully"
         );
 
+        let watch = Arc::new(WatchService::new(config.watch.buffer_size));
+
         Ok(Self {
             storage,
             embedding,
             config,
             vectors: RwLock::new(vectors),
             insight_vectors: RwLock::new(insight_vectors),
+            watch,
         })
     }
 
@@ -799,6 +809,17 @@ impl PulseDB {
             index.insert_experience(id, &embedding_for_hnsw)?;
         }
 
+        // Emit watch event after both storage and HNSW succeed
+        self.watch.emit(
+            WatchEvent {
+                experience_id: id,
+                collective_id,
+                event_type: WatchEventType::Created,
+                timestamp: experience.timestamp,
+            },
+            &experience,
+        );
+
         info!(id = %id, "Experience recorded");
         Ok(id)
     }
@@ -827,6 +848,26 @@ impl PulseDB {
         let updated = self.storage.update_experience(id, &update)?;
         if !updated {
             return Err(PulseDBError::from(NotFoundError::experience(id)));
+        }
+
+        // Emit watch event (fetch experience for collective_id + filter matching)
+        if self.watch.has_subscribers() {
+            if let Ok(Some(exp)) = self.storage.get_experience(id) {
+                let event_type = if update.archived == Some(true) {
+                    WatchEventType::Archived
+                } else {
+                    WatchEventType::Updated
+                };
+                self.watch.emit(
+                    WatchEvent {
+                        experience_id: id,
+                        collective_id: exp.collective_id,
+                        event_type,
+                        timestamp: Timestamp::now(),
+                    },
+                    &exp,
+                );
+            }
         }
 
         info!(id = %id, "Experience updated");
@@ -912,6 +953,17 @@ impl PulseDB {
             index.delete_experience(id)?;
         }
 
+        // Emit watch event after storage + HNSW deletion
+        self.watch.emit(
+            WatchEvent {
+                experience_id: id,
+                collective_id: experience.collective_id,
+                event_type: WatchEventType::Deleted,
+                timestamp: Timestamp::now(),
+            },
+            &experience,
+        );
+
         info!(id = %id, "Experience deleted");
         Ok(())
     }
@@ -930,6 +982,21 @@ impl PulseDB {
             .storage
             .reinforce_experience(id)?
             .ok_or_else(|| PulseDBError::from(NotFoundError::experience(id)))?;
+
+        // Emit watch event (fetch experience for collective_id + filter matching)
+        if self.watch.has_subscribers() {
+            if let Ok(Some(exp)) = self.storage.get_experience(id) {
+                self.watch.emit(
+                    WatchEvent {
+                        experience_id: id,
+                        collective_id: exp.collective_id,
+                        event_type: WatchEventType::Updated,
+                        timestamp: Timestamp::now(),
+                    },
+                    &exp,
+                );
+            }
+        }
 
         info!(id = %id, applications = new_count, "Experience reinforced");
         Ok(new_count)
@@ -1895,6 +1962,59 @@ impl PulseDB {
             relations,
             active_agents,
         })
+    }
+
+    // =========================================================================
+    // Watch System (E4-S01)
+    // =========================================================================
+
+    /// Subscribes to all experience changes in a collective.
+    ///
+    /// Returns a [`WatchStream`] that yields [`WatchEvent`] values for every
+    /// create, update, archive, and delete operation. The stream ends when
+    /// dropped or when the `PulseDB` instance is closed.
+    ///
+    /// Multiple subscribers per collective are supported. Each gets an
+    /// independent copy of every event.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use futures::StreamExt;
+    ///
+    /// let mut stream = db.watch_experiences(collective_id);
+    /// while let Some(event) = stream.next().await {
+    ///     println!("{:?}: {}", event.event_type, event.experience_id);
+    /// }
+    /// ```
+    pub fn watch_experiences(&self, collective_id: CollectiveId) -> WatchStream {
+        self.watch.subscribe(collective_id, None)
+    }
+
+    /// Subscribes to filtered experience changes in a collective.
+    ///
+    /// Like [`watch_experiences`](Self::watch_experiences), but only delivers
+    /// events that match the filter criteria. Filters are applied on the
+    /// sender side before channel delivery.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use futures::StreamExt;
+    ///
+    /// let filter = WatchFilter {
+    ///     domains: Some(vec!["security".to_string()]),
+    ///     min_importance: Some(0.7),
+    ///     ..Default::default()
+    /// };
+    /// let mut stream = db.watch_experiences_filtered(collective_id, filter);
+    /// ```
+    pub fn watch_experiences_filtered(
+        &self,
+        collective_id: CollectiveId,
+        filter: WatchFilter,
+    ) -> WatchStream {
+        self.watch.subscribe(collective_id, Some(filter))
     }
 }
 
