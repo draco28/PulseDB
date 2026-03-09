@@ -87,6 +87,7 @@ mod experience;
 mod insight;
 mod relation;
 mod search;
+mod watch;
 
 /// Vector index module for HNSW-based approximate nearest neighbor search.
 pub mod vector;
@@ -101,6 +102,7 @@ pub use db::PulseDB;
 // Configuration
 pub use config::{
     ActivityConfig, Config, EmbeddingDimension, EmbeddingProvider, HnswConfig, SyncMode,
+    WatchConfig,
 };
 
 // Error handling
@@ -128,6 +130,9 @@ pub use activity::{Activity, NewActivity};
 // Search & Context
 pub use search::{ContextCandidates, ContextRequest, SearchFilter, SearchResult};
 
+// Watch (real-time notifications)
+pub use watch::{WatchEvent, WatchEventType, WatchFilter, WatchStream};
+
 // Storage (for advanced users)
 pub use storage::DatabaseMetadata;
 
@@ -147,4 +152,5 @@ pub mod prelude {
     pub use crate::experience::{Experience, ExperienceType, NewExperience};
     pub use crate::search::{ContextCandidates, ContextRequest, SearchFilter, SearchResult};
     pub use crate::types::{CollectiveId, ExperienceId, Timestamp};
+    pub use crate::watch::{WatchEvent, WatchEventType, WatchFilter};
 }

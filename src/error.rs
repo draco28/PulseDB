@@ -58,6 +58,10 @@ pub enum PulseDBError {
     /// Vector index error (HNSW operations).
     #[error("Vector index error: {0}")]
     Vector(String),
+
+    /// Watch system error (subscription or event delivery).
+    #[error("Watch error: {0}")]
+    Watch(String),
 }
 
 impl PulseDBError {
