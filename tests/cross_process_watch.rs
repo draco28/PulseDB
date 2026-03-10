@@ -5,9 +5,7 @@
 //! separate processes, these tests validate the core mechanism:
 //! sequence tracking, event recording, and polling.
 
-use pulsedb::{
-    CollectiveId, Config, ExperienceUpdate, NewExperience, PulseDB, WatchEventType,
-};
+use pulsedb::{CollectiveId, Config, ExperienceUpdate, NewExperience, PulseDB, WatchEventType};
 use tempfile::tempdir;
 
 /// Default embedding dimension for tests.
@@ -230,7 +228,9 @@ fn test_sequence_survives_close_reopen() {
         let (events, seq) = db.poll_changes(0).unwrap();
         assert_eq!(events.len(), 3);
         assert_eq!(seq, 3);
-        assert!(events.iter().all(|e| e.event_type == WatchEventType::Created));
+        assert!(events
+            .iter()
+            .all(|e| e.event_type == WatchEventType::Created));
 
         // New writes continue from 3
         db.record_experience(minimal_experience(cid)).unwrap();

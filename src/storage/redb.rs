@@ -307,8 +307,8 @@ impl RedbStorage {
             event_type,
             timestamp_ms: timestamp.as_millis(),
         };
-        let record_bytes = bincode::serialize(&record)
-            .map_err(|e| StorageError::serialization(e.to_string()))?;
+        let record_bytes =
+            bincode::serialize(&record).map_err(|e| StorageError::serialization(e.to_string()))?;
 
         let mut events_table = write_txn.open_table(WATCH_EVENTS_TABLE)?;
         events_table.insert(&seq_bytes, record_bytes.as_slice())?;
