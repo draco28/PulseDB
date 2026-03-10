@@ -321,7 +321,10 @@ fn test_buffer_full_graceful_degradation() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.db");
     let config = Config {
-        watch: pulsedb::WatchConfig { buffer_size: 2 },
+        watch: pulsedb::WatchConfig {
+            buffer_size: 2,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let db = PulseDB::open(&path, config).unwrap();

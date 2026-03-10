@@ -2,7 +2,7 @@
 name = "pulsedb"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 authors = ["PulseDB Team"]
 description = "Embedded database for agentic AI systems - the substrate for hive mind architectures"
 license = "MIT OR Apache-2.0"
@@ -41,6 +41,9 @@ anndists = "0.1"
 
 # JSON serialization for HNSW metadata files (human-readable for debugging)
 serde_json = "1.0"
+
+# Cross-process watch - advisory file locking for writer detection
+fs2 = "0.4"
 
 # Watch system - bounded sync channels for in-process event delivery (<100ns per event)
 crossbeam-channel = "0.5"

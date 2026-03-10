@@ -13,6 +13,7 @@ use crossbeam_channel::Receiver;
 use futures_core::Stream;
 
 use crate::experience::ExperienceType;
+use crate::storage::schema::{WatchEventRecord, WatchEventTypeTag};
 use crate::types::{CollectiveId, ExperienceId, Timestamp};
 
 /// An event emitted when an experience changes.
@@ -64,6 +65,43 @@ pub enum WatchEventType {
 
     /// An experience was permanently deleted.
     Deleted,
+}
+
+// ============================================================================
+// Conversions between storage tags and public types
+// ============================================================================
+
+impl From<WatchEventType> for WatchEventTypeTag {
+    fn from(value: WatchEventType) -> Self {
+        match value {
+            WatchEventType::Created => Self::Created,
+            WatchEventType::Updated => Self::Updated,
+            WatchEventType::Archived => Self::Archived,
+            WatchEventType::Deleted => Self::Deleted,
+        }
+    }
+}
+
+impl From<WatchEventTypeTag> for WatchEventType {
+    fn from(value: WatchEventTypeTag) -> Self {
+        match value {
+            WatchEventTypeTag::Created => Self::Created,
+            WatchEventTypeTag::Updated => Self::Updated,
+            WatchEventTypeTag::Archived => Self::Archived,
+            WatchEventTypeTag::Deleted => Self::Deleted,
+        }
+    }
+}
+
+impl From<WatchEventRecord> for WatchEvent {
+    fn from(record: WatchEventRecord) -> Self {
+        Self {
+            experience_id: ExperienceId::from_bytes(record.experience_id),
+            collective_id: CollectiveId::from_bytes(record.collective_id),
+            event_type: record.event_type.into(),
+            timestamp: Timestamp::from_millis(record.timestamp_ms),
+        }
+    }
 }
 
 /// Filter for narrowing which watch events a subscriber receives.

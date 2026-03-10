@@ -199,6 +199,86 @@ pub const INSIGHTS_BY_COLLECTIVE_TABLE: MultimapTableDefinition<&[u8; 16], &[u8;
 pub const ACTIVITIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("activities");
 
 // ============================================================================
+// Watch Events Tables (E4-S02)
+// ============================================================================
+
+/// Metadata key for the current WAL sequence number.
+///
+/// Stored in `METADATA_TABLE` as 8-byte big-endian `u64`.
+/// Starts at 0 (no writes yet), incremented atomically within each
+/// experience write transaction.
+pub const WAL_SEQUENCE_KEY: &str = "wal_sequence";
+
+/// Watch events table — cross-process change detection log.
+///
+/// Each experience mutation (create, update, archive, delete) records an
+/// entry here with a monotonically increasing sequence number as the key.
+/// Reader processes poll this table to discover changes made by the writer.
+///
+/// Key: u64 sequence number as 8-byte big-endian (lexicographic = numeric order)
+/// Value: bincode-serialized `WatchEventRecord`
+///
+/// The table grows unboundedly; a future compaction feature will allow
+/// trimming old entries.
+pub const WATCH_EVENTS_TABLE: TableDefinition<&[u8; 8], &[u8]> =
+    TableDefinition::new("watch_events");
+
+/// A persisted watch event for cross-process change detection.
+///
+/// This is the on-disk representation — compact and self-contained.
+/// Converted to the public `WatchEvent` type when returned to callers.
+///
+/// Uses raw byte arrays for IDs (not UUID wrappers) to keep serialization
+/// simple and avoid coupling the storage format to the public type system.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WatchEventRecord {
+    /// The experience that changed (16-byte UUID).
+    pub experience_id: [u8; 16],
+
+    /// The collective the experience belongs to (16-byte UUID).
+    pub collective_id: [u8; 16],
+
+    /// What kind of change occurred.
+    pub event_type: WatchEventTypeTag,
+
+    /// When the change occurred (milliseconds since Unix epoch).
+    pub timestamp_ms: i64,
+}
+
+/// Compact tag for watch event types stored on disk.
+///
+/// Mirrors `WatchEventType` from `watch/types.rs` but uses `repr(u8)` for
+/// minimal storage footprint. Derives `Serialize`/`Deserialize` since it's
+/// part of the bincode-serialized `WatchEventRecord`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum WatchEventTypeTag {
+    /// A new experience was recorded.
+    Created = 0,
+    /// An existing experience was modified or reinforced.
+    Updated = 1,
+    /// An experience was soft-deleted (archived).
+    Archived = 2,
+    /// An experience was permanently deleted.
+    Deleted = 3,
+}
+
+impl WatchEventTypeTag {
+    /// Converts a raw byte to a WatchEventTypeTag.
+    ///
+    /// Returns `None` if the byte doesn't correspond to a known variant.
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Created),
+            1 => Some(Self::Updated),
+            2 => Some(Self::Archived),
+            3 => Some(Self::Deleted),
+            _ => None,
+        }
+    }
+}
+
+// ============================================================================
 // Experience Type Tag
 // ============================================================================
 

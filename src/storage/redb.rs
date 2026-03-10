@@ -30,10 +30,11 @@ use crate::types::{CollectiveId, ExperienceId, InsightId, RelationId, Timestamp}
 
 use super::schema::{
     decode_collective_from_activity_key, encode_activity_key, encode_type_index_key,
-    DatabaseMetadata, ExperienceTypeTag, ACTIVITIES_TABLE, COLLECTIVES_TABLE, EMBEDDINGS_TABLE,
-    EXPERIENCES_BY_COLLECTIVE_TABLE, EXPERIENCES_BY_TYPE_TABLE, EXPERIENCES_TABLE,
-    INSIGHTS_BY_COLLECTIVE_TABLE, INSIGHTS_TABLE, METADATA_TABLE, RELATIONS_BY_SOURCE_TABLE,
-    RELATIONS_BY_TARGET_TABLE, RELATIONS_TABLE, SCHEMA_VERSION,
+    DatabaseMetadata, ExperienceTypeTag, WatchEventRecord, WatchEventTypeTag, ACTIVITIES_TABLE,
+    COLLECTIVES_TABLE, EMBEDDINGS_TABLE, EXPERIENCES_BY_COLLECTIVE_TABLE,
+    EXPERIENCES_BY_TYPE_TABLE, EXPERIENCES_TABLE, INSIGHTS_BY_COLLECTIVE_TABLE, INSIGHTS_TABLE,
+    METADATA_TABLE, RELATIONS_BY_SOURCE_TABLE, RELATIONS_BY_TARGET_TABLE, RELATIONS_TABLE,
+    SCHEMA_VERSION, WAL_SEQUENCE_KEY, WATCH_EVENTS_TABLE,
 };
 use super::StorageEngine;
 use crate::config::{Config, EmbeddingDimension};
@@ -160,6 +161,7 @@ impl RedbStorage {
             let _ = write_txn.open_table(INSIGHTS_TABLE)?;
             let _ = write_txn.open_multimap_table(INSIGHTS_BY_COLLECTIVE_TABLE)?;
             let _ = write_txn.open_table(ACTIVITIES_TABLE)?;
+            let _ = write_txn.open_table(WATCH_EVENTS_TABLE)?;
         }
 
         write_txn.commit().map_err(StorageError::from)?;
@@ -235,6 +237,9 @@ impl RedbStorage {
             let metadata_bytes = bincode::serialize(&metadata)
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             meta_table.insert(METADATA_KEY, metadata_bytes.as_slice())?;
+
+            // Ensure watch_events table exists (migration for pre-E4-S02 databases)
+            let _ = write_txn.open_table(WATCH_EVENTS_TABLE)?;
         }
         write_txn.commit().map_err(StorageError::from)?;
 
@@ -254,6 +259,61 @@ impl RedbStorage {
     #[allow(dead_code)] // Used by Collective CRUD (E1-S02) and Experience CRUD (E1-S03)
     pub(crate) fn database(&self) -> &Database {
         &self.db
+    }
+
+    /// Increments the WAL sequence and records a watch event within an existing write transaction.
+    ///
+    /// This is the core of cross-process change detection. By executing within the caller's
+    /// transaction, the sequence increment and event record are atomic with the data mutation:
+    /// if the transaction commits, both are durable; if it rolls back, neither is visible.
+    ///
+    /// # Arguments
+    ///
+    /// * `write_txn` - The caller's open write transaction
+    /// * `experience_id` - The experience that changed
+    /// * `collective_id` - The collective it belongs to
+    /// * `event_type` - What kind of change occurred
+    /// * `timestamp` - When the change occurred
+    fn increment_wal_and_record(
+        &self,
+        write_txn: &::redb::WriteTransaction,
+        experience_id: ExperienceId,
+        collective_id: CollectiveId,
+        event_type: WatchEventTypeTag,
+        timestamp: Timestamp,
+    ) -> Result<u64> {
+        // Read current sequence (0 if key doesn't exist yet)
+        let mut meta_table = write_txn.open_table(METADATA_TABLE)?;
+        let current_seq = match meta_table.get(WAL_SEQUENCE_KEY)? {
+            Some(entry) => {
+                let bytes: [u8; 8] = entry
+                    .value()
+                    .try_into()
+                    .map_err(|_| StorageError::corrupted("invalid wal_sequence bytes"))?;
+                u64::from_be_bytes(bytes)
+            }
+            None => 0,
+        };
+        let new_seq = current_seq + 1;
+
+        // Write new sequence number
+        let seq_bytes = new_seq.to_be_bytes();
+        meta_table.insert(WAL_SEQUENCE_KEY, seq_bytes.as_slice())?;
+
+        // Record the event
+        let record = WatchEventRecord {
+            experience_id: *experience_id.as_bytes(),
+            collective_id: *collective_id.as_bytes(),
+            event_type,
+            timestamp_ms: timestamp.as_millis(),
+        };
+        let record_bytes = bincode::serialize(&record)
+            .map_err(|e| StorageError::serialization(e.to_string()))?;
+
+        let mut events_table = write_txn.open_table(WATCH_EVENTS_TABLE)?;
+        events_table.insert(&seq_bytes, record_bytes.as_slice())?;
+
+        Ok(new_seq)
     }
 
     /// Returns the embedding dimension configured for this database.
@@ -557,6 +617,14 @@ impl StorageEngine for RedbStorage {
             let mut type_table = write_txn.open_multimap_table(EXPERIENCES_BY_TYPE_TABLE)?;
             type_table.insert(&type_key, experience.id.as_bytes())?;
         }
+        // Record WAL event for cross-process change detection
+        self.increment_wal_and_record(
+            &write_txn,
+            experience.id,
+            experience.collective_id,
+            WatchEventTypeTag::Created,
+            experience.timestamp,
+        )?;
         write_txn.commit().map_err(StorageError::from)?;
 
         debug!(
@@ -592,6 +660,9 @@ impl StorageEngine for RedbStorage {
     fn update_experience(&self, id: ExperienceId, update: &ExperienceUpdate) -> Result<bool> {
         // Read-modify-write: read the current record, apply updates, write back
         let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        let collective_id;
+        let timestamp;
+        let is_archive;
         {
             let mut exp_table = write_txn.open_table(EXPERIENCES_TABLE)?;
 
@@ -605,6 +676,11 @@ impl StorageEngine for RedbStorage {
 
             // Drop the borrow on entry before mutating the table
             drop(entry);
+
+            // Capture metadata for WAL event before applying updates
+            collective_id = experience.collective_id;
+            timestamp = experience.timestamp;
+            is_archive = update.archived == Some(true);
 
             // Apply updates (only Some fields)
             if let Some(importance) = update.importance {
@@ -628,6 +704,13 @@ impl StorageEngine for RedbStorage {
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             exp_table.insert(id.as_bytes(), bytes.as_slice())?;
         }
+        // Record WAL event for cross-process change detection
+        let event_type = if is_archive {
+            WatchEventTypeTag::Archived
+        } else {
+            WatchEventTypeTag::Updated
+        };
+        self.increment_wal_and_record(&write_txn, id, collective_id, event_type, timestamp)?;
         write_txn.commit().map_err(StorageError::from)?;
 
         debug!(id = %id, "Experience updated");
@@ -636,7 +719,7 @@ impl StorageEngine for RedbStorage {
 
     fn delete_experience(&self, id: ExperienceId) -> Result<bool> {
         // First read the experience to get collective_id, timestamp, and type_tag
-        // (needed for cleaning up secondary indices)
+        // (needed for cleaning up secondary indices and WAL event)
         let (collective_id, timestamp, type_tag) = {
             let read_txn = self.db.begin_read().map_err(StorageError::from)?;
             let exp_table = read_txn.open_table(EXPERIENCES_TABLE)?;
@@ -679,6 +762,14 @@ impl StorageEngine for RedbStorage {
             let type_key = encode_type_index_key(collective_id.as_bytes(), type_tag);
             type_table.remove(&type_key, id.as_bytes())?;
         }
+        // Record WAL event for cross-process change detection
+        self.increment_wal_and_record(
+            &write_txn,
+            id,
+            collective_id,
+            WatchEventTypeTag::Deleted,
+            timestamp,
+        )?;
         write_txn.commit().map_err(StorageError::from)?;
 
         debug!(id = %id, "Experience deleted");
@@ -687,7 +778,7 @@ impl StorageEngine for RedbStorage {
 
     fn reinforce_experience(&self, id: ExperienceId) -> Result<Option<u32>> {
         let write_txn = self.db.begin_write().map_err(StorageError::from)?;
-        let new_count = {
+        let (new_count, collective_id, timestamp) = {
             let mut exp_table = write_txn.open_table(EXPERIENCES_TABLE)?;
 
             let entry = match exp_table.get(id.as_bytes())? {
@@ -701,12 +792,22 @@ impl StorageEngine for RedbStorage {
 
             experience.applications = experience.applications.saturating_add(1);
             let new_count = experience.applications;
+            let collective_id = experience.collective_id;
+            let timestamp = experience.timestamp;
 
             let bytes = bincode::serialize(&experience)
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             exp_table.insert(id.as_bytes(), bytes.as_slice())?;
-            new_count
+            (new_count, collective_id, timestamp)
         };
+        // Record WAL event for cross-process change detection
+        self.increment_wal_and_record(
+            &write_txn,
+            id,
+            collective_id,
+            WatchEventTypeTag::Updated,
+            timestamp,
+        )?;
         write_txn.commit().map_err(StorageError::from)?;
 
         debug!(id = %id, applications = new_count, "Experience reinforced");
@@ -1189,6 +1290,53 @@ impl StorageEngine for RedbStorage {
             "Cascade-deleted activities for collective"
         );
         Ok(count)
+    }
+
+    // =========================================================================
+    // Watch Event Operations (E4-S02)
+    // =========================================================================
+
+    fn get_wal_sequence(&self) -> Result<u64> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let meta_table = read_txn.open_table(METADATA_TABLE)?;
+        match meta_table.get(WAL_SEQUENCE_KEY)? {
+            Some(entry) => {
+                let bytes: [u8; 8] = entry
+                    .value()
+                    .try_into()
+                    .map_err(|_| StorageError::corrupted("invalid wal_sequence bytes"))?;
+                Ok(u64::from_be_bytes(bytes))
+            }
+            None => Ok(0),
+        }
+    }
+
+    fn poll_watch_events(
+        &self,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<(Vec<WatchEventRecord>, u64)> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let events_table = read_txn.open_table(WATCH_EVENTS_TABLE)?;
+
+        let start_key = (since_seq + 1).to_be_bytes();
+        let end_key = u64::MAX.to_be_bytes();
+        let mut events = Vec::new();
+        let mut max_seq = since_seq;
+
+        for entry in events_table.range::<&[u8; 8]>(&start_key..=&end_key)? {
+            let (key, value) = entry.map_err(StorageError::from)?;
+            let seq = u64::from_be_bytes(*key.value());
+            let record: WatchEventRecord = bincode::deserialize(value.value())
+                .map_err(|e| StorageError::serialization(e.to_string()))?;
+            events.push(record);
+            max_seq = seq;
+            if events.len() >= limit {
+                break;
+            }
+        }
+
+        Ok((events, max_seq))
     }
 }
 
@@ -2164,6 +2312,242 @@ mod tests {
 
         let result = storage.reinforce_experience(ExperienceId::new()).unwrap();
         assert!(result.is_none());
+
+        Box::new(storage).close().unwrap();
+    }
+
+    // ====================================================================
+    // WAL Sequence Tracking Tests (E4-S02)
+    // ====================================================================
+
+    #[test]
+    fn test_wal_sequence_starts_at_zero() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        assert_eq!(storage.get_wal_sequence().unwrap(), 0);
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_save_experience_increments_wal_sequence() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let collective = Collective::new("test", 384);
+        storage.save_collective(&collective).unwrap();
+
+        let exp1 = test_experience(collective.id, 384);
+        storage.save_experience(&exp1).unwrap();
+        assert_eq!(storage.get_wal_sequence().unwrap(), 1);
+
+        let exp2 = test_experience(collective.id, 384);
+        storage.save_experience(&exp2).unwrap();
+        assert_eq!(storage.get_wal_sequence().unwrap(), 2);
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_poll_watch_events_returns_correct_events() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let collective = Collective::new("test", 384);
+        storage.save_collective(&collective).unwrap();
+
+        let exp1 = test_experience(collective.id, 384);
+        let exp2 = test_experience(collective.id, 384);
+        let exp3 = test_experience(collective.id, 384);
+        storage.save_experience(&exp1).unwrap();
+        storage.save_experience(&exp2).unwrap();
+        storage.save_experience(&exp3).unwrap();
+
+        let (events, max_seq) = storage.poll_watch_events(0, 100).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(max_seq, 3);
+        // All should be Created events
+        assert!(events
+            .iter()
+            .all(|e| e.event_type == WatchEventTypeTag::Created));
+        // IDs should match in order
+        assert_eq!(events[0].experience_id, *exp1.id.as_bytes());
+        assert_eq!(events[1].experience_id, *exp2.id.as_bytes());
+        assert_eq!(events[2].experience_id, *exp3.id.as_bytes());
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_poll_watch_events_since_midpoint() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let collective = Collective::new("test", 384);
+        storage.save_collective(&collective).unwrap();
+
+        // Create 5 experiences
+        for _ in 0..5 {
+            let exp = test_experience(collective.id, 384);
+            storage.save_experience(&exp).unwrap();
+        }
+
+        // Poll from seq 3 — should get 2 events (seq 4 and 5)
+        let (events, max_seq) = storage.poll_watch_events(3, 100).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(max_seq, 5);
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_poll_watch_events_empty_when_caught_up() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let collective = Collective::new("test", 384);
+        storage.save_collective(&collective).unwrap();
+
+        let exp = test_experience(collective.id, 384);
+        storage.save_experience(&exp).unwrap();
+
+        // Poll everything
+        let (events, max_seq) = storage.poll_watch_events(0, 100).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(max_seq, 1);
+
+        // Poll again from same position — empty
+        let (events, max_seq) = storage.poll_watch_events(1, 100).unwrap();
+        assert_eq!(events.len(), 0);
+        assert_eq!(max_seq, 1); // stays the same
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_delete_records_watch_event() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let collective = Collective::new("test", 384);
+        storage.save_collective(&collective).unwrap();
+
+        let exp = test_experience(collective.id, 384);
+        storage.save_experience(&exp).unwrap();
+        storage.delete_experience(exp.id).unwrap();
+
+        let (events, max_seq) = storage.poll_watch_events(0, 100).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(max_seq, 2);
+        assert_eq!(events[0].event_type, WatchEventTypeTag::Created);
+        assert_eq!(events[1].event_type, WatchEventTypeTag::Deleted);
+        assert_eq!(events[1].experience_id, *exp.id.as_bytes());
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_update_records_watch_event() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let collective = Collective::new("test", 384);
+        storage.save_collective(&collective).unwrap();
+
+        let exp = test_experience(collective.id, 384);
+        storage.save_experience(&exp).unwrap();
+
+        let update = ExperienceUpdate {
+            importance: Some(0.99),
+            ..Default::default()
+        };
+        storage.update_experience(exp.id, &update).unwrap();
+
+        let (events, _) = storage.poll_watch_events(0, 100).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].event_type, WatchEventTypeTag::Updated);
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_reinforce_records_watch_event() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let collective = Collective::new("test", 384);
+        storage.save_collective(&collective).unwrap();
+
+        let exp = test_experience(collective.id, 384);
+        storage.save_experience(&exp).unwrap();
+        storage.reinforce_experience(exp.id).unwrap();
+
+        let (events, _) = storage.poll_watch_events(0, 100).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, WatchEventTypeTag::Created);
+        assert_eq!(events[1].event_type, WatchEventTypeTag::Updated);
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_archive_records_archived_event() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let collective = Collective::new("test", 384);
+        storage.save_collective(&collective).unwrap();
+
+        let exp = test_experience(collective.id, 384);
+        storage.save_experience(&exp).unwrap();
+
+        let update = ExperienceUpdate {
+            archived: Some(true),
+            ..Default::default()
+        };
+        storage.update_experience(exp.id, &update).unwrap();
+
+        let (events, _) = storage.poll_watch_events(0, 100).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].event_type, WatchEventTypeTag::Archived);
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_poll_watch_events_batch_limit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let collective = Collective::new("test", 384);
+        storage.save_collective(&collective).unwrap();
+
+        // Create 10 experiences
+        for _ in 0..10 {
+            let exp = test_experience(collective.id, 384);
+            storage.save_experience(&exp).unwrap();
+        }
+
+        // Poll with limit of 3
+        let (events, max_seq) = storage.poll_watch_events(0, 3).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(max_seq, 3);
+
+        // Continue from where we left off
+        let (events, max_seq) = storage.poll_watch_events(3, 3).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(max_seq, 6);
 
         Box::new(storage).close().unwrap();
     }

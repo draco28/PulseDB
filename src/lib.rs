@@ -133,8 +133,8 @@ pub use activity::{Activity, NewActivity};
 // Search & Context
 pub use search::{ContextCandidates, ContextRequest, SearchFilter, SearchResult};
 
-// Watch (real-time notifications)
-pub use watch::{WatchEvent, WatchEventType, WatchFilter, WatchStream};
+// Watch (real-time notifications + cross-process change detection)
+pub use watch::{ChangePoller, WatchEvent, WatchEventType, WatchFilter, WatchLock, WatchStream};
 
 // Substrate (async PulseHive integration)
 pub use substrate::{PulseDBSubstrate, SubstrateProvider};
@@ -159,5 +159,5 @@ pub mod prelude {
     pub use crate::search::{ContextCandidates, ContextRequest, SearchFilter, SearchResult};
     pub use crate::substrate::{PulseDBSubstrate, SubstrateProvider};
     pub use crate::types::{CollectiveId, ExperienceId, Timestamp};
-    pub use crate::watch::{WatchEvent, WatchEventType, WatchFilter};
+    pub use crate::watch::{ChangePoller, WatchEvent, WatchEventType, WatchFilter, WatchLock};
 }

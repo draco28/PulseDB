@@ -364,6 +364,34 @@ pub trait StorageEngine: Send + Sync {
     /// Used for cascade deletion when a collective is removed.
     /// Returns the count of deleted activities.
     fn delete_activities_by_collective(&self, collective_id: CollectiveId) -> Result<u64>;
+
+    // =========================================================================
+    // Watch Event Operations (E4-S02) — Cross-Process Change Detection
+    // =========================================================================
+
+    /// Returns the current WAL sequence number.
+    ///
+    /// Every experience write (create, update, delete, reinforce) atomically
+    /// increments the sequence. Returns 0 if no writes have occurred yet.
+    ///
+    /// This is a read-only operation — the write-side logic is internal to the
+    /// storage implementation to maintain transactional atomicity.
+    fn get_wal_sequence(&self) -> Result<u64>;
+
+    /// Retrieves watch events with sequence numbers greater than `since_seq`.
+    ///
+    /// Returns events in ascending sequence order and the highest sequence
+    /// number seen. If no new events exist, returns an empty vec and `since_seq`.
+    ///
+    /// # Arguments
+    ///
+    /// * `since_seq` - Return events with sequence > this value (0 = all events)
+    /// * `limit` - Maximum number of events to return per call
+    fn poll_watch_events(
+        &self,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<(Vec<schema::WatchEventRecord>, u64)>;
 }
 
 /// Opens a storage engine at the given path.

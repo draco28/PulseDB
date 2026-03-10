@@ -2020,6 +2020,76 @@ impl PulseDB {
     ) -> WatchStream {
         self.watch.subscribe(collective_id, Some(filter))
     }
+
+    // =========================================================================
+    // Cross-Process Watch (E4-S02)
+    // =========================================================================
+
+    /// Returns the current WAL sequence number.
+    ///
+    /// Use this to establish a baseline before starting to poll for changes.
+    /// Returns 0 if no experience writes have occurred yet.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let seq = db.get_current_sequence()?;
+    /// // ... later ...
+    /// let (events, new_seq) = db.poll_changes(seq)?;
+    /// ```
+    pub fn get_current_sequence(&self) -> Result<u64> {
+        self.storage.get_wal_sequence()
+    }
+
+    /// Polls for experience changes since the given sequence number.
+    ///
+    /// Returns a tuple of `(events, new_sequence)`:
+    /// - `events`: New [`WatchEvent`]s in sequence order
+    /// - `new_sequence`: Pass this value back on the next call
+    ///
+    /// Returns an empty vec and the same sequence if no changes exist.
+    ///
+    /// # Arguments
+    ///
+    /// * `since_seq` - The last sequence number you received (0 for first call)
+    ///
+    /// # Performance
+    ///
+    /// Target: < 10ms per call. Internally performs a range scan on the
+    /// watch_events table, O(k) where k is the number of new events.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut seq = 0u64;
+    /// loop {
+    ///     let (events, new_seq) = db.poll_changes(seq)?;
+    ///     seq = new_seq;
+    ///     for event in events {
+    ///         println!("{:?}: {}", event.event_type, event.experience_id);
+    ///     }
+    ///     std::thread::sleep(Duration::from_millis(100));
+    /// }
+    /// ```
+    pub fn poll_changes(&self, since_seq: u64) -> Result<(Vec<WatchEvent>, u64)> {
+        let (records, new_seq) = self.storage.poll_watch_events(since_seq, 1000)?;
+        let events = records.into_iter().map(WatchEvent::from).collect();
+        Ok((events, new_seq))
+    }
+
+    /// Polls for changes with a custom batch size limit.
+    ///
+    /// Same as [`poll_changes`](Self::poll_changes) but returns at most
+    /// `limit` events per call. Use this for backpressure control.
+    pub fn poll_changes_batch(
+        &self,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<(Vec<WatchEvent>, u64)> {
+        let (records, new_seq) = self.storage.poll_watch_events(since_seq, limit)?;
+        let events = records.into_iter().map(WatchEvent::from).collect();
+        Ok((events, new_seq))
+    }
 }
 
 // PulseDB is auto Send + Sync: Box<dyn StorageEngine + Send + Sync>,

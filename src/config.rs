@@ -186,6 +186,12 @@ impl Config {
                 "must be greater than 0",
             ));
         }
+        if self.watch.poll_interval_ms == 0 {
+            return Err(ValidationError::invalid_field(
+                "watch.poll_interval_ms",
+                "must be greater than 0",
+            ));
+        }
 
         // Validate custom dimension bounds
         if let EmbeddingDimension::Custom(dim) = self.embedding_dimension {
@@ -421,10 +427,10 @@ impl Default for ActivityConfig {
     }
 }
 
-/// Configuration for the in-process watch system.
+/// Configuration for the watch system (in-process and cross-process).
 ///
-/// Controls the channel buffer size for real-time experience notifications.
-/// Subscribers that fall behind will have events dropped (non-blocking).
+/// Controls the channel buffer size for real-time experience notifications
+/// and the poll interval for cross-process change detection.
 ///
 /// # Example
 /// ```rust
@@ -433,24 +439,36 @@ impl Default for ActivityConfig {
 /// let config = Config {
 ///     watch: pulsedb::WatchConfig {
 ///         buffer_size: 500,
+///         poll_interval_ms: 200,
 ///     },
 ///     ..Default::default()
 /// };
 /// ```
 #[derive(Clone, Debug)]
 pub struct WatchConfig {
-    /// Maximum number of events buffered per subscriber.
+    /// Maximum number of events buffered per subscriber (in-process).
     ///
     /// When a subscriber's channel is full, new events are dropped for
     /// that subscriber (with a warning log). The publisher never blocks.
     ///
     /// Default: 1000
     pub buffer_size: usize,
+
+    /// Poll interval in milliseconds for cross-process change detection.
+    ///
+    /// Reader processes call `poll_changes()` at this interval to check
+    /// for new experiences written by the writer process.
+    ///
+    /// Default: 100
+    pub poll_interval_ms: u64,
 }
 
 impl Default for WatchConfig {
     fn default() -> Self {
-        Self { buffer_size: 1000 }
+        Self {
+            buffer_size: 1000,
+            poll_interval_ms: 100,
+        }
     }
 }
 

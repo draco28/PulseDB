@@ -18,8 +18,12 @@
 //! Filters are applied on the sender side before channel delivery, so
 //! subscribers only receive events they care about.
 
+pub mod lock;
+pub mod poll;
 pub mod types;
 
+pub use lock::WatchLock;
+pub use poll::ChangePoller;
 pub use types::{WatchEvent, WatchEventType, WatchFilter, WatchStream};
 
 use std::collections::HashMap;
