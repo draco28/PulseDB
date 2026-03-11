@@ -87,10 +87,10 @@ jobs:
         run: cargo test ${{ matrix.features }}
 
   # ─────────────────────────────────────────────
-  # Job 3: MSRV verification (Rust 1.88)
+  # Job 3: MSRV verification (Rust 1.89)
   # ─────────────────────────────────────────────
   test-msrv:
-    name: MSRV (Rust 1.88)
+    name: MSRV (Rust 1.89)
     needs: lint
     runs-on: ubuntu-latest
     steps:
@@ -98,7 +98,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.89"
 
       - uses: Swatinem/rust-cache@v2
         with:
