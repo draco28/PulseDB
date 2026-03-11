@@ -22,9 +22,14 @@ fn dummy_embedding() -> Vec<f32> {
 }
 
 /// Creates a distinct embedding seeded by a value (for search ordering tests).
+///
+/// Uses two components so that different seeds produce genuinely different
+/// directions after normalization (a single-component vector always normalizes
+/// to the same unit vector regardless of seed).
 fn seeded_embedding(seed: f32) -> Vec<f32> {
     let mut emb = vec![0.0; DIM];
     emb[0] = seed;
+    emb[1] = 1.0 - seed; // second component ensures distinct direction
     // Normalize to unit length for cosine similarity
     let norm = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
