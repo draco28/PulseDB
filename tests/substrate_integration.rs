@@ -30,7 +30,7 @@ fn seeded_embedding(seed: f32) -> Vec<f32> {
     let mut emb = vec![0.0; DIM];
     emb[0] = seed;
     emb[1] = 1.0 - seed; // second component ensures distinct direction
-    // Normalize to unit length for cosine similarity
+                         // Normalize to unit length for cosine similarity
     let norm = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
         emb.iter_mut().for_each(|x| *x /= norm);
