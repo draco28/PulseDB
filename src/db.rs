@@ -185,7 +185,10 @@ impl PulseDB {
             "PulseDB opened successfully"
         );
 
-        let watch = Arc::new(WatchService::new(config.watch.buffer_size));
+        let watch = Arc::new(WatchService::new(
+            config.watch.buffer_size,
+            config.watch.in_process,
+        ));
 
         Ok(Self {
             storage,

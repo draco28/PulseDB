@@ -4,14 +4,11 @@
 //! Uses External embedding provider (default), so all experiences must provide
 //! pre-computed embeddings of the correct dimension (384 for D384).
 
-use std::time::Duration;
-
 use futures::executor::block_on;
 use futures::StreamExt;
 
 use pulsedb::{
-    CollectiveId, Config, ExperienceType, ExperienceUpdate, NewExperience, PulseDB, WatchEventType,
-    WatchFilter,
+    CollectiveId, Config, ExperienceUpdate, NewExperience, PulseDB, WatchEventType, WatchFilter,
 };
 use tempfile::tempdir;
 

@@ -32,7 +32,7 @@ use std::sync::{Arc, RwLock};
 
 use atomic_waker::AtomicWaker;
 use crossbeam_channel::{bounded, Sender, TrySendError};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::experience::Experience;
 use crate::types::CollectiveId;
@@ -59,15 +59,22 @@ pub(crate) struct WatchService {
 
     /// Channel buffer capacity for new subscriptions.
     buffer_size: usize,
+
+    /// Whether in-process event dispatch is enabled.
+    in_process: bool,
 }
 
 impl WatchService {
     /// Creates a new watch service with the given channel buffer size.
-    pub(crate) fn new(buffer_size: usize) -> Self {
+    ///
+    /// When `in_process` is `false`, event dispatch via `emit()` is skipped
+    /// and `has_subscribers()` always returns `false`.
+    pub(crate) fn new(buffer_size: usize, in_process: bool) -> Self {
         Self {
             subscribers: RwLock::new(HashMap::new()),
             next_id: AtomicU64::new(0),
             buffer_size,
+            in_process,
         }
     }
 
@@ -80,6 +87,10 @@ impl WatchService {
         collective_id: CollectiveId,
         filter: Option<WatchFilter>,
     ) -> WatchStream {
+        if !self.in_process {
+            info!("in-process watch disabled, stream will not receive events");
+        }
+
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = bounded(self.buffer_size);
         let waker = Arc::new(AtomicWaker::new());
@@ -125,6 +136,10 @@ impl WatchService {
     /// The `experience` parameter is used for filter matching (domain, type,
     /// importance) without including it in the event payload.
     pub(crate) fn emit(&self, event: WatchEvent, experience: &Experience) {
+        if !self.in_process {
+            return;
+        }
+
         let collective_id = event.collective_id;
         let mut disconnected = Vec::new();
 
@@ -184,6 +199,9 @@ impl WatchService {
     /// Cheap check used by mutation methods to skip the `get_experience`
     /// read when nobody is watching.
     pub(crate) fn has_subscribers(&self) -> bool {
+        if !self.in_process {
+            return false;
+        }
         let subs = self
             .subscribers
             .read()
@@ -290,7 +308,7 @@ mod tests {
 
     #[test]
     fn subscribe_returns_stream() {
-        let service = Arc::new(WatchService::new(100));
+        let service = Arc::new(WatchService::new(100, true));
         let collective = CollectiveId::new();
         let _stream = service.subscribe(collective, None);
         assert!(service.has_subscribers());
@@ -298,7 +316,7 @@ mod tests {
 
     #[test]
     fn emit_delivers_to_subscriber() {
-        let service = Arc::new(WatchService::new(100));
+        let service = Arc::new(WatchService::new(100, true));
         let collective = CollectiveId::new();
         let stream = service.subscribe(collective, None);
 
@@ -319,7 +337,7 @@ mod tests {
 
     #[test]
     fn emit_delivers_to_multiple_subscribers() {
-        let service = Arc::new(WatchService::new(100));
+        let service = Arc::new(WatchService::new(100, true));
         let collective = CollectiveId::new();
         let stream1 = service.subscribe(collective, None);
         let stream2 = service.subscribe(collective, None);
@@ -338,7 +356,7 @@ mod tests {
 
     #[test]
     fn emit_isolates_collectives() {
-        let service = Arc::new(WatchService::new(100));
+        let service = Arc::new(WatchService::new(100, true));
         let coll_a = CollectiveId::new();
         let coll_b = CollectiveId::new();
         let stream_a = service.subscribe(coll_a, None);
@@ -359,7 +377,7 @@ mod tests {
 
     #[test]
     fn filter_by_domain() {
-        let service = Arc::new(WatchService::new(100));
+        let service = Arc::new(WatchService::new(100, true));
         let collective = CollectiveId::new();
         let filter = WatchFilter {
             domains: Some(vec!["security".to_string()]),
@@ -393,7 +411,7 @@ mod tests {
 
     #[test]
     fn filter_by_experience_type() {
-        let service = Arc::new(WatchService::new(100));
+        let service = Arc::new(WatchService::new(100, true));
         let collective = CollectiveId::new();
         let filter = WatchFilter {
             experience_types: Some(vec![ExperienceType::Fact {
@@ -433,7 +451,7 @@ mod tests {
 
     #[test]
     fn filter_by_min_importance() {
-        let service = Arc::new(WatchService::new(100));
+        let service = Arc::new(WatchService::new(100, true));
         let collective = CollectiveId::new();
         let filter = WatchFilter {
             min_importance: Some(0.7),
@@ -464,7 +482,7 @@ mod tests {
 
     #[test]
     fn subscriber_cleanup_on_drop() {
-        let service = Arc::new(WatchService::new(100));
+        let service = Arc::new(WatchService::new(100, true));
         let collective = CollectiveId::new();
 
         {
@@ -477,7 +495,7 @@ mod tests {
 
     #[test]
     fn dead_subscriber_cleaned_on_emit() {
-        let service = Arc::new(WatchService::new(100));
+        let service = Arc::new(WatchService::new(100, true));
         let collective = CollectiveId::new();
 
         // Manually inject a subscriber whose receiver has been dropped,
@@ -513,7 +531,7 @@ mod tests {
 
     #[test]
     fn buffer_full_does_not_block() {
-        let service = Arc::new(WatchService::new(2)); // Tiny buffer
+        let service = Arc::new(WatchService::new(2, true)); // Tiny buffer
         let collective = CollectiveId::new();
         let stream = service.subscribe(collective, None);
 
@@ -539,13 +557,13 @@ mod tests {
 
     #[test]
     fn has_subscribers_empty() {
-        let service = Arc::new(WatchService::new(100));
+        let service = Arc::new(WatchService::new(100, true));
         assert!(!service.has_subscribers());
     }
 
     #[test]
     fn combined_filter_requires_all_criteria() {
-        let service = Arc::new(WatchService::new(100));
+        let service = Arc::new(WatchService::new(100, true));
         let collective = CollectiveId::new();
         let filter = WatchFilter {
             domains: Some(vec!["security".to_string()]),
@@ -583,5 +601,52 @@ mod tests {
         );
         service.emit(test_event(collective, WatchEventType::Created), &exp3);
         assert!(stream.receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn in_process_disabled_no_events() {
+        let service = Arc::new(WatchService::new(100, false));
+        let collective = CollectiveId::new();
+        let stream = service.subscribe(collective, None);
+
+        let exp = test_experience(
+            collective,
+            vec!["test".to_string()],
+            ExperienceType::Generic { category: None },
+            0.5,
+        );
+        service.emit(test_event(collective, WatchEventType::Created), &exp);
+
+        // No events should arrive when in_process is disabled
+        assert!(stream.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn in_process_disabled_has_subscribers_false() {
+        let service = Arc::new(WatchService::new(100, false));
+        let collective = CollectiveId::new();
+
+        // Even after subscribing, has_subscribers returns false
+        let _stream = service.subscribe(collective, None);
+        assert!(!service.has_subscribers());
+    }
+
+    #[test]
+    fn in_process_enabled_receives_events() {
+        let service = Arc::new(WatchService::new(100, true));
+        let collective = CollectiveId::new();
+        let stream = service.subscribe(collective, None);
+
+        let exp = test_experience(
+            collective,
+            vec!["test".to_string()],
+            ExperienceType::Generic { category: None },
+            0.5,
+        );
+        service.emit(test_event(collective, WatchEventType::Created), &exp);
+
+        // Events should arrive when in_process is enabled
+        let event = stream.receiver.try_recv().unwrap();
+        assert_eq!(event.event_type, WatchEventType::Created);
     }
 }

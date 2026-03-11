@@ -429,8 +429,9 @@ impl Default for ActivityConfig {
 
 /// Configuration for the watch system (in-process and cross-process).
 ///
-/// Controls the channel buffer size for real-time experience notifications
-/// and the poll interval for cross-process change detection.
+/// Controls whether in-process channel subscriptions are enabled, the
+/// channel buffer size for real-time experience notifications, and the
+/// poll interval for cross-process change detection.
 ///
 /// # Example
 /// ```rust
@@ -438,6 +439,7 @@ impl Default for ActivityConfig {
 ///
 /// let config = Config {
 ///     watch: pulsedb::WatchConfig {
+///         in_process: true,
 ///         buffer_size: 500,
 ///         poll_interval_ms: 200,
 ///     },
@@ -446,6 +448,16 @@ impl Default for ActivityConfig {
 /// ```
 #[derive(Clone, Debug)]
 pub struct WatchConfig {
+    /// Enable in-process watch subscriptions via crossbeam channels.
+    ///
+    /// When `true` (default), [`watch_experiences()`](crate::PulseDB::watch_experiences)
+    /// streams receive real-time events. When `false`, in-process event
+    /// dispatch is skipped entirely — only cross-process
+    /// [`poll_changes()`](crate::PulseDB::poll_changes) remains available.
+    ///
+    /// Default: true
+    pub in_process: bool,
+
     /// Maximum number of events buffered per subscriber (in-process).
     ///
     /// When a subscriber's channel is full, new events are dropped for
@@ -466,6 +478,7 @@ pub struct WatchConfig {
 impl Default for WatchConfig {
     fn default() -> Self {
         Self {
+            in_process: true,
             buffer_size: 1000,
             poll_interval_ms: 100,
         }
@@ -621,5 +634,45 @@ mod tests {
         let bytes = bincode::serialize(&dim).unwrap();
         let restored: EmbeddingDimension = bincode::deserialize(&bytes).unwrap();
         assert_eq!(dim, restored);
+    }
+
+    #[test]
+    fn test_watch_config_defaults() {
+        let config = WatchConfig::default();
+        assert!(config.in_process);
+        assert_eq!(config.buffer_size, 1000);
+        assert_eq!(config.poll_interval_ms, 100);
+    }
+
+    #[test]
+    fn test_validate_watch_zero_buffer_size() {
+        let config = Config {
+            watch: WatchConfig {
+                buffer_size: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ValidationError::InvalidField { field, .. } if field == "watch.buffer_size"
+        ));
+    }
+
+    #[test]
+    fn test_validate_watch_zero_poll_interval() {
+        let config = Config {
+            watch: WatchConfig {
+                poll_interval_ms: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ValidationError::InvalidField { field, .. } if field == "watch.poll_interval_ms"
+        ));
     }
 }
