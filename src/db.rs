@@ -821,7 +821,7 @@ impl PulseDB {
                 timestamp: experience.timestamp,
             },
             &experience,
-        );
+        )?;
 
         info!(id = %id, "Experience recorded");
         Ok(id)
@@ -869,7 +869,7 @@ impl PulseDB {
                         timestamp: Timestamp::now(),
                     },
                     &exp,
-                );
+                )?;
             }
         }
 
@@ -965,7 +965,7 @@ impl PulseDB {
                 timestamp: Timestamp::now(),
             },
             &experience,
-        );
+        )?;
 
         info!(id = %id, "Experience deleted");
         Ok(())
@@ -997,7 +997,7 @@ impl PulseDB {
                         timestamp: Timestamp::now(),
                     },
                     &exp,
-                );
+                )?;
             }
         }
 
@@ -1994,7 +1994,7 @@ impl PulseDB {
     ///     println!("{:?}: {}", event.event_type, event.experience_id);
     /// }
     /// ```
-    pub fn watch_experiences(&self, collective_id: CollectiveId) -> WatchStream {
+    pub fn watch_experiences(&self, collective_id: CollectiveId) -> Result<WatchStream> {
         self.watch.subscribe(collective_id, None)
     }
 
@@ -2020,7 +2020,7 @@ impl PulseDB {
         &self,
         collective_id: CollectiveId,
         filter: WatchFilter,
-    ) -> WatchStream {
+    ) -> Result<WatchStream> {
         self.watch.subscribe(collective_id, Some(filter))
     }
 

@@ -34,6 +34,7 @@ use atomic_waker::AtomicWaker;
 use crossbeam_channel::{bounded, Sender, TrySendError};
 use tracing::{info, warn};
 
+use crate::error::PulseDBError;
 use crate::experience::Experience;
 use crate::types::CollectiveId;
 
@@ -86,7 +87,7 @@ impl WatchService {
         self: &Arc<Self>,
         collective_id: CollectiveId,
         filter: Option<WatchFilter>,
-    ) -> WatchStream {
+    ) -> crate::Result<WatchStream> {
         if !self.in_process {
             info!("in-process watch disabled, stream will not receive events");
         }
@@ -106,7 +107,7 @@ impl WatchService {
             let mut subs = self
                 .subscribers
                 .write()
-                .expect("watch subscribers lock poisoned");
+                .map_err(|_| PulseDBError::watch("Watch subscribers lock poisoned"))?;
             subs.entry(collective_id)
                 .or_default()
                 .push((id, subscriber));
@@ -116,7 +117,7 @@ impl WatchService {
         let service = Arc::downgrade(self);
         let cleanup_collective = collective_id;
 
-        WatchStream {
+        Ok(WatchStream {
             receiver,
             waker,
             cleanup: Some(Box::new(move || {
@@ -124,7 +125,7 @@ impl WatchService {
                     service.remove_subscriber(cleanup_collective, id);
                 }
             })),
-        }
+        })
     }
 
     /// Emits an event to all matching subscribers for the event's collective.
@@ -135,9 +136,9 @@ impl WatchService {
     ///
     /// The `experience` parameter is used for filter matching (domain, type,
     /// importance) without including it in the event payload.
-    pub(crate) fn emit(&self, event: WatchEvent, experience: &Experience) {
+    pub(crate) fn emit(&self, event: WatchEvent, experience: &Experience) -> crate::Result<()> {
         if !self.in_process {
-            return;
+            return Ok(());
         }
 
         let collective_id = event.collective_id;
@@ -148,7 +149,7 @@ impl WatchService {
             let subs = self
                 .subscribers
                 .read()
-                .expect("watch subscribers lock poisoned");
+                .map_err(|_| PulseDBError::watch("Watch subscribers lock poisoned"))?;
 
             if let Some(subscribers) = subs.get(&collective_id) {
                 for (id, sub) in subscribers {
@@ -184,7 +185,7 @@ impl WatchService {
             let mut subs = self
                 .subscribers
                 .write()
-                .expect("watch subscribers lock poisoned");
+                .map_err(|_| PulseDBError::watch("Watch subscribers lock poisoned"))?;
             if let Some(subscribers) = subs.get_mut(&collective_id) {
                 subscribers.retain(|(id, _)| !disconnected.contains(id));
                 if subscribers.is_empty() {
@@ -192,6 +193,8 @@ impl WatchService {
                 }
             }
         }
+
+        Ok(())
     }
 
     /// Returns `true` if any subscribers are registered.
@@ -202,19 +205,24 @@ impl WatchService {
         if !self.in_process {
             return false;
         }
-        let subs = self
-            .subscribers
+        self.subscribers
             .read()
-            .expect("watch subscribers lock poisoned");
-        !subs.is_empty()
+            .map(|subs| !subs.is_empty())
+            .unwrap_or(false)
     }
 
     /// Removes a specific subscriber. Called from [`WatchStream::drop`].
+    ///
+    /// Silently handles lock poisoning since this runs in a drop handler
+    /// where returning errors is not possible.
     fn remove_subscriber(&self, collective_id: CollectiveId, subscriber_id: u64) {
-        let mut subs = self
-            .subscribers
-            .write()
-            .expect("watch subscribers lock poisoned");
+        let mut subs = match self.subscribers.write() {
+            Ok(guard) => guard,
+            Err(_) => {
+                warn!("Watch subscribers lock poisoned during cleanup");
+                return;
+            }
+        };
         if let Some(subscribers) = subs.get_mut(&collective_id) {
             subscribers.retain(|(id, _)| *id != subscriber_id);
             if subscribers.is_empty() {
@@ -310,7 +318,7 @@ mod tests {
     fn subscribe_returns_stream() {
         let service = Arc::new(WatchService::new(100, true));
         let collective = CollectiveId::new();
-        let _stream = service.subscribe(collective, None);
+        let _stream = service.subscribe(collective, None).unwrap();
         assert!(service.has_subscribers());
     }
 
@@ -318,7 +326,7 @@ mod tests {
     fn emit_delivers_to_subscriber() {
         let service = Arc::new(WatchService::new(100, true));
         let collective = CollectiveId::new();
-        let stream = service.subscribe(collective, None);
+        let stream = service.subscribe(collective, None).unwrap();
 
         let exp = test_experience(
             collective,
@@ -328,7 +336,7 @@ mod tests {
         );
         let event = test_event(collective, WatchEventType::Created);
 
-        service.emit(event.clone(), &exp);
+        service.emit(event.clone(), &exp).unwrap();
 
         let received = stream.receiver.try_recv().unwrap();
         assert_eq!(received.event_type, WatchEventType::Created);
@@ -339,8 +347,8 @@ mod tests {
     fn emit_delivers_to_multiple_subscribers() {
         let service = Arc::new(WatchService::new(100, true));
         let collective = CollectiveId::new();
-        let stream1 = service.subscribe(collective, None);
-        let stream2 = service.subscribe(collective, None);
+        let stream1 = service.subscribe(collective, None).unwrap();
+        let stream2 = service.subscribe(collective, None).unwrap();
 
         let exp = test_experience(
             collective,
@@ -348,7 +356,9 @@ mod tests {
             ExperienceType::Generic { category: None },
             0.5,
         );
-        service.emit(test_event(collective, WatchEventType::Created), &exp);
+        service
+            .emit(test_event(collective, WatchEventType::Created), &exp)
+            .unwrap();
 
         assert!(stream1.receiver.try_recv().is_ok());
         assert!(stream2.receiver.try_recv().is_ok());
@@ -359,8 +369,8 @@ mod tests {
         let service = Arc::new(WatchService::new(100, true));
         let coll_a = CollectiveId::new();
         let coll_b = CollectiveId::new();
-        let stream_a = service.subscribe(coll_a, None);
-        let _stream_b = service.subscribe(coll_b, None);
+        let stream_a = service.subscribe(coll_a, None).unwrap();
+        let _stream_b = service.subscribe(coll_b, None).unwrap();
 
         let exp = test_experience(
             coll_a,
@@ -368,7 +378,9 @@ mod tests {
             ExperienceType::Generic { category: None },
             0.5,
         );
-        service.emit(test_event(coll_a, WatchEventType::Created), &exp);
+        service
+            .emit(test_event(coll_a, WatchEventType::Created), &exp)
+            .unwrap();
 
         // Stream A receives, Stream B does not
         assert!(stream_a.receiver.try_recv().is_ok());
@@ -383,7 +395,7 @@ mod tests {
             domains: Some(vec!["security".to_string()]),
             ..Default::default()
         };
-        let stream = service.subscribe(collective, Some(filter));
+        let stream = service.subscribe(collective, Some(filter)).unwrap();
 
         // Matching domain
         let exp_match = test_experience(
@@ -392,7 +404,9 @@ mod tests {
             ExperienceType::Generic { category: None },
             0.5,
         );
-        service.emit(test_event(collective, WatchEventType::Created), &exp_match);
+        service
+            .emit(test_event(collective, WatchEventType::Created), &exp_match)
+            .unwrap();
         assert!(stream.receiver.try_recv().is_ok());
 
         // Non-matching domain
@@ -402,10 +416,12 @@ mod tests {
             ExperienceType::Generic { category: None },
             0.5,
         );
-        service.emit(
-            test_event(collective, WatchEventType::Created),
-            &exp_no_match,
-        );
+        service
+            .emit(
+                test_event(collective, WatchEventType::Created),
+                &exp_no_match,
+            )
+            .unwrap();
         assert!(stream.receiver.try_recv().is_err());
     }
 
@@ -420,7 +436,7 @@ mod tests {
             }]),
             ..Default::default()
         };
-        let stream = service.subscribe(collective, Some(filter));
+        let stream = service.subscribe(collective, Some(filter)).unwrap();
 
         // Matching type (Fact)
         let exp_fact = test_experience(
@@ -432,7 +448,9 @@ mod tests {
             },
             0.5,
         );
-        service.emit(test_event(collective, WatchEventType::Created), &exp_fact);
+        service
+            .emit(test_event(collective, WatchEventType::Created), &exp_fact)
+            .unwrap();
         assert!(stream.receiver.try_recv().is_ok());
 
         // Non-matching type (Generic)
@@ -442,10 +460,12 @@ mod tests {
             ExperienceType::Generic { category: None },
             0.5,
         );
-        service.emit(
-            test_event(collective, WatchEventType::Created),
-            &exp_generic,
-        );
+        service
+            .emit(
+                test_event(collective, WatchEventType::Created),
+                &exp_generic,
+            )
+            .unwrap();
         assert!(stream.receiver.try_recv().is_err());
     }
 
@@ -457,7 +477,7 @@ mod tests {
             min_importance: Some(0.7),
             ..Default::default()
         };
-        let stream = service.subscribe(collective, Some(filter));
+        let stream = service.subscribe(collective, Some(filter)).unwrap();
 
         // Above threshold
         let exp_high = test_experience(
@@ -466,7 +486,9 @@ mod tests {
             ExperienceType::Generic { category: None },
             0.8,
         );
-        service.emit(test_event(collective, WatchEventType::Created), &exp_high);
+        service
+            .emit(test_event(collective, WatchEventType::Created), &exp_high)
+            .unwrap();
         assert!(stream.receiver.try_recv().is_ok());
 
         // Below threshold
@@ -476,7 +498,9 @@ mod tests {
             ExperienceType::Generic { category: None },
             0.3,
         );
-        service.emit(test_event(collective, WatchEventType::Created), &exp_low);
+        service
+            .emit(test_event(collective, WatchEventType::Created), &exp_low)
+            .unwrap();
         assert!(stream.receiver.try_recv().is_err());
     }
 
@@ -486,7 +510,7 @@ mod tests {
         let collective = CollectiveId::new();
 
         {
-            let _stream = service.subscribe(collective, None);
+            let _stream = service.subscribe(collective, None).unwrap();
             assert!(service.has_subscribers());
         }
         // Stream dropped — subscriber should be removed
@@ -525,7 +549,9 @@ mod tests {
             ExperienceType::Generic { category: None },
             0.5,
         );
-        service.emit(test_event(collective, WatchEventType::Created), &exp);
+        service
+            .emit(test_event(collective, WatchEventType::Created), &exp)
+            .unwrap();
         assert!(!service.has_subscribers());
     }
 
@@ -533,7 +559,7 @@ mod tests {
     fn buffer_full_does_not_block() {
         let service = Arc::new(WatchService::new(2, true)); // Tiny buffer
         let collective = CollectiveId::new();
-        let stream = service.subscribe(collective, None);
+        let stream = service.subscribe(collective, None).unwrap();
 
         let exp = test_experience(
             collective,
@@ -543,11 +569,17 @@ mod tests {
         );
 
         // Fill the buffer
-        service.emit(test_event(collective, WatchEventType::Created), &exp);
-        service.emit(test_event(collective, WatchEventType::Created), &exp);
+        service
+            .emit(test_event(collective, WatchEventType::Created), &exp)
+            .unwrap();
+        service
+            .emit(test_event(collective, WatchEventType::Created), &exp)
+            .unwrap();
 
         // Third emit should not block (buffer full, event dropped)
-        service.emit(test_event(collective, WatchEventType::Created), &exp);
+        service
+            .emit(test_event(collective, WatchEventType::Created), &exp)
+            .unwrap();
 
         // Only 2 events received
         assert!(stream.receiver.try_recv().is_ok());
@@ -570,7 +602,7 @@ mod tests {
             min_importance: Some(0.7),
             ..Default::default()
         };
-        let stream = service.subscribe(collective, Some(filter));
+        let stream = service.subscribe(collective, Some(filter)).unwrap();
 
         // Matches domain but NOT importance → filtered out
         let exp = test_experience(
@@ -579,7 +611,9 @@ mod tests {
             ExperienceType::Generic { category: None },
             0.3,
         );
-        service.emit(test_event(collective, WatchEventType::Created), &exp);
+        service
+            .emit(test_event(collective, WatchEventType::Created), &exp)
+            .unwrap();
         assert!(stream.receiver.try_recv().is_err());
 
         // Matches importance but NOT domain → filtered out
@@ -589,7 +623,9 @@ mod tests {
             ExperienceType::Generic { category: None },
             0.9,
         );
-        service.emit(test_event(collective, WatchEventType::Created), &exp2);
+        service
+            .emit(test_event(collective, WatchEventType::Created), &exp2)
+            .unwrap();
         assert!(stream.receiver.try_recv().is_err());
 
         // Matches BOTH → delivered
@@ -599,7 +635,9 @@ mod tests {
             ExperienceType::Generic { category: None },
             0.9,
         );
-        service.emit(test_event(collective, WatchEventType::Created), &exp3);
+        service
+            .emit(test_event(collective, WatchEventType::Created), &exp3)
+            .unwrap();
         assert!(stream.receiver.try_recv().is_ok());
     }
 
@@ -607,7 +645,7 @@ mod tests {
     fn in_process_disabled_no_events() {
         let service = Arc::new(WatchService::new(100, false));
         let collective = CollectiveId::new();
-        let stream = service.subscribe(collective, None);
+        let stream = service.subscribe(collective, None).unwrap();
 
         let exp = test_experience(
             collective,
@@ -615,7 +653,9 @@ mod tests {
             ExperienceType::Generic { category: None },
             0.5,
         );
-        service.emit(test_event(collective, WatchEventType::Created), &exp);
+        service
+            .emit(test_event(collective, WatchEventType::Created), &exp)
+            .unwrap();
 
         // No events should arrive when in_process is disabled
         assert!(stream.receiver.try_recv().is_err());
@@ -627,7 +667,7 @@ mod tests {
         let collective = CollectiveId::new();
 
         // Even after subscribing, has_subscribers returns false
-        let _stream = service.subscribe(collective, None);
+        let _stream = service.subscribe(collective, None).unwrap();
         assert!(!service.has_subscribers());
     }
 
@@ -635,7 +675,7 @@ mod tests {
     fn in_process_enabled_receives_events() {
         let service = Arc::new(WatchService::new(100, true));
         let collective = CollectiveId::new();
-        let stream = service.subscribe(collective, None);
+        let stream = service.subscribe(collective, None).unwrap();
 
         let exp = test_experience(
             collective,
@@ -643,7 +683,9 @@ mod tests {
             ExperienceType::Generic { category: None },
             0.5,
         );
-        service.emit(test_event(collective, WatchEventType::Created), &exp);
+        service
+            .emit(test_event(collective, WatchEventType::Created), &exp)
+            .unwrap();
 
         // Events should arrive when in_process is enabled
         let event = stream.receiver.try_recv().unwrap();

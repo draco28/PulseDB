@@ -164,7 +164,7 @@ impl SubstrateProvider for PulseDBSubstrate {
         collective: CollectiveId,
     ) -> Result<Pin<Box<dyn Stream<Item = WatchEvent> + Send>>, PulseDBError> {
         // watch_experiences is non-blocking (just channel setup), no spawn_blocking needed
-        let stream = self.db.watch_experiences(collective);
+        let stream = self.db.watch_experiences(collective)?;
         Ok(Box::pin(stream))
     }
 }

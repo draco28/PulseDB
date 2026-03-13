@@ -86,6 +86,11 @@ impl PulseDBError {
         Self::Vector(msg.into())
     }
 
+    /// Creates a watch system error with the given message.
+    pub fn watch(msg: impl Into<String>) -> Self {
+        Self::Watch(msg.into())
+    }
+
     /// Creates an internal error with the given message.
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
@@ -109,6 +114,31 @@ impl PulseDBError {
     /// Returns true if this is a vector index error.
     pub fn is_vector(&self) -> bool {
         matches!(self, Self::Vector(_))
+    }
+
+    /// Returns true if this is a watch system error.
+    pub fn is_watch(&self) -> bool {
+        matches!(self, Self::Watch(_))
+    }
+
+    /// Returns true if this is an embedding error.
+    pub fn is_embedding(&self) -> bool {
+        matches!(self, Self::Embedding(_))
+    }
+
+    /// Returns true if this is an internal error.
+    pub fn is_internal(&self) -> bool {
+        matches!(self, Self::Internal(_))
+    }
+
+    /// Returns true if this is a configuration error.
+    pub fn is_config(&self) -> bool {
+        matches!(self, Self::Config { .. })
+    }
+
+    /// Returns true if this is an I/O error.
+    pub fn is_io(&self) -> bool {
+        matches!(self, Self::Io(_))
     }
 }
 
@@ -471,5 +501,56 @@ mod tests {
         let result = inner();
         assert!(result.is_err());
         assert!(result.unwrap_err().is_storage());
+    }
+
+    #[test]
+    fn test_watch_error_display() {
+        let err = PulseDBError::watch("subscribers lock poisoned");
+        assert_eq!(err.to_string(), "Watch error: subscribers lock poisoned");
+    }
+
+    #[test]
+    fn test_watch_constructor() {
+        let err = PulseDBError::watch("test");
+        assert!(err.is_watch());
+        assert!(!err.is_storage());
+    }
+
+    #[test]
+    fn test_is_watch() {
+        let err = PulseDBError::watch("test");
+        assert!(err.is_watch());
+        assert!(!err.is_not_found());
+    }
+
+    #[test]
+    fn test_is_embedding() {
+        let err = PulseDBError::embedding("model load failed");
+        assert!(err.is_embedding());
+        assert!(!err.is_vector());
+    }
+
+    #[test]
+    fn test_is_internal() {
+        let err = PulseDBError::internal("task join failed");
+        assert!(err.is_internal());
+        assert!(!err.is_storage());
+    }
+
+    #[test]
+    fn test_is_config() {
+        let err = PulseDBError::config("invalid dimension");
+        assert!(err.is_config());
+        assert!(!err.is_validation());
+    }
+
+    #[test]
+    fn test_is_io() {
+        let err = PulseDBError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file missing",
+        ));
+        assert!(err.is_io());
+        assert!(!err.is_storage());
     }
 }

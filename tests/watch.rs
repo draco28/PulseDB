@@ -52,7 +52,7 @@ fn minimal_experience(collective_id: CollectiveId) -> NewExperience {
 #[test]
 fn test_record_experience_emits_created_event() {
     let (db, cid, _dir) = open_db_with_collective();
-    let mut stream = db.watch_experiences(cid);
+    let mut stream = db.watch_experiences(cid).unwrap();
 
     let exp_id = db.record_experience(minimal_experience(cid)).unwrap();
 
@@ -69,7 +69,7 @@ fn test_update_experience_emits_updated_event() {
     let exp_id = db.record_experience(minimal_experience(cid)).unwrap();
 
     // Subscribe AFTER recording so we only get the update event
-    let mut stream = db.watch_experiences(cid);
+    let mut stream = db.watch_experiences(cid).unwrap();
 
     db.update_experience(
         exp_id,
@@ -90,7 +90,7 @@ fn test_archive_experience_emits_archived_event() {
     let (db, cid, _dir) = open_db_with_collective();
     let exp_id = db.record_experience(minimal_experience(cid)).unwrap();
 
-    let mut stream = db.watch_experiences(cid);
+    let mut stream = db.watch_experiences(cid).unwrap();
     db.archive_experience(exp_id).unwrap();
 
     let event = block_on(stream.next()).expect("should receive event");
@@ -104,7 +104,7 @@ fn test_unarchive_experience_emits_updated_event() {
     let exp_id = db.record_experience(minimal_experience(cid)).unwrap();
     db.archive_experience(exp_id).unwrap();
 
-    let mut stream = db.watch_experiences(cid);
+    let mut stream = db.watch_experiences(cid).unwrap();
     db.unarchive_experience(exp_id).unwrap();
 
     let event = block_on(stream.next()).expect("should receive event");
@@ -117,7 +117,7 @@ fn test_delete_experience_emits_deleted_event() {
     let (db, cid, _dir) = open_db_with_collective();
     let exp_id = db.record_experience(minimal_experience(cid)).unwrap();
 
-    let mut stream = db.watch_experiences(cid);
+    let mut stream = db.watch_experiences(cid).unwrap();
     db.delete_experience(exp_id).unwrap();
 
     let event = block_on(stream.next()).expect("should receive event");
@@ -130,7 +130,7 @@ fn test_reinforce_experience_emits_updated_event() {
     let (db, cid, _dir) = open_db_with_collective();
     let exp_id = db.record_experience(minimal_experience(cid)).unwrap();
 
-    let mut stream = db.watch_experiences(cid);
+    let mut stream = db.watch_experiences(cid).unwrap();
     let count = db.reinforce_experience(exp_id).unwrap();
     assert_eq!(count, 1);
 
@@ -146,8 +146,8 @@ fn test_reinforce_experience_emits_updated_event() {
 #[test]
 fn test_multiple_subscribers_all_receive_events() {
     let (db, cid, _dir) = open_db_with_collective();
-    let mut stream1 = db.watch_experiences(cid);
-    let mut stream2 = db.watch_experiences(cid);
+    let mut stream1 = db.watch_experiences(cid).unwrap();
+    let mut stream2 = db.watch_experiences(cid).unwrap();
 
     let exp_id = db.record_experience(minimal_experience(cid)).unwrap();
 
@@ -172,7 +172,7 @@ fn test_filtered_watch_by_domain() {
         domains: Some(vec!["security".to_string()]),
         ..Default::default()
     };
-    let mut stream = db.watch_experiences_filtered(cid, filter);
+    let mut stream = db.watch_experiences_filtered(cid, filter).unwrap();
 
     // Record experience WITH matching domain
     let matching = db
@@ -213,7 +213,7 @@ fn test_filtered_watch_by_importance() {
         min_importance: Some(0.7),
         ..Default::default()
     };
-    let mut stream = db.watch_experiences_filtered(cid, filter);
+    let mut stream = db.watch_experiences_filtered(cid, filter).unwrap();
 
     // Low importance — should be filtered
     db.record_experience(NewExperience {
@@ -250,7 +250,7 @@ fn test_watch_isolates_collectives() {
     let cid_a = db.create_collective("collective-a").unwrap();
     let cid_b = db.create_collective("collective-b").unwrap();
 
-    let mut stream_a = db.watch_experiences(cid_a);
+    let mut stream_a = db.watch_experiences(cid_a).unwrap();
 
     // Record in collective B
     db.record_experience(NewExperience {
@@ -284,7 +284,7 @@ fn test_watch_isolates_collectives() {
 #[test]
 fn test_stream_ends_when_db_dropped() {
     let (db, cid, _dir) = open_db_with_collective();
-    let mut stream = db.watch_experiences(cid);
+    let mut stream = db.watch_experiences(cid).unwrap();
 
     // Drop the database (closes it, drops all senders)
     db.close().unwrap();
@@ -299,7 +299,7 @@ fn test_subscriber_removed_on_stream_drop() {
     let (db, cid, _dir) = open_db_with_collective();
 
     {
-        let _stream = db.watch_experiences(cid);
+        let _stream = db.watch_experiences(cid).unwrap();
         // stream exists — subscriber registered
     }
     // stream dropped — subscriber should be cleaned up
@@ -327,7 +327,7 @@ fn test_buffer_full_graceful_degradation() {
     let db = PulseDB::open(&path, config).unwrap();
     let cid = db.create_collective("test").unwrap();
 
-    let mut stream = db.watch_experiences(cid);
+    let mut stream = db.watch_experiences(cid).unwrap();
 
     // Fill the buffer with 2 events
     db.record_experience(minimal_experience(cid)).unwrap();
@@ -354,7 +354,7 @@ fn test_buffer_full_graceful_degradation() {
 #[test]
 fn test_events_arrive_in_order() {
     let (db, cid, _dir) = open_db_with_collective();
-    let mut stream = db.watch_experiences(cid);
+    let mut stream = db.watch_experiences(cid).unwrap();
 
     // Record 3 experiences
     let id1 = db.record_experience(minimal_experience(cid)).unwrap();
