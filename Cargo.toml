@@ -95,6 +95,14 @@ proptest = "1.4"
 name = "lifecycle"
 harness = false
 
+[[bench]]
+name = "core_operations"
+harness = false
+
+[[bench]]
+name = "workloads"
+harness = false
+
 [profile.release]
 lto = true
 codegen-units = 1
