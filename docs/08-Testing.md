@@ -508,33 +508,56 @@ proptest! {
 
 **Framework:** cargo-fuzz / libfuzzer
 
+**Setup:**
+```bash
+# Install (one-time)
+rustup toolchain install nightly
+cargo install cargo-fuzz
+```
+
+**Targets:** Three fuzz targets in `fuzz/fuzz_targets/`:
+
+| Target | What it fuzzes | Input derivation |
+|--------|---------------|------------------|
+| `fuzz_record_experience` | Experience storage with arbitrary content, embeddings, importance, confidence | Raw bytes → lossy UTF-8 content, cycled bytes → 384-dim embedding, first bytes → float fields |
+| `fuzz_search_similar` | HNSW search with arbitrary query vectors and k values | Pre-populates 5 fixed experiences, fuzz bytes → query vector + k |
+| `fuzz_create_collective` | Collective creation with arbitrary names | Raw bytes → lossy UTF-8 name |
+
+**Running fuzz tests:**
+```bash
+# Run individual targets (recommended: 1-5 minutes each)
+cargo +nightly fuzz run fuzz_record_experience -- -max_total_time=60
+cargo +nightly fuzz run fuzz_search_similar -- -max_total_time=60
+cargo +nightly fuzz run fuzz_create_collective -- -max_total_time=60
+
+# Run with more iterations (longer, deeper exploration)
+cargo +nightly fuzz run fuzz_record_experience -- -max_total_time=300
+
+# List all available targets
+cargo +nightly fuzz list
+```
+
+**Interpreting results:**
+- `DONE N runs in Xs` — success, no crashes found
+- `SUMMARY: ... crash-...` — a crash was found; the crashing input is saved in `fuzz/artifacts/`
+- `cov: N` — number of code coverage edges reached (higher = more thorough)
+- Corpus files are saved in `fuzz/corpus/<target>/` for future runs
+
+**Example target (fuzz_record_experience):**
 ```rust
-// fuzz/fuzz_targets/record_experience.rs
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use arbitrary::Arbitrary;
+use pulsedb::{Config, NewExperience, PulseDB};
+use tempfile::tempdir;
 
-#[derive(Arbitrary, Debug)]
-struct FuzzExperience {
-    content: String,
-    importance: f32,
-    confidence: f32,
-    domain: Vec<String>,
-}
-
-fuzz_target!(|input: FuzzExperience| {
-    let db = setup_fuzz_db();
-    let collective_id = db.create_collective("fuzz").unwrap();
-    
-    // Should never panic
-    let _ = db.record_experience(NewExperience {
-        collective_id,
-        content: input.content,
-        importance: input.importance,
-        confidence: input.confidence,
-        domain: input.domain,
-        ..Default::default()
-    });
+fuzz_target!(|data: &[u8]| {
+    if data.is_empty() { return; }
+    let dir = tempdir().unwrap();
+    let db = PulseDB::open(dir.path().join("fuzz.db"), Config::default()).unwrap();
+    let cid = db.create_collective("fuzz").unwrap();
+    let content = String::from_utf8_lossy(data).to_string();
+    // ... derive embedding, importance, confidence from data bytes ...
+    let _ = db.record_experience(NewExperience { /* ... */ });
 });
 ```
 
@@ -832,11 +855,13 @@ cargo bench search_similar
 # Run with coverage
 cargo tarpaulin
 
-# Run fuzz tests
-cargo +nightly fuzz run record_experience
+# Run fuzz tests (requires nightly)
+cargo +nightly fuzz run fuzz_record_experience -- -max_total_time=60
+cargo +nightly fuzz run fuzz_search_similar -- -max_total_time=60
+cargo +nightly fuzz run fuzz_create_collective -- -max_total_time=60
 
 # Run property tests with more cases
-PROPTEST_CASES=10000 cargo test properties
+PROPTEST_CASES=10000 cargo test --test property_tests
 ```
 
 ### 6.2 Test Tags
