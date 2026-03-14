@@ -7,11 +7,13 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust,ignore
-//! use pulsedb::{PulseDB, Config};
+//! ```rust
+//! # fn main() -> pulsedb::Result<()> {
+//! # let dir = tempfile::tempdir().unwrap();
+//! use pulsedb::{PulseDB, Config, NewExperience};
 //!
 //! // Open or create a database
-//! let db = PulseDB::open("./pulse.db", Config::default())?;
+//! let db = PulseDB::open(dir.path().join("test.db"), Config::default())?;
 //!
 //! // Create a collective (isolated namespace)
 //! let collective = db.create_collective("my-project")?;
@@ -20,16 +22,19 @@
 //! db.record_experience(NewExperience {
 //!     collective_id: collective,
 //!     content: "Always validate user input before processing".to_string(),
-//!     experience_type: ExperienceType::Lesson,
 //!     importance: 0.8,
+//!     embedding: Some(vec![0.1f32; 384]),
 //!     ..Default::default()
 //! })?;
 //!
 //! // Search for relevant experiences
+//! let query_embedding = vec![0.1f32; 384];
 //! let results = db.search_similar(collective, &query_embedding, 10)?;
 //!
 //! // Clean up
 //! db.close()?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Key Concepts

@@ -22,20 +22,24 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust,no_run
+//! # fn main() -> pulsedb::Result<()> {
+//! # let dir = tempfile::tempdir().unwrap();
 //! use std::sync::Arc;
 //! use pulsedb::{PulseDB, Config, PulseDBSubstrate, SubstrateProvider};
 //!
 //! // Create PulseDB and wrap in substrate
-//! let db = Arc::new(PulseDB::open("./pulse.db", Config::default())?);
+//! let db = Arc::new(PulseDB::open(dir.path().join("test.db"), Config::default())?);
 //! let substrate = PulseDBSubstrate::new(db);
 //!
 //! // Use as trait object (how PulseHive consumes it)
 //! let provider: Box<dyn SubstrateProvider> = Box::new(substrate);
 //!
-//! // All operations are async
-//! let exp_id = provider.store_experience(new_exp).await?;
-//! let results = provider.search_similar(collective, &embedding, 10).await?;
+//! // All operations are async (shown here for illustration)
+//! // let exp_id = provider.store_experience(new_exp).await?;
+//! // let results = provider.search_similar(collective, &embedding, 10).await?;
+//! # Ok(())
+//! # }
 //! ```
 
 mod r#impl;

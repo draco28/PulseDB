@@ -27,16 +27,25 @@ use fs2::FileExt;
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// # fn main() -> pulsedb::Result<()> {
+/// # let dir = tempfile::tempdir().unwrap();
+/// # let db_path = dir.path().join("test.db");
+/// # let db = pulsedb::PulseDB::open(&db_path, pulsedb::Config::default())?;
+/// use pulsedb::WatchLock;
+///
 /// // Writer process
-/// let lock = WatchLock::acquire_exclusive("./pulse.db")?;
+/// let lock = WatchLock::acquire_exclusive(&db_path)?;
 /// // ... write experiences ...
 /// drop(lock); // releases lock
 ///
 /// // Reader process
-/// if WatchLock::is_writer_active("./pulse.db") {
+/// if WatchLock::is_writer_active(&db_path) {
+///     let last_seq = 0;
 ///     let changes = db.poll_changes(last_seq)?;
 /// }
+/// # Ok(())
+/// # }
 /// ```
 pub struct WatchLock {
     /// The locked file handle. Lock is held as long as this exists.

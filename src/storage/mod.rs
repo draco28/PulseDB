@@ -52,12 +52,17 @@ use crate::types::{CollectiveId, ExperienceId, InsightId, RelationId, Timestamp}
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use pulsedb::storage::{StorageEngine, RedbStorage};
+/// ```rust
+/// # fn main() -> pulsedb::Result<()> {
+/// # let dir = tempfile::tempdir().unwrap();
+/// use pulsedb::{Config, storage::{StorageEngine, RedbStorage}};
 ///
-/// let storage = RedbStorage::open("./pulse.db", &config)?;
+/// let config = Config::default();
+/// let storage = RedbStorage::open(dir.path().join("test.db"), &config)?;
 /// let metadata = storage.metadata();
 /// println!("Schema version: {}", metadata.schema_version);
+/// # Ok(())
+/// # }
 /// ```
 pub trait StorageEngine: Send + Sync {
     // =========================================================================

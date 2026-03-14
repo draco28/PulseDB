@@ -10,7 +10,7 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust
 //! use pulsedb::embedding::{EmbeddingService, ExternalEmbedding};
 //!
 //! // External mode - user provides embeddings
@@ -35,10 +35,15 @@ use crate::types::Embedding;
 ///
 /// # Implementing a Custom Provider
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use pulsedb::embedding::EmbeddingService;
 /// use pulsedb::{Embedding, Result};
 ///
+/// # struct MyApiClient;
+/// # impl MyApiClient {
+/// #     fn get_embedding(&self, _: &str) -> Result<Embedding> { Ok(vec![0.0; 384]) }
+/// #     fn get_embeddings(&self, _: &[&str]) -> Result<Vec<Embedding>> { Ok(vec![]) }
+/// # }
 /// struct MyEmbeddingService {
 ///     client: MyApiClient,
 ///     dimension: usize,

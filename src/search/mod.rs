@@ -32,7 +32,12 @@ use crate::experience::Experience;
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// # fn main() -> pulsedb::Result<()> {
+/// # let dir = tempfile::tempdir().unwrap();
+/// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
+/// # let collective_id = db.create_collective("example")?;
+/// # let query_embedding = vec![0.1f32; 384];
 /// let results = db.search_similar(collective_id, &query_embedding, 10)?;
 /// for result in &results {
 ///     println!(
@@ -40,6 +45,8 @@ use crate::experience::Experience;
 ///         result.similarity, result.experience.content
 ///     );
 /// }
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Clone, Debug)]
 pub struct SearchResult {

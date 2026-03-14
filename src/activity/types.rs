@@ -55,7 +55,11 @@ pub struct Activity {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// # fn main() -> pulsedb::Result<()> {
+/// # let dir = tempfile::tempdir().unwrap();
+/// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
+/// # let collective_id = db.create_collective("example")?;
 /// use pulsedb::NewActivity;
 ///
 /// let activity = NewActivity {
@@ -65,6 +69,8 @@ pub struct Activity {
 ///     context_summary: Some("Working on src/error.rs".to_string()),
 /// };
 /// db.register_activity(activity)?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct NewActivity {
     /// The agent's identifier (non-empty, max 255 bytes).

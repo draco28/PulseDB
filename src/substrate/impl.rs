@@ -27,16 +27,20 @@ use super::SubstrateProvider;
 ///
 /// # Construction
 ///
-/// ```rust,ignore
+/// ```rust
+/// # fn main() -> pulsedb::Result<()> {
+/// # let dir = tempfile::tempdir().unwrap();
 /// use std::sync::Arc;
 /// use pulsedb::{PulseDB, Config, PulseDBSubstrate};
 ///
-/// let db = Arc::new(PulseDB::open("./pulse.db", Config::default())?);
+/// let db = Arc::new(PulseDB::open(dir.path().join("a.db"), Config::default())?);
 /// let substrate = PulseDBSubstrate::new(db);
 ///
 /// // Or from an owned PulseDB:
-/// let db = PulseDB::open("./pulse.db", Config::default())?;
+/// let db = PulseDB::open(dir.path().join("b.db"), Config::default())?;
 /// let substrate = PulseDBSubstrate::from_db(db);
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// # Cloning

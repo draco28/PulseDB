@@ -25,7 +25,12 @@ use crate::types::CollectiveId;
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// # fn main() -> pulsedb::Result<()> {
+/// # let dir = tempfile::tempdir().unwrap();
+/// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
+/// # let collective_id = db.create_collective("example")?;
+/// # let query_vec = vec![0.1f32; 384];
 /// use pulsedb::{ContextRequest, SearchFilter};
 ///
 /// let candidates = db.get_context_candidates(ContextRequest {
@@ -40,6 +45,8 @@ use crate::types::CollectiveId;
 ///     },
 ///     ..ContextRequest::default()
 /// })?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Clone, Debug)]
 pub struct ContextRequest {

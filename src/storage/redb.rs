@@ -86,10 +86,14 @@ impl RedbStorage {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// # fn main() -> pulsedb::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
     /// use pulsedb::{Config, storage::RedbStorage};
     ///
-    /// let storage = RedbStorage::open("./pulse.db", &Config::default())?;
+    /// let storage = RedbStorage::open(dir.path().join("test.db"), &Config::default())?;
+    /// # Ok(())
+    /// # }
     /// ```
     #[instrument(skip(config), fields(path = %path.as_ref().display()))]
     pub fn open(path: impl AsRef<Path>, config: &Config) -> Result<Self> {

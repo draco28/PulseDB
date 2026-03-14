@@ -92,7 +92,18 @@ pub struct ExperienceRelation {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// # fn main() -> pulsedb::Result<()> {
+/// # let dir = tempfile::tempdir().unwrap();
+/// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
+/// # let cid = db.create_collective("example")?;
+/// # let emb = vec![0.1f32; 384];
+/// # let exp_a = db.record_experience(pulsedb::NewExperience {
+/// #     collective_id: cid, content: "a".into(), embedding: Some(emb.clone()), ..Default::default()
+/// # })?;
+/// # let exp_b = db.record_experience(pulsedb::NewExperience {
+/// #     collective_id: cid, content: "b".into(), embedding: Some(emb.clone()), ..Default::default()
+/// # })?;
 /// use pulsedb::{NewExperienceRelation, RelationType};
 ///
 /// let rel = NewExperienceRelation {
@@ -103,6 +114,8 @@ pub struct ExperienceRelation {
 ///     metadata: None,
 /// };
 /// let id = db.store_relation(rel)?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct NewExperienceRelation {
     /// The experience this relation originates from.

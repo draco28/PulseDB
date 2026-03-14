@@ -32,9 +32,14 @@ const DEFAULT_BATCH_LIMIT: usize = 1000;
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use pulsedb::ChangePoller;
+/// ```rust,no_run
+/// # fn main() -> pulsedb::Result<()> {
+/// # let dir = tempfile::tempdir().unwrap();
+/// use std::time::Duration;
+/// use pulsedb::{Config, ChangePoller};
+/// use pulsedb::storage::{StorageEngine, RedbStorage};
 ///
+/// let storage = RedbStorage::open(dir.path().join("test.db"), &Config::default())?;
 /// let mut poller = ChangePoller::new();
 ///
 /// loop {
@@ -44,6 +49,7 @@ const DEFAULT_BATCH_LIMIT: usize = 1000;
 ///     }
 ///     std::thread::sleep(Duration::from_millis(100));
 /// }
+/// # }
 /// ```
 pub struct ChangePoller {
     /// Last sequence number successfully consumed.

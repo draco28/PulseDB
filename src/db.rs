@@ -10,11 +10,13 @@
 //!
 //! # Quick Start
 //!
-//! ```rust,ignore
-//! use pulsedb::{PulseDB, Config};
+//! ```rust
+//! # fn main() -> pulsedb::Result<()> {
+//! # let dir = tempfile::tempdir().unwrap();
+//! use pulsedb::{PulseDB, Config, NewExperience};
 //!
 //! // Open or create a database
-//! let db = PulseDB::open("./pulse.db", Config::default())?;
+//! let db = PulseDB::open(dir.path().join("test.db"), Config::default())?;
 //!
 //! // Create a collective for your project
 //! let collective = db.create_collective("my-project")?;
@@ -23,12 +25,14 @@
 //! db.record_experience(NewExperience {
 //!     collective_id: collective,
 //!     content: "Always validate user input".to_string(),
-//!     experience_type: ExperienceType::Lesson,
+//!     embedding: Some(vec![0.1f32; 384]),
 //!     ..Default::default()
 //! })?;
 //!
 //! // Close when done
 //! db.close()?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Thread Safety
@@ -37,17 +41,21 @@
 //! The underlying storage uses MVCC for concurrent reads with exclusive
 //! write locking.
 //!
-//! ```rust,ignore
+//! ```rust
+//! # fn main() -> pulsedb::Result<()> {
+//! # let dir = tempfile::tempdir().unwrap();
 //! use std::sync::Arc;
-//! use pulsedb::PulseDB;
+//! use pulsedb::{PulseDB, Config};
 //!
-//! let db = Arc::new(PulseDB::open("./pulse.db", Config::default())?);
+//! let db = Arc::new(PulseDB::open(dir.path().join("test.db"), Config::default())?);
 //!
 //! // Clone Arc for use in another thread
 //! let db_clone = Arc::clone(&db);
 //! std::thread::spawn(move || {
 //!     // Safe to use db_clone here
 //! });
+//! # Ok(())
+//! # }
 //! ```
 
 use std::collections::HashMap;
@@ -149,17 +157,22 @@ impl PulseDB {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// # fn main() -> pulsedb::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
     /// use pulsedb::{PulseDB, Config, EmbeddingDimension};
     ///
     /// // Open with default configuration
-    /// let db = PulseDB::open("./pulse.db", Config::default())?;
+    /// let db = PulseDB::open(dir.path().join("default.db"), Config::default())?;
+    /// # drop(db);
     ///
     /// // Open with custom embedding dimension
-    /// let db = PulseDB::open("./pulse.db", Config {
+    /// let db = PulseDB::open(dir.path().join("custom.db"), Config {
     ///     embedding_dimension: EmbeddingDimension::D768,
     ///     ..Default::default()
     /// })?;
+    /// # Ok(())
+    /// # }
     /// ```
     #[instrument(skip(config), fields(path = %path.as_ref().display()))]
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self> {
@@ -214,13 +227,17 @@ impl PulseDB {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// # fn main() -> pulsedb::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
     /// use pulsedb::{PulseDB, Config};
     ///
-    /// let db = PulseDB::open("./pulse.db", Config::default())?;
+    /// let db = PulseDB::open(dir.path().join("test.db"), Config::default())?;
     /// // ... use the database ...
     /// db.close()?;  // db is consumed here
     /// // db.something() // Compile error: db was moved
+    /// # Ok(())
+    /// # }
     /// ```
     #[instrument(skip(self))]
     pub fn close(self) -> Result<()> {
@@ -524,8 +541,13 @@ impl PulseDB {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// # fn main() -> pulsedb::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
     /// let id = db.create_collective("my-project")?;
+    /// # Ok(())
+    /// # }
     /// ```
     #[instrument(skip(self))]
     pub fn create_collective(&self, name: &str) -> Result<CollectiveId> {
@@ -605,10 +627,16 @@ impl PulseDB {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// # fn main() -> pulsedb::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
+    /// # let id = db.create_collective("example")?;
     /// if let Some(collective) = db.get_collective(id)? {
     ///     println!("Found: {}", collective.name);
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     #[instrument(skip(self))]
     pub fn get_collective(&self, id: CollectiveId) -> Result<Option<Collective>> {
@@ -667,9 +695,15 @@ impl PulseDB {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// # fn main() -> pulsedb::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
+    /// # let collective_id = db.create_collective("to-delete")?;
     /// db.delete_collective(collective_id)?;
     /// assert!(db.get_collective(collective_id)?.is_none());
+    /// # Ok(())
+    /// # }
     /// ```
     #[instrument(skip(self))]
     pub fn delete_collective(&self, id: CollectiveId) -> Result<()> {
@@ -1027,11 +1061,17 @@ impl PulseDB {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// # fn main() -> pulsedb::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
+    /// # let collective_id = db.create_collective("example")?;
     /// let recent = db.get_recent_experiences(collective_id, 50)?;
     /// for exp in &recent {
     ///     println!("{}: {}", exp.timestamp, exp.content);
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     #[instrument(skip(self))]
     pub fn get_recent_experiences(
@@ -1131,7 +1171,11 @@ impl PulseDB {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// # fn main() -> pulsedb::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
+    /// # let collective_id = db.create_collective("example")?;
     /// let query = vec![0.1f32; 384]; // Your query embedding
     /// let results = db.search_similar(collective_id, &query, 10)?;
     /// for result in &results {
@@ -1140,6 +1184,8 @@ impl PulseDB {
     ///         result.similarity, result.experience.content
     ///     );
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     #[instrument(skip(self, query))]
     pub fn search_similar(
@@ -1175,7 +1221,12 @@ impl PulseDB {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// # fn main() -> pulsedb::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
+    /// # let collective_id = db.create_collective("example")?;
+    /// # let query_embedding = vec![0.1f32; 384];
     /// use pulsedb::SearchFilter;
     ///
     /// let filter = SearchFilter {
@@ -1189,6 +1240,8 @@ impl PulseDB {
     ///     10,
     ///     filter,
     /// )?;
+    /// # Ok(())
+    /// # }
     /// ```
     #[instrument(skip(self, query, filter))]
     pub fn search_similar_filtered(
@@ -1375,8 +1428,18 @@ impl PulseDB {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// use pulsedb::RelationType;
+    /// ```rust
+    /// # fn main() -> pulsedb::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
+    /// # let cid = db.create_collective("example")?;
+    /// # let exp_a = db.record_experience(pulsedb::NewExperience {
+    /// #     collective_id: cid,
+    /// #     content: "a".into(),
+    /// #     embedding: Some(vec![0.1f32; 384]),
+    /// #     ..Default::default()
+    /// # })?;
+    /// use pulsedb::{RelationType, RelationDirection};
     ///
     /// // Only "Supports" relations outgoing from exp_a
     /// let supports = db.get_related_experiences_filtered(
@@ -1384,6 +1447,8 @@ impl PulseDB {
     ///     RelationDirection::Outgoing,
     ///     Some(RelationType::Supports),
     /// )?;
+    /// # Ok(())
+    /// # }
     /// ```
     #[instrument(skip(self))]
     pub fn get_related_experiences_filtered(
@@ -1693,13 +1758,21 @@ impl PulseDB {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// # fn main() -> pulsedb::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
+    /// # let collective_id = db.create_collective("example")?;
+    /// use pulsedb::NewActivity;
+    ///
     /// db.register_activity(NewActivity {
     ///     agent_id: "claude-opus".to_string(),
     ///     collective_id,
     ///     current_task: Some("Reviewing pull request".to_string()),
     ///     context_summary: None,
     /// })?;
+    /// # Ok(())
+    /// # }
     /// ```
     #[instrument(skip(self, activity), fields(agent_id = %activity.agent_id, collective_id = %activity.collective_id))]
     pub fn register_activity(&self, activity: NewActivity) -> Result<()> {
@@ -1847,7 +1920,12 @@ impl PulseDB {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// # fn main() -> pulsedb::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
+    /// # let collective_id = db.create_collective("example")?;
+    /// # let query_vec = vec![0.1f32; 384];
     /// use pulsedb::{ContextRequest, SearchFilter};
     ///
     /// let candidates = db.get_context_candidates(ContextRequest {
@@ -1864,6 +1942,8 @@ impl PulseDB {
     ///     },
     ///     ..ContextRequest::default()
     /// })?;
+    /// # Ok(())
+    /// # }
     /// ```
     #[instrument(skip(self, request), fields(collective_id = %request.collective_id))]
     pub fn get_context_candidates(&self, request: ContextRequest) -> Result<ContextCandidates> {
@@ -1986,13 +2066,20 @@ impl PulseDB {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> pulsedb::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
+    /// # let collective_id = db.create_collective("example")?;
     /// use futures::StreamExt;
     ///
-    /// let mut stream = db.watch_experiences(collective_id);
+    /// let mut stream = db.watch_experiences(collective_id)?;
     /// while let Some(event) = stream.next().await {
     ///     println!("{:?}: {}", event.event_type, event.experience_id);
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn watch_experiences(&self, collective_id: CollectiveId) -> Result<WatchStream> {
         self.watch.subscribe(collective_id, None)
@@ -2006,15 +2093,21 @@ impl PulseDB {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// use futures::StreamExt;
+    /// ```rust
+    /// # fn main() -> pulsedb::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
+    /// # let collective_id = db.create_collective("example")?;
+    /// use pulsedb::WatchFilter;
     ///
     /// let filter = WatchFilter {
     ///     domains: Some(vec!["security".to_string()]),
     ///     min_importance: Some(0.7),
     ///     ..Default::default()
     /// };
-    /// let mut stream = db.watch_experiences_filtered(collective_id, filter);
+    /// let mut stream = db.watch_experiences_filtered(collective_id, filter)?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn watch_experiences_filtered(
         &self,
@@ -2035,10 +2128,15 @@ impl PulseDB {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// # fn main() -> pulsedb::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
     /// let seq = db.get_current_sequence()?;
     /// // ... later ...
     /// let (events, new_seq) = db.poll_changes(seq)?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn get_current_sequence(&self) -> Result<u64> {
         self.storage.get_wal_sequence()
@@ -2063,7 +2161,12 @@ impl PulseDB {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # fn main() -> pulsedb::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
+    /// use std::time::Duration;
+    ///
     /// let mut seq = 0u64;
     /// loop {
     ///     let (events, new_seq) = db.poll_changes(seq)?;
@@ -2073,6 +2176,7 @@ impl PulseDB {
     ///     }
     ///     std::thread::sleep(Duration::from_millis(100));
     /// }
+    /// # }
     /// ```
     pub fn poll_changes(&self, since_seq: u64) -> Result<(Vec<WatchEvent>, u64)> {
         let (records, new_seq) = self.storage.poll_watch_events(since_seq, 1000)?;

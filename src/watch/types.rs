@@ -24,10 +24,16 @@ use crate::types::{CollectiveId, ExperienceId, Timestamp};
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// # #[tokio::main]
+/// # async fn main() -> pulsedb::Result<()> {
+/// # let dir = tempfile::tempdir().unwrap();
+/// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
+/// # let collective_id = db.create_collective("example")?;
 /// use futures::StreamExt;
+/// use pulsedb::WatchEventType;
 ///
-/// let mut stream = db.watch_experiences(collective_id);
+/// let mut stream = db.watch_experiences(collective_id)?;
 /// while let Some(event) = stream.next().await {
 ///     match event.event_type {
 ///         WatchEventType::Created => println!("New experience: {}", event.experience_id),
@@ -35,6 +41,8 @@ use crate::types::{CollectiveId, ExperienceId, Timestamp};
 ///         _ => {}
 ///     }
 /// }
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Clone, Debug)]
 pub struct WatchEvent {
@@ -114,13 +122,21 @@ impl From<WatchEventRecord> for WatchEvent {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// # fn main() -> pulsedb::Result<()> {
+/// # let dir = tempfile::tempdir().unwrap();
+/// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
+/// # let collective_id = db.create_collective("example")?;
+/// use pulsedb::WatchFilter;
+///
 /// let filter = WatchFilter {
 ///     domains: Some(vec!["security".to_string()]),
 ///     min_importance: Some(0.7),
 ///     ..Default::default()
 /// };
-/// let stream = db.watch_experiences_filtered(collective_id, filter);
+/// let stream = db.watch_experiences_filtered(collective_id, filter)?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct WatchFilter {

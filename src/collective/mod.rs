@@ -21,10 +21,12 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust
+//! # fn main() -> pulsedb::Result<()> {
+//! # let dir = tempfile::tempdir().unwrap();
 //! use pulsedb::{PulseDB, Config};
 //!
-//! let db = PulseDB::open("./pulse.db", Config::default())?;
+//! let db = PulseDB::open(dir.path().join("test.db"), Config::default())?;
 //!
 //! // Create a collective
 //! let id = db.create_collective("my-project")?;
@@ -45,6 +47,8 @@
 //!
 //! // Delete when no longer needed
 //! db.delete_collective(id)?;
+//! # Ok(())
+//! # }
 //! ```
 
 pub mod types;

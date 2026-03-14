@@ -10,12 +10,16 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use pulsedb::embedding::onnx::OnnxEmbedding;
+//! use pulsedb::embedding::EmbeddingService;
 //!
+//! # fn main() -> pulsedb::Result<()> {
 //! let service = OnnxEmbedding::new(None)?;  // Use default model
 //! let embedding = service.embed("Hello, world!")?;
 //! assert_eq!(embedding.len(), 384);
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Architecture
@@ -110,12 +114,17 @@ impl OnnxEmbedding {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// use pulsedb::embedding::onnx::OnnxEmbedding;
+    ///
+    /// # fn main() -> pulsedb::Result<()> {
     /// // Use default model from cache
     /// let service = OnnxEmbedding::new(None)?;
     ///
     /// // Use custom model directory
     /// let service = OnnxEmbedding::new(Some("./models/my-model".into()))?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn new(model_path: Option<PathBuf>) -> Result<Self> {
         Self::with_dimension(model_path, DEFAULT_DIMENSION)

@@ -5,11 +5,12 @@
 //! - Specific error types (`StorageError`, `ValidationError`) provide detail
 //!
 //! # Error Handling Pattern
-//! ```rust,ignore
+//! ```rust
 //! use pulsedb::{PulseDB, Config, Result};
 //!
 //! fn example() -> Result<()> {
-//!     let db = PulseDB::open("./pulse.db", Config::default())?;
+//!     let dir = tempfile::tempdir().unwrap();
+//!     let db = PulseDB::open(dir.path().join("test.db"), Config::default())?;
 //!     // ... operations that may fail ...
 //!     db.close()?;
 //!     Ok(())

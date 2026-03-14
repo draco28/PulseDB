@@ -85,7 +85,22 @@ pub struct DerivedInsight {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// # fn main() -> pulsedb::Result<()> {
+/// # let dir = tempfile::tempdir().unwrap();
+/// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
+/// # let collective_id = db.create_collective("example")?;
+/// # let emb = vec![0.1f32; 384];
+/// # let exp_a = db.record_experience(pulsedb::NewExperience {
+/// #     collective_id, content: "a".into(), embedding: Some(emb.clone()), ..Default::default()
+/// # })?;
+/// # let exp_b = db.record_experience(pulsedb::NewExperience {
+/// #     collective_id, content: "b".into(), embedding: Some(emb.clone()), ..Default::default()
+/// # })?;
+/// # let exp_c = db.record_experience(pulsedb::NewExperience {
+/// #     collective_id, content: "c".into(), embedding: Some(emb.clone()), ..Default::default()
+/// # })?;
+/// # let embedding_vec = vec![0.2f32; 384];
 /// use pulsedb::{NewDerivedInsight, InsightType};
 ///
 /// let insight = NewDerivedInsight {
@@ -98,6 +113,8 @@ pub struct DerivedInsight {
 ///     domain: vec!["rust".to_string(), "error-handling".to_string()],
 /// };
 /// let id = db.store_insight(insight)?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct NewDerivedInsight {
     /// The collective to store this insight in.
