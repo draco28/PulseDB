@@ -103,6 +103,10 @@ harness = false
 name = "workloads"
 harness = false
 
+[[bench]]
+name = "scaling"
+harness = false
+
 [profile.release]
 lto = true
 codegen-units = 1
