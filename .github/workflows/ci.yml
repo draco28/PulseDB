@@ -179,8 +179,44 @@ jobs:
         with:
           prefix-key: bench
 
+      - name: Install critcmp
+        run: cargo install critcmp
+
+      # Restore baseline from main branch (PRs only)
+      - name: Restore baseline
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: target/criterion-baseline/
+          key: criterion-baseline-main
+
       - name: Run benchmarks
         run: cargo bench
+
+      # Compare against baseline and report regressions (PRs only, advisory)
+      - name: Compare with baseline (10% threshold)
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          if [ -d target/criterion-baseline ]; then
+            critcmp target/criterion-baseline target/criterion --threshold 10
+          else
+            echo "No baseline found — skipping comparison"
+          fi
+
+      # Save current results as baseline (main branch only)
+      - name: Save baseline
+        if: github.ref == 'refs/heads/main'
+        run: |
+          rm -rf target/criterion-baseline
+          cp -r target/criterion target/criterion-baseline
+
+      - name: Cache baseline
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: target/criterion-baseline/
+          key: criterion-baseline-main
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
