@@ -88,6 +88,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 # Benchmarking framework
 criterion = { version = "0.5", features = ["html_reports"] }
 
+# Property-based testing (E5-S03: verify invariants with random inputs)
+proptest = "1.4"
+
 [[bench]]
 name = "lifecycle"
 harness = false
