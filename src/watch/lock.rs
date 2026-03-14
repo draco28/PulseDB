@@ -41,8 +41,9 @@ use fs2::FileExt;
 ///
 /// // Reader process
 /// if WatchLock::is_writer_active(&db_path) {
-///     let last_seq = 0;
-///     let changes = db.poll_changes(last_seq)?;
+///     let seq = db.get_current_sequence()?;
+///     let (events, _new_seq) = db.poll_changes(seq)?;
+///     # let _ = events;
 /// }
 /// # Ok(())
 /// # }
