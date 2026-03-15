@@ -1,22 +1,22 @@
-//! SubstrateProvider async trait for PulseHive integration.
+//! Async storage trait for integrating PulseDB with agent frameworks.
 //!
-//! This module defines the async interface between PulseDB (the storage layer)
-//! and PulseHive (the intelligence layer). PulseHive's `HiveMind` holds a
-//! `Box<dyn SubstrateProvider>` to interact with the database without knowing
-//! the concrete storage implementation.
+//! This module defines the async interface for integrating PulseDB with
+//! agent frameworks and orchestration layers. Consumers hold a
+//! `Box<dyn SubstrateProvider>` to interact with the database without
+//! knowing the concrete storage implementation.
 //!
 //! # Architecture
 //!
 //! ```text
 //! ┌──────────────────────┐       ┌──────────────────────┐
-//! │     PulseHive        │       │       PulseDB         │
+//! │   Agent Framework    │       │       PulseDB         │
 //! │                      │       │                       │
-//! │  HiveMind ───────────┼──────►│  PulseDBSubstrate     │
+//! │  Orchestrator ───────┼──────►│  PulseDBSubstrate     │
 //! │  Box<dyn Substrate>  │       │  (Arc<PulseDB>)       │
 //! │                      │       │                       │
-//! │  Agents perceive     │       │  spawn_blocking ──►   │
-//! │  the field through   │       │  sync storage ops     │
-//! │  SubstrateProvider   │       │                       │
+//! │  Agents interact     │       │  spawn_blocking ──►   │
+//! │  through the trait   │       │  sync storage ops     │
+//! │                      │       │                       │
 //! └──────────────────────┘       └──────────────────────┘
 //! ```
 //!
@@ -32,7 +32,7 @@
 //! let db = Arc::new(PulseDB::open(dir.path().join("test.db"), Config::default())?);
 //! let substrate = PulseDBSubstrate::new(db);
 //!
-//! // Use as trait object (how PulseHive consumes it)
+//! // Use as trait object
 //! let provider: Box<dyn SubstrateProvider> = Box::new(substrate);
 //!
 //! // All operations are async (shown here for illustration)
@@ -60,16 +60,16 @@ use crate::search::{ContextCandidates, ContextRequest};
 use crate::types::{CollectiveId, ExperienceId, InsightId, RelationId};
 use crate::watch::WatchEvent;
 
-/// Async storage interface for PulseHive integration.
+/// Async storage interface for agent framework integration.
 ///
 /// This trait abstracts PulseDB's storage capabilities behind an async
-/// boundary, enabling PulseHive's `HiveMind` to interact with the database
+/// boundary, enabling agent frameworks to interact with the database
 /// without blocking the async runtime.
 ///
 /// # Object Safety
 ///
 /// `SubstrateProvider` is object-safe via `#[async_trait]`, allowing it to
-/// be used as `Box<dyn SubstrateProvider>` in PulseHive.
+/// be used as `Box<dyn SubstrateProvider>` in any async context.
 ///
 /// # Implementors
 ///

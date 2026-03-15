@@ -23,6 +23,7 @@
 //! ```
 
 #[cfg(feature = "builtin-embeddings")]
+#[cfg_attr(docsrs, doc(cfg(feature = "builtin-embeddings")))]
 pub mod onnx;
 
 use crate::error::{PulseDBError, Result};

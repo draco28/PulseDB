@@ -1,6 +1,6 @@
 //! # PulseDB
 //!
-//! Embedded database for agentic AI systems - the substrate for hive mind architectures.
+//! Embedded database for agentic AI systems - collective memory for multi-agent coordination.
 //!
 //! PulseDB provides persistent storage for AI agent experiences, enabling semantic
 //! search, context retrieval, and knowledge sharing between agents.
@@ -68,7 +68,14 @@
 //!
 //! `PulseDB` is `Send + Sync` and can be shared across threads using `Arc`.
 //! The database uses MVCC for concurrent reads with exclusive write locking.
+//!
+//! ## Feature Flags
+//!
+//! | Feature | Description |
+//! |---------|-------------|
+//! | `builtin-embeddings` | Bundles ONNX runtime with all-MiniLM-L6-v2 for local embedding generation. Without this feature, you must supply pre-computed embeddings. |
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 #![warn(rustdoc::missing_crate_level_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -94,7 +101,7 @@ mod relation;
 mod search;
 mod watch;
 
-/// SubstrateProvider async trait for PulseHive integration.
+/// SubstrateProvider async trait for agent framework integration.
 pub mod substrate;
 
 /// Vector index module for HNSW-based approximate nearest neighbor search.
@@ -141,7 +148,7 @@ pub use search::{ContextCandidates, ContextRequest, SearchFilter, SearchResult};
 // Watch (real-time notifications + cross-process change detection)
 pub use watch::{ChangePoller, WatchEvent, WatchEventType, WatchFilter, WatchLock, WatchStream};
 
-// Substrate (async PulseHive integration)
+// Substrate (async agent framework integration)
 pub use substrate::{PulseDBSubstrate, SubstrateProvider};
 
 // Storage (for advanced users)

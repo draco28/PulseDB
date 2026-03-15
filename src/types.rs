@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 /// Collective identifier (UUID v7 for time-ordering).
 ///
-/// Collectives are isolated hive minds, typically one per project.
+/// Collectives are isolated namespaces for agent experiences, typically one per project.
 /// Each collective has its own HNSW index and embedding dimension.
 ///
 /// # Example

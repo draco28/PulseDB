@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-03-15
+
+### Changed
+- Improved public documentation for docs.rs readability
+- Added docs.rs build configuration for feature-gated items
+- Added Feature Flags documentation table to crate-level docs
+
 ## [0.1.0] - 2026-03-15
 
 ### Added
@@ -35,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - In-process watch system for real-time experience notifications via crossbeam channels
 - Cross-process change detection via WAL sequence tracking and file lock coordination
 - Configurable watch behavior (WatchConfig: in_process toggle, poll interval, buffer size)
-- SubstrateProvider async trait and PulseDBSubstrate adapter for PulseHive integration
+- SubstrateProvider async trait and PulseDBSubstrate adapter for agent framework integration
 
 #### Quality
 - Error handling audit: comprehensive PulseDBError hierarchy with actionable messages
