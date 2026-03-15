@@ -1,16 +1,19 @@
 [package]
 name = "pulsehive-db"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.89"
 authors = ["PulseDB Team"]
-description = "Embedded database for agentic AI systems - the substrate for hive mind architectures"
+description = "Embedded database for agentic AI systems — collective memory for multi-agent coordination"
 license = "AGPL-3.0-only"
 repository = "https://github.com/pulsehive/pulsedb"
-documentation = "https://docs.rs/pulsedb"
+documentation = "https://docs.rs/pulsehive-db"
 keywords = ["database", "embedded", "ai", "agents", "vector"]
 categories = ["database", "embedded"]
 readme = "README.md"
+
+[lib]
+name = "pulsedb"
 
 [features]
 default = []
@@ -120,3 +123,7 @@ debug = true
 # Match dev profile for consistent behavior
 opt-level = 0
 debug = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

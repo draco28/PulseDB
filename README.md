@@ -1,14 +1,14 @@
 # PulseDB
 
 [![CI](https://github.com/pulsehive/pulsedb/actions/workflows/ci.yml/badge.svg)](https://github.com/pulsehive/pulsedb/actions/workflows/ci.yml)
-[![Crates.io](https://img.shields.io/crates/v/pulsedb)](https://crates.io/crates/pulsedb)
-[![docs.rs](https://docs.rs/pulsedb/badge.svg)](https://docs.rs/pulsedb)
+[![Crates.io](https://img.shields.io/crates/v/pulsehive-db)](https://crates.io/crates/pulsehive-db)
+[![docs.rs](https://docs.rs/pulsehive-db/badge.svg)](https://docs.rs/pulsehive-db)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.89-blue)](Cargo.toml)
 
-**The database that gives your agents shared consciousness.** Not message passing. Not RAG. Actual collective memory.
+**Collective memory for AI agents.** Not message passing. Not RAG. A purpose-built embedded database for multi-agent coordination.
 
-PulseDB is an embedded database purpose-built for agentic AI systems. It provides the substrate for "hive mind" architectures where multiple AI agents share experiences and learn from each other — without coordination overhead.
+PulseDB is an embedded database purpose-built for agentic AI systems. It provides persistent collective memory for multi-agent systems where agents share experiences and learn from each other — without coordination overhead.
 
 ## Features
 
@@ -17,7 +17,7 @@ PulseDB is an embedded database purpose-built for agentic AI systems. It provide
 - **Knowledge graph** — Typed relations between experiences (Supports, Contradicts, Elaborates, Supersedes, Implies, RelatedTo)
 - **Real-time notifications** — In-process watch streams via crossbeam channels (<100ns overhead per event) and cross-process change detection
 - **Context assembly** — Single API call retrieves similar experiences, recent activity, insights, relations, and active agents
-- **SubstrateProvider** — Async trait adapter for PulseHive integration
+- **SubstrateProvider** — Async trait adapter for agent framework integration
 - **Optional ONNX embeddings** — Built-in all-MiniLM-L6-v2 (384d) with automatic model download (`builtin-embeddings` feature)
 - **ACID transactions** — redb-backed storage with crash safety via shadow paging
 
@@ -83,7 +83,7 @@ Run benchmarks yourself: `cargo bench`
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        CONSUMER APPLICATIONS                     │
-│  (PulseHive, Custom Agent Systems, RAG Pipelines)               │
+│  (Agent Frameworks, Custom Agent Systems, RAG Pipelines)               │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
 │  ┌─────────────────────────────────────────────────────────────┐│
@@ -139,11 +139,11 @@ An **experience** is a unit of learned knowledge: content, embedding, importance
 
 ### SubstrateProvider
 
-The **SubstrateProvider** trait enables PulseDB to serve as the storage layer for PulseHive's HiveMind architecture. `PulseDBSubstrate` wraps sync operations with `tokio::spawn_blocking` for async compatibility.
+The **SubstrateProvider** trait provides an async interface for integrating PulseDB with agent frameworks and orchestration layers. `PulseDBSubstrate` wraps sync operations with `tokio::spawn_blocking` for async compatibility.
 
 ## Documentation
 
-- [API Reference (docs.rs)](https://docs.rs/pulsedb)
+- [API Reference (docs.rs)](https://docs.rs/pulsehive-db)
 - [CHANGELOG](CHANGELOG.md)
 
 ## License
