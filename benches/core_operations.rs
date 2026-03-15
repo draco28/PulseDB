@@ -38,7 +38,12 @@ fn make_embedding(seed: u64) -> Vec<f32> {
 ///
 /// Returns (db, collective_id, first_experience_id, tempdir).
 /// The tempdir must be kept alive for the DB's lifetime.
-fn setup_populated_db() -> (PulseDB, CollectiveId, pulsedb::ExperienceId, tempfile::TempDir) {
+fn setup_populated_db() -> (
+    PulseDB,
+    CollectiveId,
+    pulsedb::ExperienceId,
+    tempfile::TempDir,
+) {
     let dir = tempdir().unwrap();
     let db = PulseDB::open(dir.path().join("bench.db"), Config::default()).unwrap();
     let cid = db.create_collective("bench").unwrap();
