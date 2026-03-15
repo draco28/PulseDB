@@ -55,14 +55,14 @@ Add PulseDB to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pulsedb = "0.1"
+pulsehive-db = "0.1"
 ```
 
 With built-in embedding generation (no external embedding service needed):
 
 ```toml
 [dependencies]
-pulsedb = { version = "0.1", features = ["builtin-embeddings"] }
+pulsehive-db = { version = "0.1", features = ["builtin-embeddings"] }
 ```
 
 ## Performance
