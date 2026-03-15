@@ -3,7 +3,7 @@
 [![CI](https://github.com/pulsehive/pulsedb/actions/workflows/ci.yml/badge.svg)](https://github.com/pulsehive/pulsedb/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/pulsedb)](https://crates.io/crates/pulsedb)
 [![docs.rs](https://docs.rs/pulsedb/badge.svg)](https://docs.rs/pulsedb)
-[![License](https://img.shields.io/crates/l/pulsedb)](LICENSE)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.89-blue)](Cargo.toml)
 
 **The database that gives your agents shared consciousness.** Not message passing. Not RAG. Actual collective memory.
@@ -148,9 +148,9 @@ The **SubstrateProvider** trait enables PulseDB to serve as the storage layer fo
 
 ## License
 
-Licensed under either of:
+PulseDB is dual-licensed:
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT License ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+- **Open Source**: [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE) — free for open-source projects and internal use. If you modify PulseDB and offer it as a network service, you must release your source code under AGPL-3.0.
+- **Commercial License**: For proprietary use without AGPL obligations, contact us for a commercial license.
 
-at your option.
+This ensures PulseDB remains free for the community while protecting against unauthorized commercial hosting.
