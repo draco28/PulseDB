@@ -3,6 +3,9 @@ CLAUDE.md
 AGENTS.md
 SPEC.md
 .claude/
+
+# Internal planning docs (keep locally, not public)
+docs/
 .mcp.json
 opencode.json
 .opencode/
