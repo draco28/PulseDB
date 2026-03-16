@@ -395,7 +395,7 @@ async fn test_watch_delivers_events() {
 async fn test_trait_object_safety() {
     let (substrate, cid, _dir) = setup();
 
-    // This must compile — PulseHive holds Box<dyn SubstrateProvider>
+    // This must compile — consumers hold Box<dyn SubstrateProvider>
     let provider: Box<dyn SubstrateProvider> = Box::new(substrate);
 
     let exp_id = provider
