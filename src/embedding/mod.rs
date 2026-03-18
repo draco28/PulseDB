@@ -218,8 +218,19 @@ pub fn create_embedding_service(
         #[cfg(feature = "builtin-embeddings")]
         EmbeddingProvider::Builtin { model_path } => {
             let dim = config.embedding_dimension.size();
-            let service = onnx::OnnxEmbedding::with_dimension(model_path.clone(), dim)?;
-            Ok(Box::new(service))
+            match onnx::OnnxEmbedding::with_dimension(model_path.clone(), dim) {
+                Ok(service) => Ok(Box::new(service)),
+                Err(ref e) if e.to_string().contains("Model not found") => {
+                    tracing::info!(
+                        "Builtin embedding model not found, downloading (dimension: {dim})..."
+                    );
+                    let _path = onnx::OnnxEmbedding::download_default_model(dim)?;
+                    let service =
+                        onnx::OnnxEmbedding::with_dimension(model_path.clone(), dim)?;
+                    Ok(Box::new(service))
+                }
+                Err(e) => Err(e),
+            }
         }
 
         #[cfg(not(feature = "builtin-embeddings"))]
@@ -282,11 +293,11 @@ mod tests {
     }
 
     #[test]
-    fn test_create_embedding_service_builtin_requires_model() {
+    #[ignore] // Requires network access for auto-download
+    fn test_create_embedding_service_builtin_auto_downloads() {
         let config = crate::config::Config::with_builtin_embeddings();
         let result = create_embedding_service(&config);
-        // Fails because model files aren't downloaded (expected in CI/test)
-        // In production, users call OnnxEmbedding::download_default_model() first
-        assert!(result.is_err());
+        // With auto-download, this should succeed if network is available
+        assert!(result.is_ok());
     }
 }

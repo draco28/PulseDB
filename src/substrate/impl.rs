@@ -8,6 +8,7 @@ use futures_core::Stream;
 use tokio::task::spawn_blocking;
 
 use crate::activity::Activity;
+use crate::collective::Collective;
 use crate::db::PulseDB;
 use crate::error::PulseDBError;
 use crate::experience::{Experience, NewExperience};
@@ -170,5 +171,31 @@ impl SubstrateProvider for PulseDBSubstrate {
         // watch_experiences is non-blocking (just channel setup), no spawn_blocking needed
         let stream = self.db.watch_experiences(collective)?;
         Ok(Box::pin(stream))
+    }
+
+    async fn create_collective(&self, name: &str) -> Result<CollectiveId, PulseDBError> {
+        let db = Arc::clone(&self.db);
+        let name = name.to_string();
+        blocking(move || db.create_collective(&name)).await
+    }
+
+    async fn get_or_create_collective(&self, name: &str) -> Result<CollectiveId, PulseDBError> {
+        let db = Arc::clone(&self.db);
+        let name = name.to_string();
+        blocking(move || {
+            // Try to find existing by name
+            let collectives = db.list_collectives()?;
+            if let Some(existing) = collectives.iter().find(|c| c.name == name) {
+                return Ok(existing.id);
+            }
+            // Not found — create new
+            db.create_collective(&name)
+        })
+        .await
+    }
+
+    async fn list_collectives(&self) -> Result<Vec<Collective>, PulseDBError> {
+        let db = Arc::clone(&self.db);
+        blocking(move || db.list_collectives()).await
     }
 }

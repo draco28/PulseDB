@@ -52,6 +52,7 @@ use async_trait::async_trait;
 use futures_core::Stream;
 
 use crate::activity::Activity;
+use crate::collective::Collective;
 use crate::error::PulseDBError;
 use crate::experience::{Experience, NewExperience};
 use crate::insight::{DerivedInsight, NewDerivedInsight};
@@ -151,4 +152,19 @@ pub trait SubstrateProvider: Send + Sync {
         &self,
         collective: CollectiveId,
     ) -> Result<Pin<Box<dyn Stream<Item = WatchEvent> + Send>>, PulseDBError>;
+
+    /// Creates a new collective (namespace).
+    ///
+    /// Returns the new collective's ID. Fails if a collective with the
+    /// same name already exists.
+    async fn create_collective(&self, name: &str) -> Result<CollectiveId, PulseDBError>;
+
+    /// Gets an existing collective by name, or creates it if it doesn't exist.
+    ///
+    /// This is the recommended method for SDK consumers — idempotent and safe
+    /// to call repeatedly with the same name.
+    async fn get_or_create_collective(&self, name: &str) -> Result<CollectiveId, PulseDBError>;
+
+    /// Lists all collectives in the database.
+    async fn list_collectives(&self) -> Result<Vec<Collective>, PulseDBError>;
 }

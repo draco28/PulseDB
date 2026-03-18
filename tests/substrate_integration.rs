@@ -442,3 +442,114 @@ async fn test_clone_and_concurrent_operations() {
     let unique: std::collections::HashSet<_> = exp_ids.iter().collect();
     assert_eq!(unique.len(), 5);
 }
+
+// ============================================================================
+// Collective lifecycle (SubstrateProvider methods)
+// ============================================================================
+
+#[tokio::test]
+async fn test_substrate_create_collective() {
+    let dir = tempdir().unwrap();
+    let db = PulseDB::open(dir.path().join("test.db"), Config::default()).unwrap();
+    let substrate = PulseDBSubstrate::from_db(db);
+    let provider: Box<dyn SubstrateProvider> = Box::new(substrate);
+
+    let cid = provider.create_collective("test-project").await.unwrap();
+
+    // Verify collective exists by listing
+    let collectives = provider.list_collectives().await.unwrap();
+    assert_eq!(collectives.len(), 1);
+    assert_eq!(collectives[0].id, cid);
+    assert_eq!(collectives[0].name, "test-project");
+}
+
+#[tokio::test]
+async fn test_substrate_get_or_create_collective_new() {
+    let dir = tempdir().unwrap();
+    let db = PulseDB::open(dir.path().join("test.db"), Config::default()).unwrap();
+    let substrate = PulseDBSubstrate::from_db(db);
+    let provider: Box<dyn SubstrateProvider> = Box::new(substrate);
+
+    // First call creates
+    let cid = provider
+        .get_or_create_collective("my-project")
+        .await
+        .unwrap();
+
+    let collectives = provider.list_collectives().await.unwrap();
+    assert_eq!(collectives.len(), 1);
+    assert_eq!(collectives[0].id, cid);
+}
+
+#[tokio::test]
+async fn test_substrate_get_or_create_collective_idempotent() {
+    let dir = tempdir().unwrap();
+    let db = PulseDB::open(dir.path().join("test.db"), Config::default()).unwrap();
+    let substrate = PulseDBSubstrate::from_db(db);
+    let provider: Box<dyn SubstrateProvider> = Box::new(substrate);
+
+    // Call twice with same name
+    let cid1 = provider
+        .get_or_create_collective("my-project")
+        .await
+        .unwrap();
+    let cid2 = provider
+        .get_or_create_collective("my-project")
+        .await
+        .unwrap();
+
+    // Same ID returned
+    assert_eq!(cid1, cid2);
+
+    // Only one collective exists
+    let collectives = provider.list_collectives().await.unwrap();
+    assert_eq!(collectives.len(), 1);
+}
+
+#[tokio::test]
+async fn test_substrate_list_collectives_multiple() {
+    let dir = tempdir().unwrap();
+    let db = PulseDB::open(dir.path().join("test.db"), Config::default()).unwrap();
+    let substrate = PulseDBSubstrate::from_db(db);
+    let provider: Box<dyn SubstrateProvider> = Box::new(substrate);
+
+    provider.create_collective("alpha").await.unwrap();
+    provider.create_collective("beta").await.unwrap();
+    provider.create_collective("gamma").await.unwrap();
+
+    let collectives = provider.list_collectives().await.unwrap();
+    assert_eq!(collectives.len(), 3);
+
+    let names: Vec<&str> = collectives.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"alpha"));
+    assert!(names.contains(&"beta"));
+    assert!(names.contains(&"gamma"));
+}
+
+#[tokio::test]
+async fn test_substrate_get_or_create_then_store_experience() {
+    let dir = tempdir().unwrap();
+    let db = PulseDB::open(dir.path().join("test.db"), Config::default()).unwrap();
+    let substrate = PulseDBSubstrate::from_db(db);
+    let provider: Box<dyn SubstrateProvider> = Box::new(substrate);
+
+    // Create collective through trait, then store experience
+    let cid = provider
+        .get_or_create_collective("my-project")
+        .await
+        .unwrap();
+
+    let exp_id = provider
+        .store_experience(NewExperience {
+            collective_id: cid,
+            content: "Test experience through substrate".to_string(),
+            embedding: Some(dummy_embedding()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let exp = provider.get_experience(exp_id).await.unwrap().unwrap();
+    assert_eq!(exp.collective_id, cid);
+    assert_eq!(exp.content, "Test experience through substrate");
+}

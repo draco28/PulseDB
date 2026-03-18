@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-03-18
+
+### Added
+- `SubstrateProvider::create_collective()` for creating collectives through the async trait
+- `SubstrateProvider::get_or_create_collective()` for idempotent collective creation (recommended for SDK consumers)
+- `SubstrateProvider::list_collectives()` for listing all collectives
+- Auto-download of builtin embedding model when missing (no manual download step needed)
+
+### Breaking
+- `SubstrateProvider` trait has 3 new required methods — implementors must add them
+
 ## [0.1.1] - 2026-03-15
 
 ### Changed
