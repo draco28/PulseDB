@@ -204,8 +204,24 @@ impl OnnxEmbedding {
             ))
         })?;
 
+        // Acquire exclusive file lock to prevent concurrent download races.
+        // Multiple threads/processes may call this simultaneously on first run.
+        let lock_path = cache_dir.join(".download.lock");
+        let lock_file = std::fs::File::create(&lock_path)
+            .map_err(|e| PulseDBError::embedding(format!("Failed to create download lock: {e}")))?;
+        use fs2::FileExt;
+        lock_file.lock_exclusive().map_err(|e| {
+            PulseDBError::embedding(format!("Failed to acquire download lock: {e}"))
+        })?;
+
         let model_path = cache_dir.join(MODEL_FILENAME);
         let tokenizer_path = cache_dir.join(TOKENIZER_FILENAME);
+
+        // Double-check after acquiring lock — another process may have downloaded while we waited
+        if model_path.exists() && tokenizer_path.exists() {
+            info!(dir = %cache_dir.display(), "Model files already downloaded by another process");
+            return Ok(cache_dir);
+        }
 
         // Download model if not present
         if !model_path.exists() {
