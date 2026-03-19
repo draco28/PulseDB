@@ -225,8 +225,7 @@ pub fn create_embedding_service(
                         "Builtin embedding model not found, downloading (dimension: {dim})..."
                     );
                     let _path = onnx::OnnxEmbedding::download_default_model(dim)?;
-                    let service =
-                        onnx::OnnxEmbedding::with_dimension(model_path.clone(), dim)?;
+                    let service = onnx::OnnxEmbedding::with_dimension(model_path.clone(), dim)?;
                     Ok(Box::new(service))
                 }
                 Err(e) => Err(e),
