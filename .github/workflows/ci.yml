@@ -245,6 +245,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [lint, test, test-msrv, coverage, security]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
