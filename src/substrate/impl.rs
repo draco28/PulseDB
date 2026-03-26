@@ -198,4 +198,34 @@ impl SubstrateProvider for PulseDBSubstrate {
         let db = Arc::clone(&self.db);
         blocking(move || db.list_collectives()).await
     }
+
+    async fn list_experiences(
+        &self,
+        collective: CollectiveId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Experience>, PulseDBError> {
+        let db = Arc::clone(&self.db);
+        blocking(move || db.list_experiences(collective, limit, offset)).await
+    }
+
+    async fn list_relations(
+        &self,
+        collective: CollectiveId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ExperienceRelation>, PulseDBError> {
+        let db = Arc::clone(&self.db);
+        blocking(move || db.list_relations(collective, limit, offset)).await
+    }
+
+    async fn list_insights(
+        &self,
+        collective: CollectiveId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<DerivedInsight>, PulseDBError> {
+        let db = Arc::clone(&self.db);
+        blocking(move || db.list_insights(collective, limit, offset)).await
+    }
 }

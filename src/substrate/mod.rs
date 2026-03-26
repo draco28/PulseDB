@@ -167,4 +167,41 @@ pub trait SubstrateProvider: Send + Sync {
 
     /// Lists all collectives in the database.
     async fn list_collectives(&self) -> Result<Vec<Collective>, PulseDBError>;
+
+    /// Lists experiences in a collective with pagination.
+    ///
+    /// Returns full `Experience` records including embeddings.
+    /// Default implementation returns empty vec for backward compatibility.
+    async fn list_experiences(
+        &self,
+        _collective: CollectiveId,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<Experience>, PulseDBError> {
+        Ok(vec![])
+    }
+
+    /// Lists relations in a collective with pagination.
+    ///
+    /// Default implementation returns empty vec for backward compatibility.
+    async fn list_relations(
+        &self,
+        _collective: CollectiveId,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<ExperienceRelation>, PulseDBError> {
+        Ok(vec![])
+    }
+
+    /// Lists insights in a collective with pagination.
+    ///
+    /// Default implementation returns empty vec for backward compatibility.
+    async fn list_insights(
+        &self,
+        _collective: CollectiveId,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<DerivedInsight>, PulseDBError> {
+        Ok(vec![])
+    }
 }

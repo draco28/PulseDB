@@ -527,6 +527,20 @@ impl PulseDB {
         self.storage.as_ref()
     }
 
+    /// Returns true if this database is in read-only mode.
+    pub fn is_read_only(&self) -> bool {
+        self.config.read_only
+    }
+
+    /// Checks if the database is read-only and returns an error if so.
+    #[inline]
+    fn check_writable(&self) -> Result<()> {
+        if self.config.read_only {
+            return Err(PulseDBError::ReadOnly);
+        }
+        Ok(())
+    }
+
     // =========================================================================
     // Collective Management (E1-S02)
     // =========================================================================
@@ -557,6 +571,7 @@ impl PulseDB {
     /// ```
     #[instrument(skip(self))]
     pub fn create_collective(&self, name: &str) -> Result<CollectiveId> {
+        self.check_writable()?;
         validate_collective_name(name)?;
 
         let dimension = self.config.embedding_dimension.size() as u16;
@@ -598,6 +613,7 @@ impl PulseDB {
     /// Returns a validation error if the name or owner_id is invalid.
     #[instrument(skip(self))]
     pub fn create_collective_with_owner(&self, name: &str, owner_id: &str) -> Result<CollectiveId> {
+        self.check_writable()?;
         validate_collective_name(name)?;
 
         if owner_id.is_empty() {
@@ -713,6 +729,7 @@ impl PulseDB {
     /// ```
     #[instrument(skip(self))]
     pub fn delete_collective(&self, id: CollectiveId) -> Result<()> {
+        self.check_writable()?;
         // Verify collective exists
         self.storage
             .get_collective(id)?
@@ -795,6 +812,7 @@ impl PulseDB {
     /// - [`PulseDBError::Embedding`] if embedding generation fails (Builtin mode)
     #[instrument(skip(self, exp), fields(collective_id = %exp.collective_id))]
     pub fn record_experience(&self, exp: NewExperience) -> Result<ExperienceId> {
+        self.check_writable()?;
         let is_external = matches!(self.config.embedding_provider, EmbeddingProvider::External);
 
         // Verify collective exists and get its dimension
@@ -859,6 +877,7 @@ impl PulseDB {
                 collective_id,
                 event_type: WatchEventType::Created,
                 timestamp: experience.timestamp,
+                experience: Some(experience.clone()),
             },
             &experience,
         )?;
@@ -886,6 +905,7 @@ impl PulseDB {
     /// - [`NotFoundError::Experience`] if the experience doesn't exist
     #[instrument(skip(self, update))]
     pub fn update_experience(&self, id: ExperienceId, update: ExperienceUpdate) -> Result<()> {
+        self.check_writable()?;
         validate_experience_update(&update)?;
 
         let updated = self.storage.update_experience(id, &update)?;
@@ -907,6 +927,7 @@ impl PulseDB {
                         collective_id: exp.collective_id,
                         event_type,
                         timestamp: Timestamp::now(),
+                        experience: Some(exp.clone()),
                     },
                     &exp,
                 )?;
@@ -927,6 +948,7 @@ impl PulseDB {
     /// Returns [`NotFoundError::Experience`] if the experience doesn't exist.
     #[instrument(skip(self))]
     pub fn archive_experience(&self, id: ExperienceId) -> Result<()> {
+        self.check_writable()?;
         self.update_experience(
             id,
             ExperienceUpdate {
@@ -945,6 +967,7 @@ impl PulseDB {
     /// Returns [`NotFoundError::Experience`] if the experience doesn't exist.
     #[instrument(skip(self))]
     pub fn unarchive_experience(&self, id: ExperienceId) -> Result<()> {
+        self.check_writable()?;
         self.update_experience(
             id,
             ExperienceUpdate {
@@ -964,6 +987,7 @@ impl PulseDB {
     /// Returns [`NotFoundError::Experience`] if the experience doesn't exist.
     #[instrument(skip(self))]
     pub fn delete_experience(&self, id: ExperienceId) -> Result<()> {
+        self.check_writable()?;
         // Read experience first to get collective_id for HNSW lookup.
         // This adds one extra read, but delete is not a hot path.
         let experience = self
@@ -1003,6 +1027,7 @@ impl PulseDB {
                 collective_id: experience.collective_id,
                 event_type: WatchEventType::Deleted,
                 timestamp: Timestamp::now(),
+                experience: None, // Deleted — no data to include
             },
             &experience,
         )?;
@@ -1021,6 +1046,7 @@ impl PulseDB {
     /// Returns [`NotFoundError::Experience`] if the experience doesn't exist.
     #[instrument(skip(self))]
     pub fn reinforce_experience(&self, id: ExperienceId) -> Result<u32> {
+        self.check_writable()?;
         let new_count = self
             .storage
             .reinforce_experience(id)?
@@ -1035,6 +1061,7 @@ impl PulseDB {
                         collective_id: exp.collective_id,
                         event_type: WatchEventType::Updated,
                         timestamp: Timestamp::now(),
+                        experience: Some(exp.clone()),
                     },
                     &exp,
                 )?;
@@ -1049,36 +1076,73 @@ impl PulseDB {
     // Recent Experiences
     // =========================================================================
 
-    /// Retrieves the most recent experiences in a collective, newest first.
+    // =========================================================================
+    // Paginated List Operations (PulseVision)
+    // =========================================================================
+
+    /// Lists experiences in a collective with pagination.
     ///
-    /// Returns up to `limit` non-archived experiences ordered by timestamp
-    /// descending (newest first). Uses the by-collective timestamp index
-    /// for efficient retrieval.
+    /// Returns full `Experience` records (including embeddings) ordered by
+    /// timestamp. Use `offset` and `limit` for pagination.
     ///
-    /// # Arguments
+    /// Designed for visualization tools (PulseVision) that need to enumerate
+    /// the entire embedding space of a collective.
+    #[instrument(skip(self))]
+    pub fn list_experiences(
+        &self,
+        collective_id: CollectiveId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Experience>> {
+        let ids = self
+            .storage
+            .list_experience_ids_paginated(collective_id, limit, offset)?;
+        let mut experiences = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(exp) = self.storage.get_experience(id)? {
+                experiences.push(exp);
+            }
+        }
+        Ok(experiences)
+    }
+
+    /// Lists relations in a collective with pagination.
+    #[instrument(skip(self))]
+    pub fn list_relations(
+        &self,
+        collective_id: CollectiveId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::relation::ExperienceRelation>> {
+        self.storage
+            .list_relations_in_collective(collective_id, limit, offset)
+    }
+
+    /// Lists insights in a collective with pagination.
     ///
-    /// * `collective_id` - The collective to query
-    /// * `limit` - Maximum number of experiences to return (1-1000)
+    /// Returns full `DerivedInsight` records including embeddings.
+    #[instrument(skip(self))]
+    pub fn list_insights(
+        &self,
+        collective_id: CollectiveId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<DerivedInsight>> {
+        let ids = self
+            .storage
+            .list_insight_ids_paginated(collective_id, limit, offset)?;
+        let mut insights = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(insight) = self.storage.get_insight(id)? {
+                insights.push(insight);
+            }
+        }
+        Ok(insights)
+    }
+
+    /// Retrieves the most recent experiences in a collective.
     ///
-    /// # Errors
-    ///
-    /// - [`ValidationError::InvalidField`] if `limit` is 0 or > 1000
-    /// - [`NotFoundError::Collective`] if the collective doesn't exist
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # fn main() -> pulsedb::Result<()> {
-    /// # let dir = tempfile::tempdir().unwrap();
-    /// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
-    /// # let collective_id = db.create_collective("example")?;
-    /// let recent = db.get_recent_experiences(collective_id, 50)?;
-    /// for exp in &recent {
-    ///     println!("{}: {}", exp.timestamp, exp.content);
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Returns full experiences ordered by timestamp (newest first).
     #[instrument(skip(self))]
     pub fn get_recent_experiences(
         &self,
@@ -1333,6 +1397,7 @@ impl PulseDB {
         &self,
         relation: crate::relation::NewExperienceRelation,
     ) -> Result<crate::types::RelationId> {
+        self.check_writable()?;
         use crate::relation::{validate_new_relation, ExperienceRelation};
         use crate::types::RelationId;
 
@@ -1523,6 +1588,7 @@ impl PulseDB {
     /// Returns [`NotFoundError::Relation`] if no relation with the given ID exists.
     #[instrument(skip(self))]
     pub fn delete_relation(&self, id: crate::types::RelationId) -> Result<()> {
+        self.check_writable()?;
         let deleted = self.storage.delete_relation(id)?;
         if !deleted {
             return Err(PulseDBError::from(NotFoundError::relation(id)));
@@ -1560,6 +1626,7 @@ impl PulseDB {
     /// - [`ValidationError::DimensionMismatch`] if embedding dimension is wrong
     #[instrument(skip(self, insight), fields(collective_id = %insight.collective_id))]
     pub fn store_insight(&self, insight: NewDerivedInsight) -> Result<InsightId> {
+        self.check_writable()?;
         let is_external = matches!(self.config.embedding_provider, EmbeddingProvider::External);
 
         // Validate input fields
@@ -1720,6 +1787,7 @@ impl PulseDB {
     /// Returns [`NotFoundError::Insight`] if no insight with the given ID exists.
     #[instrument(skip(self))]
     pub fn delete_insight(&self, id: InsightId) -> Result<()> {
+        self.check_writable()?;
         // Read insight first to get collective_id for HNSW lookup
         let insight = self
             .storage
@@ -1821,6 +1889,7 @@ impl PulseDB {
     /// - [`NotFoundError::Activity`] if no activity exists for the agent/collective pair
     #[instrument(skip(self))]
     pub fn update_heartbeat(&self, agent_id: &str, collective_id: CollectiveId) -> Result<()> {
+        self.check_writable()?;
         let mut activity = self
             .storage
             .get_activity(agent_id, collective_id)?

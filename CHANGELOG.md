@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-03-26
+
+### Added
+
+#### PulseVision-ready APIs (Issue #8)
+- `Config::read_only()` constructor and `read_only` field — opens database in read-only mode where all mutations return `PulseDBError::ReadOnly`
+- `PulseDB::is_read_only()` method
+- `PulseDBError::ReadOnly` variant with `is_read_only()` predicate
+- `PulseDB::list_experiences(collective_id, limit, offset)` — paginated experience enumeration with embeddings
+- `PulseDB::list_relations(collective_id, limit, offset)` — paginated relation listing
+- `PulseDB::list_insights(collective_id, limit, offset)` — paginated insight listing
+- `SubstrateProvider::list_experiences()`, `list_relations()`, `list_insights()` with default implementations (backward compatible)
+- `WatchEvent.experience: Option<Experience>` — enriched events include full experience data for Created/Updated events (embeddings, importance, domain)
+
+### Changed
+- `WatchEvent` struct now has an `experience` field (`Option<Experience>`) — set to `Some` for Created/Updated events via in-process watch, `None` for Deleted and WAL-reconstructed events
+
 ## [0.3.0] - 2026-03-26
 
 ### Added
