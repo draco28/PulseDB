@@ -71,6 +71,13 @@ pub enum PulseDBError {
     #[error("Internal error: {0}")]
     Internal(String),
 
+    /// Database is in read-only mode.
+    ///
+    /// Returned when a mutation method is called on a database opened
+    /// with `Config::read_only()`.
+    #[error("Database is in read-only mode")]
+    ReadOnly,
+
     /// Sync protocol error.
     ///
     /// Only available when the `sync` feature is enabled.
@@ -151,6 +158,11 @@ impl PulseDBError {
     /// Returns true if this is an I/O error.
     pub fn is_io(&self) -> bool {
         matches!(self, Self::Io(_))
+    }
+
+    /// Returns true if this is a read-only error.
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, Self::ReadOnly)
     }
 
     /// Returns true if this is a sync error.

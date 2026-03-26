@@ -371,6 +371,39 @@ pub trait StorageEngine: Send + Sync {
     fn delete_activities_by_collective(&self, collective_id: CollectiveId) -> Result<u64>;
 
     // =========================================================================
+    // Paginated List Operations (PulseVision)
+    // =========================================================================
+
+    /// Lists experience IDs in a collective with pagination.
+    ///
+    /// Returns IDs ordered by timestamp (oldest first). Use `offset` to skip
+    /// previously fetched pages and `limit` to control page size.
+    fn list_experience_ids_paginated(
+        &self,
+        collective_id: CollectiveId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ExperienceId>>;
+
+    /// Lists all relations in a collective with pagination.
+    ///
+    /// Scans relations whose source experience belongs to the collective.
+    fn list_relations_in_collective(
+        &self,
+        collective_id: CollectiveId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::relation::ExperienceRelation>>;
+
+    /// Lists insight IDs in a collective with pagination.
+    fn list_insight_ids_paginated(
+        &self,
+        collective_id: CollectiveId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<InsightId>>;
+
+    // =========================================================================
     // Watch Event Operations (E4-S02) — Cross-Process Change Detection
     // =========================================================================
 

@@ -79,6 +79,17 @@ pub struct Config {
     /// Controls the in-process event notification channel.
     /// See [`WatchConfig`] for details.
     pub watch: WatchConfig,
+
+    /// Read-only mode.
+    ///
+    /// When `true`, all mutation methods (`record_experience`, `store_relation`,
+    /// etc.) return `PulseDBError::ReadOnly`. Read operations work normally.
+    ///
+    /// Use this for read-only consumers like PulseVision that open the same
+    /// database file a writer is using.
+    ///
+    /// Default: false
+    pub read_only: bool,
 }
 
 impl Default for Config {
@@ -94,6 +105,7 @@ impl Default for Config {
             hnsw: HnswConfig::default(),
             activity: ActivityConfig::default(),
             watch: WatchConfig::default(),
+            read_only: false,
         }
     }
 }
@@ -102,6 +114,26 @@ impl Config {
     /// Creates a new Config with default settings.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a Config for read-only access.
+    ///
+    /// All mutation methods will return `PulseDBError::ReadOnly`.
+    /// Use this for read-only consumers like visualization tools that
+    /// open the same database file a writer is using.
+    ///
+    /// # Example
+    /// ```rust
+    /// use pulsedb::Config;
+    ///
+    /// let config = Config::read_only();
+    /// assert!(config.read_only);
+    /// ```
+    pub fn read_only() -> Self {
+        Self {
+            read_only: true,
+            ..Default::default()
+        }
     }
 
     /// Creates a Config for builtin embedding generation.

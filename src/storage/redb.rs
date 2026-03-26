@@ -1497,6 +1497,109 @@ impl StorageEngine for RedbStorage {
     }
 
     // =========================================================================
+    // Paginated List Operations (PulseVision)
+    // =========================================================================
+
+    fn list_experience_ids_paginated(
+        &self,
+        collective_id: CollectiveId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ExperienceId>> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let table = read_txn.open_multimap_table(EXPERIENCES_BY_COLLECTIVE_TABLE)?;
+
+        let mut ids = Vec::new();
+        let mut skipped = 0usize;
+
+        // Multimap: key=collective_id (16 bytes), values=[timestamp_be:8][exp_id:16] (24 bytes)
+        for result in table.get(collective_id.as_bytes())? {
+            let value = result.map_err(StorageError::from)?;
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            let entry = value.value();
+            let mut id_bytes = [0u8; 16];
+            id_bytes.copy_from_slice(&entry[8..24]);
+            ids.push(ExperienceId::from_bytes(id_bytes));
+            if ids.len() >= limit {
+                return Ok(ids);
+            }
+        }
+
+        Ok(ids)
+    }
+
+    fn list_relations_in_collective(
+        &self,
+        collective_id: CollectiveId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::relation::ExperienceRelation>> {
+        // Get all experience IDs in this collective first
+        let exp_ids = self.list_experience_ids_in_collective(collective_id)?;
+
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let source_table = read_txn.open_multimap_table(RELATIONS_BY_SOURCE_TABLE)?;
+        let rel_table = read_txn.open_table(RELATIONS_TABLE)?;
+
+        let mut relations = Vec::new();
+        let mut skipped = 0usize;
+
+        for exp_id in &exp_ids {
+            for result in source_table.get(exp_id.as_bytes())? {
+                let rel_id_value = result.map_err(StorageError::from)?;
+                let rel_id = RelationId::from_bytes(*rel_id_value.value());
+
+                if skipped < offset {
+                    skipped += 1;
+                    continue;
+                }
+
+                if let Some(entry) = rel_table.get(rel_id.as_bytes())? {
+                    let relation: crate::relation::ExperienceRelation =
+                        bincode::deserialize(entry.value())
+                            .map_err(|e| StorageError::serialization(e.to_string()))?;
+                    relations.push(relation);
+                    if relations.len() >= limit {
+                        return Ok(relations);
+                    }
+                }
+            }
+        }
+
+        Ok(relations)
+    }
+
+    fn list_insight_ids_paginated(
+        &self,
+        collective_id: CollectiveId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<InsightId>> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let table = read_txn.open_multimap_table(INSIGHTS_BY_COLLECTIVE_TABLE)?;
+
+        let mut ids = Vec::new();
+        let mut skipped = 0usize;
+
+        for result in table.get(collective_id.as_bytes())? {
+            let value = result.map_err(StorageError::from)?;
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            ids.push(InsightId::from_bytes(*value.value()));
+            if ids.len() >= limit {
+                return Ok(ids);
+            }
+        }
+
+        Ok(ids)
+    }
+
+    // =========================================================================
     // Watch Event Operations (E4-S02)
     // =========================================================================
 

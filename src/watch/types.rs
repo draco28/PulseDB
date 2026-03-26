@@ -12,7 +12,7 @@ use atomic_waker::AtomicWaker;
 use crossbeam_channel::Receiver;
 use futures_core::Stream;
 
-use crate::experience::ExperienceType;
+use crate::experience::{Experience, ExperienceType};
 use crate::storage::schema::{WatchEventRecord, WatchEventTypeTag};
 use crate::types::{CollectiveId, ExperienceId, Timestamp};
 
@@ -57,6 +57,16 @@ pub struct WatchEvent {
 
     /// When the change occurred.
     pub timestamp: Timestamp,
+
+    /// The full experience data (enriched event).
+    ///
+    /// Populated for `Created` and `Updated` events when delivered via
+    /// in-process watch subscriptions. `None` for `Deleted` events and
+    /// events reconstructed from WAL records (cross-process polling).
+    ///
+    /// Includes the embedding vector, enabling visualization tools
+    /// (PulseVision) to update 3D positions without a follow-up fetch.
+    pub experience: Option<Experience>,
 }
 
 /// The kind of change that triggered a [`WatchEvent`].
@@ -108,6 +118,7 @@ impl From<WatchEventRecord> for WatchEvent {
             collective_id: CollectiveId::from_bytes(record.collective_id),
             event_type: record.event_type.into(),
             timestamp: Timestamp::from_millis(record.timestamp_ms),
+            experience: None, // WAL records don't carry full experience data
         }
     }
 }
