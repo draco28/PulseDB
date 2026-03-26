@@ -45,7 +45,7 @@ use super::SYNC_PROTOCOL_VERSION;
 /// consumers create web handlers that delegate to this struct's methods.
 ///
 /// The server manages its own `ChangePoller` for serving pull requests and
-/// delegates push handling to [`RemoteChangeApplier`].
+/// delegates push handling to `RemoteChangeApplier`.
 pub struct SyncServer {
     db: Arc<PulseDB>,
     instance_id: InstanceId,

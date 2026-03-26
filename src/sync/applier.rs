@@ -1,6 +1,6 @@
 //! Remote change applier — applies changes received from a remote peer.
 //!
-//! The [`RemoteChangeApplier`] receives batches of [`SyncChange`] from pull
+//! The `RemoteChangeApplier` receives batches of `SyncChange` from pull
 //! responses and applies them to the local database. It handles:
 //! - Echo prevention via [`SyncApplyGuard`]
 //! - Idempotent creates (skip if entity exists)

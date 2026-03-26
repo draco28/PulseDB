@@ -28,21 +28,21 @@
 //! # Module Overview
 //!
 //! **Core** (always with `sync` feature):
-//! - [`types`] — Wire types: `SyncChange`, `SyncPayload`, `InstanceId`, `SyncCursor`
-//! - [`config`] — `SyncConfig`, `SyncDirection`, `ConflictResolution`, `RetryConfig`
-//! - [`error`] — `SyncError` enum (Transport, Timeout, ProtocolVersion, etc.)
-//! - [`transport`] — `SyncTransport` pluggable trait
-//! - [`transport_mem`] — `InMemorySyncTransport` for testing
-//! - [`guard`] — `SyncApplyGuard` thread-local echo prevention
+//! - `types` — Wire types: `SyncChange`, `SyncPayload`, `InstanceId`, `SyncCursor`
+//! - `config` — `SyncConfig`, `SyncDirection`, `ConflictResolution`, `RetryConfig`
+//! - `error` — `SyncError` enum (Transport, Timeout, ProtocolVersion, etc.)
+//! - `transport` — `SyncTransport` pluggable trait
+//! - `transport_mem` — `InMemorySyncTransport` for testing
+//! - `guard` — `SyncApplyGuard` thread-local echo prevention
 //!
 //! **Engine**:
-//! - [`manager`] — `SyncManager`: start/stop/sync_once/initial_sync lifecycle
-//! - [`applier`] — `RemoteChangeApplier`: applies remote changes with idempotency
-//! - [`progress`] — `SyncProgressCallback` for initial sync UI feedback
+//! - `manager` — `SyncManager`: start/stop/sync_once/initial_sync lifecycle
+//! - `applier` — `RemoteChangeApplier`: applies remote changes with idempotency
+//! - `progress` — `SyncProgressCallback` for initial sync UI feedback
 //!
 //! **HTTP** (with `sync-http` feature):
-//! - [`server`] — `SyncServer`: framework-agnostic server handler
-//! - [`transport_http`] — `HttpSyncTransport`: reqwest-based client
+//! - `server` — `SyncServer`: framework-agnostic server handler
+//! - `transport_http` — `HttpSyncTransport`: reqwest-based client
 //!
 //! # WAL Compaction
 //!

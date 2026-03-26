@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-26
+
+### Added
+
+#### Native Sync Protocol
+- `SyncManager` for orchestrating sync between PulseDB instances (start/stop/sync_once/initial_sync)
+- `SyncTransport` pluggable trait for transport abstraction
+- `HttpSyncTransport` for HTTP/HTTPS sync via reqwest (`sync-http` feature)
+- `SyncServer` framework-agnostic server handler for Axum/other consumers (`sync-http` feature)
+- `InMemorySyncTransport` for testing
+- `SyncConfig` with direction (push/pull/bidirectional), conflict resolution (ServerWins/LastWriteWins), retry with exponential backoff
+- `SyncApplyGuard` thread-local echo prevention (prevents infinite sync loops)
+- `SyncProgressCallback` trait for initial sync UI feedback
+- WAL extension: all entity types (experiences, relations, insights, collectives) now tracked in WAL
+- Schema v2 migration (automatic on open)
+- `PulseDB::compact_wal()` for WAL compaction using min-cursor strategy
+- Per-peer sync cursor persistence in redb
+- Stable `InstanceId` per database (UUID v7, persisted in metadata)
+- `PulseDBError::Sync` variant (feature-gated)
+
+#### Feature Flags
+- `sync` — Core sync protocol, types, engine, in-memory transport
+- `sync-http` — HTTP transport (reqwest) + server handler
+- `sync-websocket` — WebSocket transport placeholder (tokio-tungstenite)
+
+#### Testing & Benchmarks
+- 65+ sync-specific integration tests (foundation, engine, HTTP)
+- 6 Criterion benchmarks for sync operations (serialization, echo prevention, WAL poll, compaction)
+
+### Changed
+- WAL schema version 1 → 2 (entity_type field added to WatchEventRecord, auto-migration on open)
+- `WatchEventRecord.experience_id` renamed to `entity_id` with new `entity_type` discriminant
+- `poll_changes()` now filters to Experience-only events (backward compatible)
+- WAL sequence now increments for relation, insight, and collective mutations
+
 ## [0.2.1] - 2026-03-19
 
 ### Fixed

@@ -1,9 +1,10 @@
 //! # PulseDB
 //!
-//! Embedded database for agentic AI systems - collective memory for multi-agent coordination.
+//! Distributed database for agentic AI systems - collective memory for multi-agent coordination.
 //!
 //! PulseDB provides persistent storage for AI agent experiences, enabling semantic
-//! search, context retrieval, and knowledge sharing between agents.
+//! search, context retrieval, and knowledge sharing between agents. Supports native
+//! sync between instances for multi-device and client-server deployments.
 //!
 //! ## Quick Start
 //!
@@ -60,9 +61,16 @@
 //! - **Builtin**: PulseDB generates embeddings using a bundled ONNX model
 //!   (requires `builtin-embeddings` feature)
 //!
-//! ## Features
+//! ## Distributed Sync
 //!
-//! - `builtin-embeddings` - Enable built-in ONNX embedding generation
+//! With the `sync` feature, PulseDB instances can synchronize data across a
+//! network. See the [`sync`] module for full documentation.
+//!
+//! Key components:
+//! - `SyncManager` — Orchestrates sync lifecycle (start/stop/sync_once)
+//! - `SyncTransport` — Pluggable transport trait (HTTP, in-memory, custom)
+//! - `SyncServer` — Server-side handler for Axum consumers (`sync-http`)
+//! - `PulseDB::compact_wal()` — WAL compaction for disk space reclamation
 //!
 //! ## Thread Safety
 //!
