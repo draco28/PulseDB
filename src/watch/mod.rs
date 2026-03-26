@@ -311,6 +311,7 @@ mod tests {
             collective_id,
             event_type,
             timestamp: Timestamp::now(),
+            experience: None,
         }
     }
 
