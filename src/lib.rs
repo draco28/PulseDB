@@ -1,9 +1,10 @@
 //! # PulseDB
 //!
-//! Embedded database for agentic AI systems - collective memory for multi-agent coordination.
+//! Distributed database for agentic AI systems - collective memory for multi-agent coordination.
 //!
 //! PulseDB provides persistent storage for AI agent experiences, enabling semantic
-//! search, context retrieval, and knowledge sharing between agents.
+//! search, context retrieval, and knowledge sharing between agents. Supports native
+//! sync between instances for multi-device and client-server deployments.
 //!
 //! ## Quick Start
 //!
@@ -60,9 +61,16 @@
 //! - **Builtin**: PulseDB generates embeddings using a bundled ONNX model
 //!   (requires `builtin-embeddings` feature)
 //!
-//! ## Features
+//! ## Distributed Sync
 //!
-//! - `builtin-embeddings` - Enable built-in ONNX embedding generation
+//! With the `sync` feature, PulseDB instances can synchronize data across a
+//! network. See the [`sync`] module for full documentation.
+//!
+//! Key components:
+//! - `SyncManager` — Orchestrates sync lifecycle (start/stop/sync_once)
+//! - `SyncTransport` — Pluggable transport trait (HTTP, in-memory, custom)
+//! - `SyncServer` — Server-side handler for Axum consumers (`sync-http`)
+//! - `PulseDB::compact_wal()` — WAL compaction for disk space reclamation
 //!
 //! ## Thread Safety
 //!
@@ -74,6 +82,9 @@
 //! | Feature | Description |
 //! |---------|-------------|
 //! | `builtin-embeddings` | Bundles ONNX runtime with all-MiniLM-L6-v2 for local embedding generation. Without this feature, you must supply pre-computed embeddings. |
+//! | `sync` | Core sync protocol: types, transport trait, in-memory transport, echo prevention guard. |
+//! | `sync-http` | HTTP sync transport via reqwest (implies `sync`). |
+//! | `sync-websocket` | WebSocket sync transport via tokio-tungstenite (implies `sync`). |
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
@@ -103,6 +114,14 @@ mod watch;
 
 /// SubstrateProvider async trait for agent framework integration.
 pub mod substrate;
+
+/// Native sync protocol for distributed PulseDB instances.
+///
+/// Requires the `sync` feature flag. Provides types, transport trait,
+/// and echo prevention for synchronizing data between PulseDB instances.
+#[cfg(feature = "sync")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sync")))]
+pub mod sync;
 
 /// Vector index module for HNSW-based approximate nearest neighbor search.
 pub mod vector;

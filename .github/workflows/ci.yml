@@ -43,6 +43,12 @@ jobs:
       - name: Clippy (builtin-embeddings)
         run: cargo clippy --features builtin-embeddings -- -D warnings
 
+      - name: Clippy (sync)
+        run: cargo clippy --features sync -- -D warnings
+
+      - name: Clippy (sync-http)
+        run: cargo clippy --features sync-http -- -D warnings
+
   # ─────────────────────────────────────────────
   # Job 2: Test matrix (3 OS x 2 feature sets)
   # ─────────────────────────────────────────────
@@ -59,6 +65,12 @@ jobs:
           - os: ubuntu-latest
             features: "--features builtin-embeddings"
             name: Linux / builtin-embeddings
+          - os: ubuntu-latest
+            features: "--features sync"
+            name: Linux / sync
+          - os: ubuntu-latest
+            features: "--features sync-http"
+            name: Linux / sync-http
           - os: macos-latest
             features: ""
             name: macOS / default

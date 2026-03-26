@@ -30,12 +30,14 @@ use crate::types::{CollectiveId, ExperienceId, InsightId, RelationId, Timestamp}
 
 use super::schema::{
     decode_collective_from_activity_key, encode_activity_key, encode_type_index_key,
-    DatabaseMetadata, ExperienceTypeTag, WatchEventRecord, WatchEventTypeTag, ACTIVITIES_TABLE,
-    COLLECTIVES_TABLE, EMBEDDINGS_TABLE, EXPERIENCES_BY_COLLECTIVE_TABLE,
+    DatabaseMetadata, EntityTypeTag, ExperienceTypeTag, WatchEventRecord, WatchEventTypeTag,
+    ACTIVITIES_TABLE, COLLECTIVES_TABLE, EMBEDDINGS_TABLE, EXPERIENCES_BY_COLLECTIVE_TABLE,
     EXPERIENCES_BY_TYPE_TABLE, EXPERIENCES_TABLE, INSIGHTS_BY_COLLECTIVE_TABLE, INSIGHTS_TABLE,
     METADATA_TABLE, RELATIONS_BY_SOURCE_TABLE, RELATIONS_BY_TARGET_TABLE, RELATIONS_TABLE,
     SCHEMA_VERSION, WAL_SEQUENCE_KEY, WATCH_EVENTS_TABLE,
 };
+#[cfg(feature = "sync")]
+use super::schema::{INSTANCE_ID_KEY, SYNC_CURSORS_TABLE};
 use super::StorageEngine;
 use crate::config::{Config, EmbeddingDimension};
 use crate::error::{PulseDBError, Result, StorageError, ValidationError};
@@ -62,6 +64,10 @@ pub struct RedbStorage {
 
     /// Path to the database file.
     path: PathBuf,
+
+    /// Persistent instance ID for sync protocol (only with `sync` feature).
+    #[cfg(feature = "sync")]
+    instance_id: crate::sync::InstanceId,
 }
 
 impl RedbStorage {
@@ -166,9 +172,32 @@ impl RedbStorage {
             let _ = write_txn.open_multimap_table(INSIGHTS_BY_COLLECTIVE_TABLE)?;
             let _ = write_txn.open_table(ACTIVITIES_TABLE)?;
             let _ = write_txn.open_table(WATCH_EVENTS_TABLE)?;
+
+            // Sync tables and instance ID (behind feature gate)
+            #[cfg(feature = "sync")]
+            {
+                let instance_id = crate::sync::InstanceId::new();
+                meta_table.insert(INSTANCE_ID_KEY, instance_id.as_bytes().as_slice())?;
+                let _ = write_txn.open_table(SYNC_CURSORS_TABLE)?;
+            }
         }
 
         write_txn.commit().map_err(StorageError::from)?;
+
+        // Load instance ID for the struct (behind feature gate)
+        #[cfg(feature = "sync")]
+        let instance_id = {
+            let read_txn = db.begin_read().map_err(StorageError::from)?;
+            let meta_table = read_txn.open_table(METADATA_TABLE)?;
+            let entry = meta_table
+                .get(INSTANCE_ID_KEY)?
+                .ok_or_else(|| StorageError::corrupted("Missing instance_id after init"))?;
+            let bytes: [u8; 16] = entry
+                .value()
+                .try_into()
+                .map_err(|_| StorageError::corrupted("invalid instance_id bytes"))?;
+            crate::sync::InstanceId::from_bytes(bytes)
+        };
 
         info!(
             schema_version = SCHEMA_VERSION,
@@ -176,7 +205,13 @@ impl RedbStorage {
             "Database initialized"
         );
 
-        Ok(Self { db, metadata, path })
+        Ok(Self {
+            db,
+            metadata,
+            path,
+            #[cfg(feature = "sync")]
+            instance_id,
+        })
     }
 
     /// Opens and validates an existing database.
@@ -203,8 +238,8 @@ impl RedbStorage {
 
         drop(read_txn);
 
-        // Validate schema version
-        if metadata.schema_version != SCHEMA_VERSION {
+        // Validate schema version (allow migration from v1 → v2)
+        if metadata.schema_version != SCHEMA_VERSION && metadata.schema_version != 1 {
             warn!(
                 expected = SCHEMA_VERSION,
                 found = metadata.schema_version,
@@ -215,6 +250,7 @@ impl RedbStorage {
                 found: metadata.schema_version,
             }));
         }
+        let needs_v2_migration = metadata.schema_version == 1;
 
         // Validate embedding dimension
         if metadata.embedding_dimension != config.embedding_dimension {
@@ -231,21 +267,57 @@ impl RedbStorage {
             ));
         }
 
-        // Update last_opened_at timestamp
+        // Update last_opened_at timestamp and bump schema version if migrating
         let mut metadata = metadata;
         metadata.touch();
+        if needs_v2_migration {
+            metadata.schema_version = SCHEMA_VERSION;
+        }
 
         let write_txn = db.begin_write().map_err(StorageError::from)?;
         {
+            // Ensure watch_events table exists (migration for pre-E4-S02 databases)
+            let _ = write_txn.open_table(WATCH_EVENTS_TABLE)?;
+
+            // Migrate WAL records from v1 → v2 (add entity_type field)
+            if needs_v2_migration {
+                Self::migrate_wal_v1_to_v2(&write_txn)?;
+                info!("Migrated WAL records from schema v1 to v2");
+            }
+
             let mut meta_table = write_txn.open_table(METADATA_TABLE)?;
             let metadata_bytes = bincode::serialize(&metadata)
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             meta_table.insert(METADATA_KEY, metadata_bytes.as_slice())?;
 
-            // Ensure watch_events table exists (migration for pre-E4-S02 databases)
-            let _ = write_txn.open_table(WATCH_EVENTS_TABLE)?;
+            // Ensure sync tables and instance ID exist (migration for pre-sync databases)
+            #[cfg(feature = "sync")]
+            {
+                // Generate instance_id if missing (first open with sync feature)
+                if meta_table.get(INSTANCE_ID_KEY)?.is_none() {
+                    let instance_id = crate::sync::InstanceId::new();
+                    meta_table.insert(INSTANCE_ID_KEY, instance_id.as_bytes().as_slice())?;
+                    debug!("Generated new instance_id for existing database");
+                }
+                let _ = write_txn.open_table(SYNC_CURSORS_TABLE)?;
+            }
         }
         write_txn.commit().map_err(StorageError::from)?;
+
+        // Load instance ID for the struct (behind feature gate)
+        #[cfg(feature = "sync")]
+        let instance_id = {
+            let read_txn = db.begin_read().map_err(StorageError::from)?;
+            let meta_table = read_txn.open_table(METADATA_TABLE)?;
+            let entry = meta_table
+                .get(INSTANCE_ID_KEY)?
+                .ok_or_else(|| StorageError::corrupted("Missing instance_id"))?;
+            let bytes: [u8; 16] = entry
+                .value()
+                .try_into()
+                .map_err(|_| StorageError::corrupted("invalid instance_id bytes"))?;
+            crate::sync::InstanceId::from_bytes(bytes)
+        };
 
         info!(
             schema_version = metadata.schema_version,
@@ -253,7 +325,13 @@ impl RedbStorage {
             "Database opened successfully"
         );
 
-        Ok(Self { db, metadata, path })
+        Ok(Self {
+            db,
+            metadata,
+            path,
+            #[cfg(feature = "sync")]
+            instance_id,
+        })
     }
 
     /// Returns a reference to the underlying redb database.
@@ -274,18 +352,26 @@ impl RedbStorage {
     /// # Arguments
     ///
     /// * `write_txn` - The caller's open write transaction
-    /// * `experience_id` - The experience that changed
+    /// * `entity_id` - The entity that changed (16-byte UUID)
     /// * `collective_id` - The collective it belongs to
-    /// * `event_type` - What kind of change occurred
+    /// * `entity_type` - What kind of entity changed (Experience, Relation, etc.)
+    /// * `event_type` - What kind of change occurred (Created, Updated, etc.)
     /// * `timestamp` - When the change occurred
     fn increment_wal_and_record(
         &self,
         write_txn: &::redb::WriteTransaction,
-        experience_id: ExperienceId,
+        entity_id: &[u8; 16],
         collective_id: CollectiveId,
+        entity_type: EntityTypeTag,
         event_type: WatchEventTypeTag,
         timestamp: Timestamp,
     ) -> Result<u64> {
+        // Echo prevention: skip WAL recording when applying sync changes
+        #[cfg(feature = "sync")]
+        if crate::sync::guard::is_sync_applying() {
+            return Ok(0);
+        }
+
         // Read current sequence (0 if key doesn't exist yet)
         let mut meta_table = write_txn.open_table(METADATA_TABLE)?;
         let current_seq = match meta_table.get(WAL_SEQUENCE_KEY)? {
@@ -304,12 +390,13 @@ impl RedbStorage {
         let seq_bytes = new_seq.to_be_bytes();
         meta_table.insert(WAL_SEQUENCE_KEY, seq_bytes.as_slice())?;
 
-        // Record the event
+        // Record the event (schema v2 with entity_type)
         let record = WatchEventRecord {
-            experience_id: *experience_id.as_bytes(),
+            entity_id: *entity_id,
             collective_id: *collective_id.as_bytes(),
             event_type,
             timestamp_ms: timestamp.as_millis(),
+            entity_type,
         };
         let record_bytes =
             bincode::serialize(&record).map_err(|e| StorageError::serialization(e.to_string()))?;
@@ -318,6 +405,45 @@ impl RedbStorage {
         events_table.insert(&seq_bytes, record_bytes.as_slice())?;
 
         Ok(new_seq)
+    }
+
+    /// Migrates WAL records from schema v1 to v2.
+    ///
+    /// V1 records have 4 fields: experience_id, collective_id, event_type, timestamp_ms.
+    /// V2 adds entity_type (defaults to Experience for existing records).
+    fn migrate_wal_v1_to_v2(write_txn: &::redb::WriteTransaction) -> Result<()> {
+        use super::schema::WatchEventRecordV1;
+
+        let events_table = write_txn.open_table(WATCH_EVENTS_TABLE)?;
+
+        // Collect all (key, v1_record) pairs
+        let mut entries: Vec<([u8; 8], WatchEventRecordV1)> = Vec::new();
+        for entry in events_table.iter()? {
+            let (key, value) = entry.map_err(StorageError::from)?;
+            let seq_bytes: [u8; 8] = *key.value();
+            let v1_record: WatchEventRecordV1 = bincode::deserialize(value.value())
+                .map_err(|e| StorageError::serialization(format!("v1 WAL record: {}", e)))?;
+            entries.push((seq_bytes, v1_record));
+        }
+        drop(events_table);
+
+        // Rewrite as v2 records
+        let mut events_table = write_txn.open_table(WATCH_EVENTS_TABLE)?;
+        for (seq_bytes, v1) in &entries {
+            let v2 = WatchEventRecord {
+                entity_id: v1.experience_id,
+                collective_id: v1.collective_id,
+                event_type: v1.event_type,
+                timestamp_ms: v1.timestamp_ms,
+                entity_type: EntityTypeTag::Experience,
+            };
+            let v2_bytes =
+                bincode::serialize(&v2).map_err(|e| StorageError::serialization(e.to_string()))?;
+            events_table.insert(seq_bytes, v2_bytes.as_slice())?;
+        }
+
+        debug!(count = entries.len(), "Migrated WAL records to v2");
+        Ok(())
     }
 
     /// Returns the embedding dimension configured for this database.
@@ -367,6 +493,14 @@ impl StorageEngine for RedbStorage {
             let mut table = write_txn.open_table(COLLECTIVES_TABLE)?;
             table.insert(collective.id.as_bytes(), bytes.as_slice())?;
         }
+        self.increment_wal_and_record(
+            &write_txn,
+            collective.id.as_bytes(),
+            collective.id,
+            EntityTypeTag::Collective,
+            WatchEventTypeTag::Created,
+            collective.created_at,
+        )?;
         write_txn.commit().map_err(StorageError::from)?;
 
         debug!(id = %collective.id, name = %collective.name, "Collective saved");
@@ -624,8 +758,9 @@ impl StorageEngine for RedbStorage {
         // Record WAL event for cross-process change detection
         self.increment_wal_and_record(
             &write_txn,
-            experience.id,
+            experience.id.as_bytes(),
             experience.collective_id,
+            EntityTypeTag::Experience,
             WatchEventTypeTag::Created,
             experience.timestamp,
         )?;
@@ -714,7 +849,14 @@ impl StorageEngine for RedbStorage {
         } else {
             WatchEventTypeTag::Updated
         };
-        self.increment_wal_and_record(&write_txn, id, collective_id, event_type, timestamp)?;
+        self.increment_wal_and_record(
+            &write_txn,
+            id.as_bytes(),
+            collective_id,
+            EntityTypeTag::Experience,
+            event_type,
+            timestamp,
+        )?;
         write_txn.commit().map_err(StorageError::from)?;
 
         debug!(id = %id, "Experience updated");
@@ -769,8 +911,9 @@ impl StorageEngine for RedbStorage {
         // Record WAL event for cross-process change detection
         self.increment_wal_and_record(
             &write_txn,
-            id,
+            id.as_bytes(),
             collective_id,
+            EntityTypeTag::Experience,
             WatchEventTypeTag::Deleted,
             timestamp,
         )?;
@@ -807,8 +950,9 @@ impl StorageEngine for RedbStorage {
         // Record WAL event for cross-process change detection
         self.increment_wal_and_record(
             &write_txn,
-            id,
+            id.as_bytes(),
             collective_id,
+            EntityTypeTag::Experience,
             WatchEventTypeTag::Updated,
             timestamp,
         )?;
@@ -863,6 +1007,26 @@ impl StorageEngine for RedbStorage {
             let mut table = write_txn.open_multimap_table(RELATIONS_BY_TARGET_TABLE)?;
             table.insert(relation.target_id.as_bytes(), relation.id.as_bytes())?;
         }
+        // Look up collective_id from source experience for WAL record
+        let collective_id = {
+            let exp_table = write_txn.open_table(EXPERIENCES_TABLE)?;
+            let entry = exp_table
+                .get(relation.source_id.as_bytes())?
+                .ok_or_else(|| {
+                    StorageError::corrupted("relation source experience not found for WAL record")
+                })?;
+            let exp: Experience = bincode::deserialize(entry.value())
+                .map_err(|e| StorageError::serialization(e.to_string()))?;
+            exp.collective_id
+        };
+        self.increment_wal_and_record(
+            &write_txn,
+            relation.id.as_bytes(),
+            collective_id,
+            EntityTypeTag::Relation,
+            WatchEventTypeTag::Created,
+            relation.created_at,
+        )?;
         write_txn.commit().map_err(StorageError::from)?;
 
         debug!(id = %relation.id, "Relation saved");
@@ -885,15 +1049,27 @@ impl StorageEngine for RedbStorage {
 
     fn delete_relation(&self, id: RelationId) -> Result<bool> {
         // Read the relation first to get source/target IDs for index cleanup
-        let (source_id, target_id) = {
+        // and source experience's collective_id for WAL record
+        let (source_id, target_id, collective_id) = {
             let read_txn = self.db.begin_read().map_err(StorageError::from)?;
-            let table = read_txn.open_table(RELATIONS_TABLE)?;
+            let rel_table = read_txn.open_table(RELATIONS_TABLE)?;
 
-            match table.get(id.as_bytes())? {
+            match rel_table.get(id.as_bytes())? {
                 Some(entry) => {
                     let rel: ExperienceRelation = bincode::deserialize(entry.value())
                         .map_err(|e| StorageError::serialization(e.to_string()))?;
-                    (rel.source_id, rel.target_id)
+                    // Look up collective_id from source experience
+                    let exp_table = read_txn.open_table(EXPERIENCES_TABLE)?;
+                    let cid = match exp_table.get(rel.source_id.as_bytes())? {
+                        Some(exp_entry) => {
+                            let exp: Experience = bincode::deserialize(exp_entry.value())
+                                .map_err(|e| StorageError::serialization(e.to_string()))?;
+                            exp.collective_id
+                        }
+                        // Source experience may have been deleted; use nil collective
+                        None => CollectiveId::nil(),
+                    };
+                    (rel.source_id, rel.target_id, cid)
                 }
                 None => return Ok(false),
             }
@@ -913,6 +1089,14 @@ impl StorageEngine for RedbStorage {
             let mut table = write_txn.open_multimap_table(RELATIONS_BY_TARGET_TABLE)?;
             table.remove(target_id.as_bytes(), id.as_bytes())?;
         }
+        self.increment_wal_and_record(
+            &write_txn,
+            id.as_bytes(),
+            collective_id,
+            EntityTypeTag::Relation,
+            WatchEventTypeTag::Deleted,
+            Timestamp::now(),
+        )?;
         write_txn.commit().map_err(StorageError::from)?;
 
         debug!(id = %id, "Relation deleted");
@@ -1066,6 +1250,14 @@ impl StorageEngine for RedbStorage {
             let mut table = write_txn.open_multimap_table(INSIGHTS_BY_COLLECTIVE_TABLE)?;
             table.insert(insight.collective_id.as_bytes(), insight.id.as_bytes())?;
         }
+        self.increment_wal_and_record(
+            &write_txn,
+            insight.id.as_bytes(),
+            insight.collective_id,
+            EntityTypeTag::Insight,
+            WatchEventTypeTag::Created,
+            insight.created_at,
+        )?;
         write_txn.commit().map_err(StorageError::from)?;
 
         debug!(id = %insight.id, collective_id = %insight.collective_id, "Insight saved");
@@ -1112,6 +1304,14 @@ impl StorageEngine for RedbStorage {
             let mut table = write_txn.open_multimap_table(INSIGHTS_BY_COLLECTIVE_TABLE)?;
             table.remove(collective_id.as_bytes(), id.as_bytes())?;
         }
+        self.increment_wal_and_record(
+            &write_txn,
+            id.as_bytes(),
+            collective_id,
+            EntityTypeTag::Insight,
+            WatchEventTypeTag::Deleted,
+            Timestamp::now(),
+        )?;
         write_txn.commit().map_err(StorageError::from)?;
 
         debug!(id = %id, "Insight deleted");
@@ -1341,6 +1541,133 @@ impl StorageEngine for RedbStorage {
         }
 
         Ok((events, max_seq))
+    }
+
+    // =========================================================================
+    // Sync Operations (feature: sync)
+    // =========================================================================
+
+    #[cfg(feature = "sync")]
+    fn poll_sync_events(
+        &self,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, WatchEventRecord)>> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let events_table = read_txn.open_table(WATCH_EVENTS_TABLE)?;
+
+        let start_key = (since_seq + 1).to_be_bytes();
+        let end_key = u64::MAX.to_be_bytes();
+        let mut events = Vec::new();
+
+        for entry in events_table.range::<&[u8; 8]>(&start_key..=&end_key)? {
+            let (key, value) = entry.map_err(StorageError::from)?;
+            let seq = u64::from_be_bytes(*key.value());
+            let record: WatchEventRecord = bincode::deserialize(value.value())
+                .map_err(|e| StorageError::serialization(e.to_string()))?;
+            events.push((seq, record));
+            if events.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(events)
+    }
+
+    #[cfg(feature = "sync")]
+    fn instance_id(&self) -> crate::sync::InstanceId {
+        self.instance_id
+    }
+
+    #[cfg(feature = "sync")]
+    fn save_sync_cursor(&self, cursor: &crate::sync::SyncCursor) -> Result<()> {
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        {
+            let mut table = write_txn.open_table(SYNC_CURSORS_TABLE)?;
+            let bytes = bincode::serialize(cursor)
+                .map_err(|e| StorageError::serialization(e.to_string()))?;
+            table.insert(cursor.instance_id.as_bytes(), bytes.as_slice())?;
+        }
+        write_txn.commit().map_err(StorageError::from)?;
+        debug!(
+            peer = %cursor.instance_id,
+            last_sequence = cursor.last_sequence,
+            "Saved sync cursor"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "sync")]
+    fn load_sync_cursor(
+        &self,
+        instance_id: &crate::sync::InstanceId,
+    ) -> Result<Option<crate::sync::SyncCursor>> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let table = read_txn.open_table(SYNC_CURSORS_TABLE)?;
+        match table.get(instance_id.as_bytes())? {
+            Some(entry) => {
+                let cursor: crate::sync::SyncCursor = bincode::deserialize(entry.value())
+                    .map_err(|e| StorageError::serialization(e.to_string()))?;
+                Ok(Some(cursor))
+            }
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    fn list_sync_cursors(&self) -> Result<Vec<crate::sync::SyncCursor>> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let table = read_txn.open_table(SYNC_CURSORS_TABLE)?;
+        let mut cursors = Vec::new();
+        for entry in table.iter()? {
+            let (_, value) = entry.map_err(StorageError::from)?;
+            let cursor: crate::sync::SyncCursor = bincode::deserialize(value.value())
+                .map_err(|e| StorageError::serialization(e.to_string()))?;
+            cursors.push(cursor);
+        }
+        Ok(cursors)
+    }
+
+    #[cfg(feature = "sync")]
+    fn compact_wal_events(&self, up_to_seq: u64) -> Result<u64> {
+        if up_to_seq == 0 {
+            return Ok(0);
+        }
+
+        // Collect keys to delete in a read pass
+        let keys_to_delete: Vec<[u8; 8]> = {
+            let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+            let events_table = read_txn.open_table(WATCH_EVENTS_TABLE)?;
+
+            let start_key = 1u64.to_be_bytes();
+            let end_key = up_to_seq.to_be_bytes();
+            let mut keys = Vec::new();
+
+            for entry in events_table.range::<&[u8; 8]>(&start_key..=&end_key)? {
+                let (key, _) = entry.map_err(StorageError::from)?;
+                keys.push(*key.value());
+            }
+            keys
+        };
+
+        if keys_to_delete.is_empty() {
+            return Ok(0);
+        }
+
+        let count = keys_to_delete.len() as u64;
+
+        // Delete in a write transaction
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        {
+            let mut events_table = write_txn.open_table(WATCH_EVENTS_TABLE)?;
+            for key in &keys_to_delete {
+                events_table.remove(key)?;
+            }
+        }
+        write_txn.commit().map_err(StorageError::from)?;
+
+        debug!(count, up_to_seq, "Compacted WAL events");
+        Ok(count)
     }
 }
 
@@ -2343,14 +2670,16 @@ mod tests {
 
         let collective = Collective::new("test", 384);
         storage.save_collective(&collective).unwrap();
+        // save_collective now records WAL event #1
+        assert_eq!(storage.get_wal_sequence().unwrap(), 1);
 
         let exp1 = test_experience(collective.id, 384);
         storage.save_experience(&exp1).unwrap();
-        assert_eq!(storage.get_wal_sequence().unwrap(), 1);
+        assert_eq!(storage.get_wal_sequence().unwrap(), 2);
 
         let exp2 = test_experience(collective.id, 384);
         storage.save_experience(&exp2).unwrap();
-        assert_eq!(storage.get_wal_sequence().unwrap(), 2);
+        assert_eq!(storage.get_wal_sequence().unwrap(), 3);
 
         Box::new(storage).close().unwrap();
     }
@@ -2363,6 +2692,7 @@ mod tests {
 
         let collective = Collective::new("test", 384);
         storage.save_collective(&collective).unwrap();
+        // Collective creates WAL event #1
 
         let exp1 = test_experience(collective.id, 384);
         let exp2 = test_experience(collective.id, 384);
@@ -2371,17 +2701,18 @@ mod tests {
         storage.save_experience(&exp2).unwrap();
         storage.save_experience(&exp3).unwrap();
 
+        // Poll all events (collective + 3 experiences = 4 total)
         let (events, max_seq) = storage.poll_watch_events(0, 100).unwrap();
-        assert_eq!(events.len(), 3);
-        assert_eq!(max_seq, 3);
-        // All should be Created events
+        assert_eq!(events.len(), 4);
+        assert_eq!(max_seq, 4);
+        // First event is collective creation, rest are experience creations
         assert!(events
             .iter()
             .all(|e| e.event_type == WatchEventTypeTag::Created));
-        // IDs should match in order
-        assert_eq!(events[0].experience_id, *exp1.id.as_bytes());
-        assert_eq!(events[1].experience_id, *exp2.id.as_bytes());
-        assert_eq!(events[2].experience_id, *exp3.id.as_bytes());
+        // Skip collective event (index 0), experience IDs should match
+        assert_eq!(events[1].entity_id, *exp1.id.as_bytes());
+        assert_eq!(events[2].entity_id, *exp2.id.as_bytes());
+        assert_eq!(events[3].entity_id, *exp3.id.as_bytes());
 
         Box::new(storage).close().unwrap();
     }
@@ -2401,10 +2732,11 @@ mod tests {
             storage.save_experience(&exp).unwrap();
         }
 
-        // Poll from seq 3 — should get 2 events (seq 4 and 5)
-        let (events, max_seq) = storage.poll_watch_events(3, 100).unwrap();
+        // Collective = seq 1, 5 experiences = seq 2-6. Total = 6.
+        // Poll from seq 4 — should get 2 events (seq 5 and 6)
+        let (events, max_seq) = storage.poll_watch_events(4, 100).unwrap();
         assert_eq!(events.len(), 2);
-        assert_eq!(max_seq, 5);
+        assert_eq!(max_seq, 6);
 
         Box::new(storage).close().unwrap();
     }
@@ -2421,15 +2753,15 @@ mod tests {
         let exp = test_experience(collective.id, 384);
         storage.save_experience(&exp).unwrap();
 
-        // Poll everything
+        // Poll everything (collective + experience = 2 events)
         let (events, max_seq) = storage.poll_watch_events(0, 100).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(max_seq, 1);
+        assert_eq!(events.len(), 2);
+        assert_eq!(max_seq, 2);
 
         // Poll again from same position — empty
-        let (events, max_seq) = storage.poll_watch_events(1, 100).unwrap();
+        let (events, max_seq) = storage.poll_watch_events(2, 100).unwrap();
         assert_eq!(events.len(), 0);
-        assert_eq!(max_seq, 1); // stays the same
+        assert_eq!(max_seq, 2); // stays the same
 
         Box::new(storage).close().unwrap();
     }
@@ -2447,12 +2779,14 @@ mod tests {
         storage.save_experience(&exp).unwrap();
         storage.delete_experience(exp.id).unwrap();
 
+        // Collective(1) + Created(2) + Deleted(3) = 3 events
         let (events, max_seq) = storage.poll_watch_events(0, 100).unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(max_seq, 2);
-        assert_eq!(events[0].event_type, WatchEventTypeTag::Created);
-        assert_eq!(events[1].event_type, WatchEventTypeTag::Deleted);
-        assert_eq!(events[1].experience_id, *exp.id.as_bytes());
+        assert_eq!(events.len(), 3);
+        assert_eq!(max_seq, 3);
+        assert_eq!(events[0].event_type, WatchEventTypeTag::Created); // collective
+        assert_eq!(events[1].event_type, WatchEventTypeTag::Created); // experience
+        assert_eq!(events[2].event_type, WatchEventTypeTag::Deleted); // experience deleted
+        assert_eq!(events[2].entity_id, *exp.id.as_bytes());
 
         Box::new(storage).close().unwrap();
     }
@@ -2475,9 +2809,10 @@ mod tests {
         };
         storage.update_experience(exp.id, &update).unwrap();
 
+        // Collective(1) + Created(2) + Updated(3) = 3 events
         let (events, _) = storage.poll_watch_events(0, 100).unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[1].event_type, WatchEventTypeTag::Updated);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[2].event_type, WatchEventTypeTag::Updated);
 
         Box::new(storage).close().unwrap();
     }
@@ -2495,10 +2830,11 @@ mod tests {
         storage.save_experience(&exp).unwrap();
         storage.reinforce_experience(exp.id).unwrap();
 
+        // Collective(1) + Created(2) + Updated(3) = 3 events
         let (events, _) = storage.poll_watch_events(0, 100).unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type, WatchEventTypeTag::Created);
-        assert_eq!(events[1].event_type, WatchEventTypeTag::Updated);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[1].event_type, WatchEventTypeTag::Created);
+        assert_eq!(events[2].event_type, WatchEventTypeTag::Updated);
 
         Box::new(storage).close().unwrap();
     }
@@ -2521,9 +2857,10 @@ mod tests {
         };
         storage.update_experience(exp.id, &update).unwrap();
 
+        // Collective(1) + Created(2) + Archived(3) = 3 events
         let (events, _) = storage.poll_watch_events(0, 100).unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[1].event_type, WatchEventTypeTag::Archived);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[2].event_type, WatchEventTypeTag::Archived);
 
         Box::new(storage).close().unwrap();
     }

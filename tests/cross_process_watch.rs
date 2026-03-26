@@ -51,14 +51,15 @@ fn test_get_current_sequence_starts_at_zero() {
 fn test_get_current_sequence_returns_latest() {
     let (db, cid, _dir) = open_db_with_collective();
 
-    db.record_experience(minimal_experience(cid)).unwrap();
-    assert_eq!(db.get_current_sequence().unwrap(), 1);
-
+    // Collective creation is WAL event #1
     db.record_experience(minimal_experience(cid)).unwrap();
     assert_eq!(db.get_current_sequence().unwrap(), 2);
 
     db.record_experience(minimal_experience(cid)).unwrap();
     assert_eq!(db.get_current_sequence().unwrap(), 3);
+
+    db.record_experience(minimal_experience(cid)).unwrap();
+    assert_eq!(db.get_current_sequence().unwrap(), 4);
 }
 
 // ============================================================================
@@ -80,9 +81,10 @@ fn test_poll_changes_after_record() {
 
     let exp_id = db.record_experience(minimal_experience(cid)).unwrap();
 
+    // Collective creation is WAL event #1; experience is #2
     let (events, seq) = db.poll_changes(0).unwrap();
-    assert_eq!(events.len(), 1);
-    assert_eq!(seq, 1);
+    assert_eq!(events.len(), 1); // Only experience events (filtered)
+    assert_eq!(seq, 2); // Seq includes collective event
 
     let event = &events[0];
     assert_eq!(event.experience_id, exp_id);
@@ -94,29 +96,29 @@ fn test_poll_changes_after_record() {
 fn test_poll_changes_incremental() {
     let (db, cid, _dir) = open_db_with_collective();
 
-    // Record 3 experiences
+    // Record 3 experiences (collective = seq 1, exps = seq 2,3,4)
     db.record_experience(minimal_experience(cid)).unwrap();
     db.record_experience(minimal_experience(cid)).unwrap();
     db.record_experience(minimal_experience(cid)).unwrap();
 
-    // First poll: get all 3
+    // First poll: get 3 experience events (filtered from 4 total)
     let (events, seq) = db.poll_changes(0).unwrap();
     assert_eq!(events.len(), 3);
-    assert_eq!(seq, 3);
+    assert_eq!(seq, 4);
 
-    // Record 2 more
+    // Record 2 more (seq 5,6)
     db.record_experience(minimal_experience(cid)).unwrap();
     db.record_experience(minimal_experience(cid)).unwrap();
 
-    // Second poll: only 2 new events
-    let (events, seq) = db.poll_changes(3).unwrap();
+    // Second poll: only 2 new experience events
+    let (events, seq) = db.poll_changes(4).unwrap();
     assert_eq!(events.len(), 2);
-    assert_eq!(seq, 5);
+    assert_eq!(seq, 6);
 
     // Third poll: no new events
-    let (events, seq) = db.poll_changes(5).unwrap();
+    let (events, seq) = db.poll_changes(6).unwrap();
     assert_eq!(events.len(), 0);
-    assert_eq!(seq, 5);
+    assert_eq!(seq, 6);
 }
 
 #[test]
@@ -162,9 +164,10 @@ fn test_poll_changes_mixed_operations() {
     // Delete
     db.delete_experience(exp_id).unwrap();
 
+    // Collective(1) + 6 experience events = 7 total, 6 experience-only
     let (events, seq) = db.poll_changes(0).unwrap();
     assert_eq!(events.len(), 6);
-    assert_eq!(seq, 6);
+    assert_eq!(seq, 7);
 
     assert_eq!(events[0].event_type, WatchEventType::Created);
     assert_eq!(events[1].event_type, WatchEventType::Updated); // importance change
@@ -183,20 +186,28 @@ fn test_poll_changes_batch_limit() {
         db.record_experience(minimal_experience(cid)).unwrap();
     }
 
-    // Poll with batch limit of 3
+    // Collective = seq 1, 10 experiences = seq 2-11. Total 11 WAL events.
+    // poll_changes_batch filters to experience-only but batch_limit applies
+    // to the storage-level poll (which includes all entity types).
+    // Batch limit 3 gets WAL events 1-3 (collective + 2 experiences) → 2 exp events
     let (events, seq) = db.poll_changes_batch(0, 3).unwrap();
-    assert_eq!(events.len(), 3);
+    assert_eq!(events.len(), 2);
     assert_eq!(seq, 3);
 
-    // Continue
+    // Continue from seq 3: gets events 4-6 (3 experiences) → 3 exp events
     let (events, seq) = db.poll_changes_batch(3, 3).unwrap();
     assert_eq!(events.len(), 3);
     assert_eq!(seq, 6);
 
-    // Get remaining
-    let (events, seq) = db.poll_changes_batch(6, 100).unwrap();
-    assert_eq!(events.len(), 4);
-    assert_eq!(seq, 10);
+    // Continue: events 7-9 (3 experiences) → 3 exp events
+    let (events, seq) = db.poll_changes_batch(6, 3).unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(seq, 9);
+
+    // Get remaining: events 10-11 (2 experiences) → 2 exp events
+    let (events, seq) = db.poll_changes_batch(9, 100).unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(seq, 11);
 }
 
 #[test]
@@ -213,7 +224,8 @@ fn test_sequence_survives_close_reopen() {
         db.record_experience(minimal_experience(cid)).unwrap();
         db.record_experience(minimal_experience(cid)).unwrap();
 
-        assert_eq!(db.get_current_sequence().unwrap(), 3);
+        // Collective(1) + 3 experiences(2,3,4) = seq 4
+        assert_eq!(db.get_current_sequence().unwrap(), 4);
         db.close().unwrap();
     }
 
@@ -222,19 +234,19 @@ fn test_sequence_survives_close_reopen() {
         let db = PulseDB::open(&path, Config::default()).unwrap();
 
         // Sequence should persist
-        assert_eq!(db.get_current_sequence().unwrap(), 3);
+        assert_eq!(db.get_current_sequence().unwrap(), 4);
 
-        // Events should be retrievable
+        // Events should be retrievable (3 experience events, filtered)
         let (events, seq) = db.poll_changes(0).unwrap();
         assert_eq!(events.len(), 3);
-        assert_eq!(seq, 3);
+        assert_eq!(seq, 4);
         assert!(events
             .iter()
             .all(|e| e.event_type == WatchEventType::Created));
 
-        // New writes continue from 3
+        // New writes continue from 4
         db.record_experience(minimal_experience(cid)).unwrap();
-        assert_eq!(db.get_current_sequence().unwrap(), 4);
+        assert_eq!(db.get_current_sequence().unwrap(), 5);
 
         db.close().unwrap();
     }
@@ -252,10 +264,11 @@ fn test_poll_changes_collective_isolation() {
     db.record_experience(minimal_experience(cid_b)).unwrap();
     db.record_experience(minimal_experience(cid_a)).unwrap();
 
-    // poll_changes returns ALL events (cross-collective) — the WAL is global
+    // poll_changes returns experience events (cross-collective) — the WAL is global
+    // 2 collectives (seq 1,2) + 3 experiences (seq 3,4,5) → 3 experience events
     let (events, seq) = db.poll_changes(0).unwrap();
     assert_eq!(events.len(), 3);
-    assert_eq!(seq, 3);
+    assert_eq!(seq, 5);
 
     // But each event has the correct collective_id
     assert_eq!(events[0].collective_id, cid_a);

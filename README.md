@@ -54,14 +54,21 @@ db.close()?;
 
 ```toml
 [dependencies]
-pulsehive-db = "0.1"
+pulsehive-db = "0.3"
 ```
 
-With built-in embedding generation (no external embedding service needed):
+With built-in embedding generation:
 
 ```toml
 [dependencies]
-pulsehive-db = { version = "0.1", features = ["builtin-embeddings"] }
+pulsehive-db = { version = "0.3", features = ["builtin-embeddings"] }
+```
+
+With distributed sync (HTTP transport):
+
+```toml
+[dependencies]
+pulsehive-db = { version = "0.3", features = ["sync-http"] }
 ```
 
 > **Note:** The crate is published as `pulsehive-db` on crates.io but imported as `use pulsedb::...` in Rust code.
@@ -78,6 +85,32 @@ pulsehive-db = { version = "0.1", features = ["builtin-embeddings"] }
 - **Optional ONNX embeddings** — Built-in all-MiniLM-L6-v2 (384d) with automatic model download (`builtin-embeddings` feature)
 - **ACID transactions** — redb-backed storage with crash safety via shadow paging
 - **Async integration** — `SubstrateProvider` trait with `tokio::spawn_blocking` wrappers for async agent frameworks
+- **Distributed sync** — Native sync protocol for multi-instance PulseDB (push/pull/bidirectional, HTTP transport, conflict resolution)
+
+## Distributed Sync
+
+PulseDB instances can sync knowledge across a network — a desktop PulseDB syncing with a server-side PulseDB. Requires the `sync` feature.
+
+```text
+Desktop (Tauri)                    Server (Axum)
+┌──────────────────┐              ┌──────────────────┐
+│  PulseDB (local) │              │  PulseDB (server)│
+│  ┌─────────────┐ │   push/pull  │  ┌─────────────┐ │
+│  │ SyncManager │◄├─────────────►├──│ SyncServer  │ │
+│  │ (background)│ │  HTTP/bincode│  │ (Axum)      │ │
+│  └─────────────┘ │              │  └─────────────┘ │
+└──────────────────┘              └──────────────────┘
+```
+
+**Feature flags:** `sync` (core engine), `sync-http` (HTTP transport + server helper)
+
+**Key capabilities:**
+- Background push/pull loops with configurable intervals
+- Conflict resolution: `ServerWins` or `LastWriteWins`
+- Echo prevention (synced changes don't loop back)
+- WAL compaction to reclaim disk space
+- Initial sync catchup with progress callback
+- Pluggable transport trait (HTTP, in-memory for testing, custom)
 
 ## Performance
 
@@ -138,6 +171,7 @@ Run benchmarks yourself: `cargo bench`
 | Real-time watch | Yes | No | No | No | No | No |
 | Context assembly | Yes | No | No | No | No | No |
 | ACID transactions | Yes | Yes | Yes | No | No | No |
+| Native sync protocol | Yes | No | No | No | No | No |
 | Language | Rust | SQL | C/SQL | Rust | Python | Rust |
 
 ## Key Concepts

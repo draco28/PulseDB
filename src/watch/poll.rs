@@ -18,6 +18,7 @@
 //! ```
 
 use crate::error::Result;
+use crate::storage::schema::EntityTypeTag;
 use crate::storage::StorageEngine;
 use crate::watch::WatchEvent;
 
@@ -97,6 +98,10 @@ impl ChangePoller {
     /// Returns new [`WatchEvent`]s in sequence order and advances the
     /// internal cursor. Returns an empty vec if no new changes exist.
     ///
+    /// **Backward compatibility**: Only returns Experience-type events.
+    /// Non-experience WAL events (relations, insights, collectives) are
+    /// skipped but the cursor still advances past them.
+    ///
     /// # Performance
     ///
     /// Target: < 10ms per call. This performs a range scan on the
@@ -105,7 +110,30 @@ impl ChangePoller {
     pub fn poll(&mut self, storage: &dyn StorageEngine) -> Result<Vec<WatchEvent>> {
         let (records, new_seq) = storage.poll_watch_events(self.last_seq, self.batch_limit)?;
         self.last_seq = new_seq;
-        Ok(records.into_iter().map(WatchEvent::from).collect())
+        Ok(records
+            .into_iter()
+            .filter(|r| r.entity_type == EntityTypeTag::Experience)
+            .map(WatchEvent::from)
+            .collect())
+    }
+
+    /// Polls for ALL entity changes since the last call (sync protocol).
+    ///
+    /// Unlike [`poll()`](Self::poll) which only returns Experience events,
+    /// this method returns all entity types with their WAL sequence numbers.
+    /// Used by the sync pusher (Phase 3) to construct `SyncChange` objects.
+    ///
+    /// Returns `(sequence, record)` pairs in ascending sequence order.
+    #[cfg(feature = "sync")]
+    pub fn poll_sync_events(
+        &mut self,
+        storage: &dyn StorageEngine,
+    ) -> Result<Vec<(u64, crate::storage::schema::WatchEventRecord)>> {
+        let events = storage.poll_sync_events(self.last_seq, self.batch_limit)?;
+        if let Some((last_seq, _)) = events.last() {
+            self.last_seq = *last_seq;
+        }
+        Ok(events)
     }
 }
 

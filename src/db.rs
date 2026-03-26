@@ -62,6 +62,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+#[cfg(feature = "sync")]
+use tracing::debug;
 use tracing::{info, instrument, warn};
 
 use crate::activity::{validate_new_activity, Activity, NewActivity};
@@ -75,8 +77,12 @@ use crate::experience::{
     NewExperience,
 };
 use crate::insight::{validate_new_insight, DerivedInsight, NewDerivedInsight};
+#[cfg(feature = "sync")]
+use crate::relation::ExperienceRelation;
 use crate::search::{ContextCandidates, ContextRequest, SearchFilter, SearchResult};
 use crate::storage::{open_storage, DatabaseMetadata, StorageEngine};
+#[cfg(feature = "sync")]
+use crate::types::RelationId;
 use crate::types::{CollectiveId, ExperienceId, InsightId, Timestamp};
 use crate::vector::HnswIndex;
 use crate::watch::{WatchEvent, WatchEventType, WatchFilter, WatchService, WatchStream};
@@ -2179,8 +2185,13 @@ impl PulseDB {
     /// # }
     /// ```
     pub fn poll_changes(&self, since_seq: u64) -> Result<(Vec<WatchEvent>, u64)> {
+        use crate::storage::schema::EntityTypeTag;
         let (records, new_seq) = self.storage.poll_watch_events(since_seq, 1000)?;
-        let events = records.into_iter().map(WatchEvent::from).collect();
+        let events = records
+            .into_iter()
+            .filter(|r| r.entity_type == EntityTypeTag::Experience)
+            .map(WatchEvent::from)
+            .collect();
         Ok((events, new_seq))
     }
 
@@ -2193,9 +2204,246 @@ impl PulseDB {
         since_seq: u64,
         limit: usize,
     ) -> Result<(Vec<WatchEvent>, u64)> {
+        use crate::storage::schema::EntityTypeTag;
         let (records, new_seq) = self.storage.poll_watch_events(since_seq, limit)?;
-        let events = records.into_iter().map(WatchEvent::from).collect();
+        let events = records
+            .into_iter()
+            .filter(|r| r.entity_type == EntityTypeTag::Experience)
+            .map(WatchEvent::from)
+            .collect();
         Ok((events, new_seq))
+    }
+
+    // =========================================================================
+    // Sync WAL Compaction (feature: sync)
+    // =========================================================================
+
+    /// Compacts the WAL by removing events that all peers have already synced.
+    ///
+    /// Finds the minimum cursor across all known peers and deletes WAL events
+    /// up to that sequence. If no peers exist, no compaction occurs (events
+    /// may be needed when a peer connects later).
+    ///
+    /// Call this periodically (e.g., daily) to reclaim disk space.
+    /// Returns the number of WAL events deleted.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # fn main() -> pulsedb::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())?;
+    /// let deleted = db.compact_wal()?;
+    /// println!("Compacted {} WAL events", deleted);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "sync")]
+    pub fn compact_wal(&self) -> Result<u64> {
+        let cursors = self
+            .storage
+            .list_sync_cursors()
+            .map_err(|e| PulseDBError::internal(format!("Failed to list sync cursors: {}", e)))?;
+
+        if cursors.is_empty() {
+            // No peers — don't compact (events may be needed later)
+            return Ok(0);
+        }
+
+        let min_seq = cursors.iter().map(|c| c.last_sequence).min().unwrap_or(0);
+
+        if min_seq == 0 {
+            return Ok(0);
+        }
+
+        let deleted = self.storage.compact_wal_events(min_seq)?;
+        info!(deleted, min_seq, "WAL compacted");
+        Ok(deleted)
+    }
+
+    // =========================================================================
+    // Sync Apply Methods (feature: sync)
+    // =========================================================================
+    //
+    // These methods apply remote changes received via sync. They bypass
+    // validation and embedding generation (data was validated on the source).
+    // WAL recording is suppressed by the SyncApplyGuard (entered by the caller).
+    // Watch emit is skipped (no in-process notifications for sync changes).
+    //
+    // These are pub(crate) and will be called by the sync applier in Phase 3.
+
+    /// Applies a synced experience from a remote peer.
+    ///
+    /// Writes the full experience to storage and inserts into HNSW.
+    /// Caller must hold `SyncApplyGuard` to suppress WAL recording.
+    #[cfg(feature = "sync")]
+    #[allow(dead_code)] // Called by sync applier (Phase 3)
+    pub fn apply_synced_experience(&self, experience: Experience) -> Result<()> {
+        let collective_id = experience.collective_id;
+        let id = experience.id;
+        let embedding = experience.embedding.clone();
+
+        self.storage.save_experience(&experience)?;
+
+        // Insert into HNSW index
+        let vectors = self
+            .vectors
+            .read()
+            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
+        if let Some(index) = vectors.get(&collective_id) {
+            index.insert_experience(id, &embedding)?;
+        }
+
+        debug!(id = %id, "Synced experience applied");
+        Ok(())
+    }
+
+    /// Applies a synced experience update from a remote peer.
+    ///
+    /// Caller must hold `SyncApplyGuard` to suppress WAL recording.
+    #[cfg(feature = "sync")]
+    #[allow(dead_code)] // Called by sync applier (Phase 3)
+    pub fn apply_synced_experience_update(
+        &self,
+        id: ExperienceId,
+        update: ExperienceUpdate,
+    ) -> Result<()> {
+        self.storage.update_experience(id, &update)?;
+        debug!(id = %id, "Synced experience update applied");
+        Ok(())
+    }
+
+    /// Applies a synced experience deletion from a remote peer.
+    ///
+    /// Removes from storage and soft-deletes from HNSW.
+    /// Caller must hold `SyncApplyGuard` to suppress WAL recording.
+    #[cfg(feature = "sync")]
+    #[allow(dead_code)] // Called by sync applier (Phase 3)
+    pub fn apply_synced_experience_delete(&self, id: ExperienceId) -> Result<()> {
+        // Get collective_id for HNSW lookup before deleting
+        if let Some(exp) = self.storage.get_experience(id)? {
+            let collective_id = exp.collective_id;
+
+            // Cascade delete relations
+            self.storage.delete_relations_for_experience(id)?;
+
+            self.storage.delete_experience(id)?;
+
+            // Soft-delete from HNSW
+            let vectors = self
+                .vectors
+                .read()
+                .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
+            if let Some(index) = vectors.get(&collective_id) {
+                index.delete_experience(id)?;
+            }
+        }
+
+        debug!(id = %id, "Synced experience delete applied");
+        Ok(())
+    }
+
+    /// Applies a synced relation from a remote peer.
+    ///
+    /// Caller must hold `SyncApplyGuard` to suppress WAL recording.
+    #[cfg(feature = "sync")]
+    #[allow(dead_code)] // Called by sync applier (Phase 3)
+    pub fn apply_synced_relation(&self, relation: ExperienceRelation) -> Result<()> {
+        let id = relation.id;
+        self.storage.save_relation(&relation)?;
+        debug!(id = %id, "Synced relation applied");
+        Ok(())
+    }
+
+    /// Applies a synced relation deletion from a remote peer.
+    ///
+    /// Caller must hold `SyncApplyGuard` to suppress WAL recording.
+    #[cfg(feature = "sync")]
+    #[allow(dead_code)] // Called by sync applier (Phase 3)
+    pub fn apply_synced_relation_delete(&self, id: RelationId) -> Result<()> {
+        self.storage.delete_relation(id)?;
+        debug!(id = %id, "Synced relation delete applied");
+        Ok(())
+    }
+
+    /// Applies a synced insight from a remote peer.
+    ///
+    /// Writes to storage and inserts into insight HNSW index.
+    /// Caller must hold `SyncApplyGuard` to suppress WAL recording.
+    #[cfg(feature = "sync")]
+    #[allow(dead_code)] // Called by sync applier (Phase 3)
+    pub fn apply_synced_insight(&self, insight: DerivedInsight) -> Result<()> {
+        let id = insight.id;
+        let collective_id = insight.collective_id;
+        let embedding = insight.embedding.clone();
+
+        self.storage.save_insight(&insight)?;
+
+        // Insert into insight HNSW (using InsightId→ExperienceId byte conversion)
+        let exp_id = ExperienceId::from_bytes(*id.as_bytes());
+        let insight_vectors = self
+            .insight_vectors
+            .read()
+            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
+        if let Some(index) = insight_vectors.get(&collective_id) {
+            index.insert_experience(exp_id, &embedding)?;
+        }
+
+        debug!(id = %id, "Synced insight applied");
+        Ok(())
+    }
+
+    /// Applies a synced insight deletion from a remote peer.
+    ///
+    /// Removes from storage and soft-deletes from insight HNSW.
+    /// Caller must hold `SyncApplyGuard` to suppress WAL recording.
+    #[cfg(feature = "sync")]
+    #[allow(dead_code)] // Called by sync applier (Phase 3)
+    pub fn apply_synced_insight_delete(&self, id: InsightId) -> Result<()> {
+        if let Some(insight) = self.storage.get_insight(id)? {
+            self.storage.delete_insight(id)?;
+
+            // Soft-delete from insight HNSW
+            let exp_id = ExperienceId::from_bytes(*id.as_bytes());
+            let insight_vectors = self
+                .insight_vectors
+                .read()
+                .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
+            if let Some(index) = insight_vectors.get(&insight.collective_id) {
+                index.delete_experience(exp_id)?;
+            }
+        }
+
+        debug!(id = %id, "Synced insight delete applied");
+        Ok(())
+    }
+
+    /// Applies a synced collective from a remote peer.
+    ///
+    /// Writes to storage and creates HNSW indexes for the collective.
+    /// Caller must hold `SyncApplyGuard` to suppress WAL recording.
+    #[cfg(feature = "sync")]
+    #[allow(dead_code)] // Called by sync applier (Phase 3)
+    pub fn apply_synced_collective(&self, collective: Collective) -> Result<()> {
+        let id = collective.id;
+        let dimension = collective.embedding_dimension as usize;
+
+        self.storage.save_collective(&collective)?;
+
+        // Create HNSW indexes (same as create_collective)
+        let exp_index = crate::vector::HnswIndex::new(dimension, &self.config.hnsw);
+        let insight_index = crate::vector::HnswIndex::new(dimension, &self.config.hnsw);
+        self.vectors
+            .write()
+            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?
+            .insert(id, exp_index);
+        self.insight_vectors
+            .write()
+            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?
+            .insert(id, insight_index);
+
+        debug!(id = %id, "Synced collective applied");
+        Ok(())
     }
 }
 

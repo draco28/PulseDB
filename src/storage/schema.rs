@@ -41,8 +41,8 @@ use crate::types::Timestamp;
 /// Current schema version.
 ///
 /// Increment this when making breaking changes to the schema.
-/// The database will refuse to open if versions don't match.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Version 2 adds `entity_type` to `WatchEventRecord` for sync protocol support.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Maximum content size in bytes (100 KB).
 pub const MAX_CONTENT_SIZE: usize = 100 * 1024;
@@ -202,6 +202,31 @@ pub const ACTIVITIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new
 // Watch Events Tables (E4-S02)
 // ============================================================================
 
+// ============================================================================
+// Sync Metadata (feature: sync)
+// ============================================================================
+
+/// Metadata key for the instance ID (16-byte UUID v7).
+///
+/// Stored in `METADATA_TABLE` as raw 16 bytes. Generated on first open
+/// and persisted for the lifetime of the database. Used by the sync
+/// protocol to identify this PulseDB instance.
+#[cfg(feature = "sync")]
+pub const INSTANCE_ID_KEY: &str = "instance_id";
+
+/// Sync cursors table — per-peer sync position tracking.
+///
+/// Each entry records the last WAL sequence number successfully synced
+/// with a specific peer instance. Key is the peer's InstanceId (16 bytes),
+/// value is bincode-serialized `SyncCursor`.
+#[cfg(feature = "sync")]
+pub const SYNC_CURSORS_TABLE: TableDefinition<&[u8; 16], &[u8]> =
+    TableDefinition::new("sync_cursors");
+
+// ============================================================================
+// Watch Events Tables (E4-S02)
+// ============================================================================
+
 /// Metadata key for the current WAL sequence number.
 ///
 /// Stored in `METADATA_TABLE` as 8-byte big-endian `u64`.
@@ -223,25 +248,48 @@ pub const WAL_SEQUENCE_KEY: &str = "wal_sequence";
 pub const WATCH_EVENTS_TABLE: TableDefinition<&[u8; 8], &[u8]> =
     TableDefinition::new("watch_events");
 
-/// A persisted watch event for cross-process change detection.
+/// A persisted watch event for cross-process change detection (schema v2).
 ///
 /// This is the on-disk representation — compact and self-contained.
 /// Converted to the public `WatchEvent` type when returned to callers.
 ///
 /// Uses raw byte arrays for IDs (not UUID wrappers) to keep serialization
 /// simple and avoid coupling the storage format to the public type system.
+///
+/// # Schema v2 Changes
+///
+/// In v1, this struct only tracked experiences (`experience_id`). In v2,
+/// the field is renamed to `entity_id` and an `entity_type` discriminant
+/// is added to track all entity types (relations, insights, collectives).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WatchEventRecord {
-    /// The experience that changed (16-byte UUID).
-    pub experience_id: [u8; 16],
+    /// The entity that changed (16-byte UUID).
+    ///
+    /// For experiences this is an ExperienceId, for relations a RelationId, etc.
+    pub entity_id: [u8; 16],
 
-    /// The collective the experience belongs to (16-byte UUID).
+    /// The collective this entity belongs to (16-byte UUID).
     pub collective_id: [u8; 16],
 
     /// What kind of change occurred.
     pub event_type: WatchEventTypeTag,
 
     /// When the change occurred (milliseconds since Unix epoch).
+    pub timestamp_ms: i64,
+
+    /// What kind of entity changed (schema v2).
+    pub entity_type: EntityTypeTag,
+}
+
+/// Schema v1 watch event record (for migration deserialization only).
+///
+/// In v1, the WAL only tracked experience mutations. This struct matches
+/// the v1 bincode layout for reading old records during migration.
+#[derive(Deserialize)]
+pub(crate) struct WatchEventRecordV1 {
+    pub experience_id: [u8; 16],
+    pub collective_id: [u8; 16],
+    pub event_type: WatchEventTypeTag,
     pub timestamp_ms: i64,
 }
 
@@ -273,6 +321,43 @@ impl WatchEventTypeTag {
             1 => Some(Self::Updated),
             2 => Some(Self::Archived),
             3 => Some(Self::Deleted),
+            _ => None,
+        }
+    }
+}
+
+// ============================================================================
+// Entity Type Tag (schema v2)
+// ============================================================================
+
+/// Compact discriminant for entity types in WAL records.
+///
+/// Identifies what kind of entity a WAL event refers to. Added in schema v2
+/// to extend WAL tracking beyond just experiences.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum EntityTypeTag {
+    /// An experience entity.
+    #[default]
+    Experience = 0,
+    /// A relation between experiences.
+    Relation = 1,
+    /// A derived insight.
+    Insight = 2,
+    /// A collective.
+    Collective = 3,
+}
+
+impl EntityTypeTag {
+    /// Converts a raw byte to an EntityTypeTag.
+    ///
+    /// Returns `None` if the byte doesn't correspond to a known variant.
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Experience),
+            1 => Some(Self::Relation),
+            2 => Some(Self::Insight),
+            3 => Some(Self::Collective),
             _ => None,
         }
     }
@@ -536,7 +621,7 @@ mod tests {
 
     #[test]
     fn test_schema_version() {
-        assert_eq!(SCHEMA_VERSION, 1);
+        assert_eq!(SCHEMA_VERSION, 2);
     }
 
     #[test]

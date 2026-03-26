@@ -104,7 +104,7 @@ impl From<WatchEventTypeTag> for WatchEventType {
 impl From<WatchEventRecord> for WatchEvent {
     fn from(record: WatchEventRecord) -> Self {
         Self {
-            experience_id: ExperienceId::from_bytes(record.experience_id),
+            experience_id: ExperienceId::from_bytes(record.entity_id),
             collective_id: CollectiveId::from_bytes(record.collective_id),
             event_type: record.event_type.into(),
             timestamp: Timestamp::from_millis(record.timestamp_ms),
