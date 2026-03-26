@@ -397,6 +397,62 @@ pub trait StorageEngine: Send + Sync {
         since_seq: u64,
         limit: usize,
     ) -> Result<(Vec<schema::WatchEventRecord>, u64)>;
+
+    // =========================================================================
+    // Sync Operations (feature: sync)
+    // =========================================================================
+
+    /// Retrieves ALL watch events (all entity types) with their sequence numbers.
+    ///
+    /// Unlike `poll_watch_events()` which returns records without sequences,
+    /// this method returns `(sequence, record)` pairs needed by the sync
+    /// pusher to construct `SyncChange` objects.
+    #[cfg(feature = "sync")]
+    fn poll_sync_events(
+        &self,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, schema::WatchEventRecord)>>;
+
+    /// Returns the persistent instance ID for this database.
+    ///
+    /// Generated on first open and stable across restarts.
+    /// Used by the sync protocol to identify this PulseDB instance.
+    #[cfg(feature = "sync")]
+    fn instance_id(&self) -> crate::sync::InstanceId;
+
+    /// Saves a sync cursor for a peer instance.
+    ///
+    /// Upserts the cursor in the `SYNC_CURSORS_TABLE`.
+    #[cfg(feature = "sync")]
+    fn save_sync_cursor(&self, cursor: &crate::sync::SyncCursor) -> Result<()>;
+
+    /// Loads the sync cursor for a specific peer instance.
+    ///
+    /// Returns `None` if no cursor has been saved for this peer.
+    #[cfg(feature = "sync")]
+    fn load_sync_cursor(
+        &self,
+        instance_id: &crate::sync::InstanceId,
+    ) -> Result<Option<crate::sync::SyncCursor>>;
+
+    /// Lists all saved sync cursors.
+    ///
+    /// Returns cursors for all known peer instances.
+    #[cfg(feature = "sync")]
+    fn list_sync_cursors(&self) -> Result<Vec<crate::sync::SyncCursor>>;
+
+    /// Compacts the WAL by deleting events with sequence <= `up_to_seq`.
+    ///
+    /// Returns the number of events deleted. This is a write operation
+    /// that permanently removes old WAL entries to reclaim disk space.
+    ///
+    /// # Safety
+    ///
+    /// Only compact up to the minimum cursor across all peers — otherwise
+    /// peers that haven't synced yet will miss events.
+    #[cfg(feature = "sync")]
+    fn compact_wal_events(&self, up_to_seq: u64) -> Result<u64>;
 }
 
 /// Opens a storage engine at the given path.

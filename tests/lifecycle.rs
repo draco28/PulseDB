@@ -265,7 +265,7 @@ fn test_close_flushes_data() {
 
     // Reopen and verify metadata was persisted
     let db = PulseDB::open(&path, Config::default()).unwrap();
-    assert_eq!(db.metadata().schema_version, 1);
+    assert_eq!(db.metadata().schema_version, 2);
     db.close().unwrap();
 }
 

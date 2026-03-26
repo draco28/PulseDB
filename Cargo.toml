@@ -18,6 +18,9 @@ name = "pulsedb"
 [features]
 default = []
 builtin-embeddings = ["ort", "tokenizers", "ndarray", "dirs", "ureq"]
+sync = ["tokio/time", "tokio/sync", "tokio/macros"]
+sync-http = ["sync", "reqwest"]
+sync-websocket = ["sync", "tokio-tungstenite"]
 
 [dependencies]
 # Storage - redb is a pure Rust embedded KV store with ACID transactions
@@ -78,6 +81,12 @@ dirs = { version = "5.0", optional = true }
 # Optional: HTTP client for model downloads from HuggingFace
 ureq = { version = "3.0", optional = true }
 
+# Optional: HTTP transport for sync protocol
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "gzip"] }
+
+# Optional: WebSocket transport for sync protocol
+tokio-tungstenite = { version = "0.24", optional = true }
+
 [dev-dependencies]
 # Testing utilities
 tempfile = "3.0"
@@ -87,6 +96,9 @@ futures = "0.3"
 
 # Async runtime for integration tests (multi-thread + macros for #[tokio::test])
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+# Axum for HTTP sync integration tests (server-side, dev only)
+axum = "0.8"
 
 # Benchmarking framework
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -109,6 +121,11 @@ harness = false
 [[bench]]
 name = "scaling"
 harness = false
+
+[[bench]]
+name = "sync"
+harness = false
+required-features = ["sync"]
 
 [profile.release]
 lto = true

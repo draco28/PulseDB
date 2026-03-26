@@ -74,6 +74,9 @@
 //! | Feature | Description |
 //! |---------|-------------|
 //! | `builtin-embeddings` | Bundles ONNX runtime with all-MiniLM-L6-v2 for local embedding generation. Without this feature, you must supply pre-computed embeddings. |
+//! | `sync` | Core sync protocol: types, transport trait, in-memory transport, echo prevention guard. |
+//! | `sync-http` | HTTP sync transport via reqwest (implies `sync`). |
+//! | `sync-websocket` | WebSocket sync transport via tokio-tungstenite (implies `sync`). |
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
@@ -103,6 +106,14 @@ mod watch;
 
 /// SubstrateProvider async trait for agent framework integration.
 pub mod substrate;
+
+/// Native sync protocol for distributed PulseDB instances.
+///
+/// Requires the `sync` feature flag. Provides types, transport trait,
+/// and echo prevention for synchronizing data between PulseDB instances.
+#[cfg(feature = "sync")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sync")))]
+pub mod sync;
 
 /// Vector index module for HNSW-based approximate nearest neighbor search.
 pub mod vector;

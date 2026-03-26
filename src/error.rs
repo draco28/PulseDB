@@ -20,6 +20,9 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
+#[cfg(feature = "sync")]
+use crate::sync::SyncError;
+
 /// Result type alias for PulseDB operations.
 pub type Result<T> = std::result::Result<T, PulseDBError>;
 
@@ -67,6 +70,14 @@ pub enum PulseDBError {
     /// Internal error (e.g., async runtime failure, task join error).
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// Sync protocol error.
+    ///
+    /// Only available when the `sync` feature is enabled.
+    #[cfg(feature = "sync")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "sync")))]
+    #[error("Sync error: {0}")]
+    Sync(#[from] SyncError),
 }
 
 impl PulseDBError {
@@ -140,6 +151,15 @@ impl PulseDBError {
     /// Returns true if this is an I/O error.
     pub fn is_io(&self) -> bool {
         matches!(self, Self::Io(_))
+    }
+
+    /// Returns true if this is a sync error.
+    ///
+    /// Only available when the `sync` feature is enabled.
+    #[cfg(feature = "sync")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "sync")))]
+    pub fn is_sync(&self) -> bool {
+        matches!(self, Self::Sync(_))
     }
 }
 
