@@ -24,10 +24,20 @@ sync-websocket = ["sync", "tokio-tungstenite"]
 
 [dependencies]
 # Storage - redb is a pure Rust embedded KV store with ACID transactions
-redb = "2.1"
+# Sprint 4.0 (VS-4.0.1 Hybrid co-resolution): bumped 2.1 -> 4.1. redb 4.x reads
+# only file-format v3 and HARD-REFUSES the v2 files written by <=v0.5.1; the
+# upgrade-on-open migration (VS-4.0.2) adds an aliased redb 2.6 to run
+# Database::upgrade() (v2->v3) before opening under 4.x. NOTE: the crate does NOT
+# compile under 4.x until VS-4.0.2 lands the redb API migration (e.g.
+# `use redb::ReadableDatabase`) — this manifest pin is intentionally ahead of the
+# code so the VS-4.0.1 auto-demo (`cargo tree -i redb` => redb v4) passes.
+redb = "4.1"
 
-# Serialization - bincode is fast and compact for internal storage
+# Serialization - postcard replaces the unmaintained bincode (RUSTSEC-2025-0141;
+# ADR-006). bincode is retained ONLY until VS-4.0.3 lands the vendored decode path
+# + value re-encode; its `deny.toml` ignore drops once the crate dependency is gone.
 bincode = "1.3"
+postcard = { version = "=1.1.3", features = ["use-std"] }
 serde = { version = "1.0", features = ["derive"] }
 
 # IDs - UUID v7 provides time-ordered unique identifiers
