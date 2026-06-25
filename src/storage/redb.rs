@@ -20,6 +20,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ::redb::{Database, ReadableTable};
+// redb 3.0 moved begin_read()/cache_stats() onto the ReadableDatabase trait;
+// it must be in scope for the ~40 db.begin_read() call sites below.
+use redb::ReadableDatabase;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument, warn};
 
@@ -202,18 +205,19 @@ impl RedbStorage {
     fn create_database(path: &Path, _config: &Config) -> Result<Database> {
         let builder = Database::builder();
 
-        // Note: redb 2.x doesn't have set_cache_size, it manages memory internally
-        // The cache_size_mb config will be used for future optimizations
+        // Note: redb's Builder exposes set_cache_size (since 2.x); PulseDB does not
+        // wire it yet, so the cache_size_mb config remains reserved for a future
+        // optimization pass. redb manages its read/write cache internally by default.
 
-        // Note: redb doesn't expose a typed error variant for lock conflicts,
-        // so we detect them via error message string matching. This may need
-        // updating if redb changes its error messages in a future version.
-        let db = builder.create(path).map_err(|e| {
-            if e.to_string().contains("locked") {
-                StorageError::DatabaseLocked
-            } else {
-                StorageError::Redb(e.to_string())
-            }
+        // redb 4.x returns a typed DatabaseError. A lock conflict (another process
+        // already holds the database) is DatabaseError::DatabaseAlreadyOpen — its
+        // Display is "Database already open. Cannot acquire lock." (note: the word
+        // "locked" no longer appears, so the prior string match on "locked" would
+        // have silently fallen through to the generic Redb error). Match the typed
+        // variant instead of string-matching.
+        let db = builder.create(path).map_err(|e| match e {
+            ::redb::DatabaseError::DatabaseAlreadyOpen => StorageError::DatabaseLocked,
+            other => StorageError::Redb(other.to_string()),
         })?;
 
         debug!("Database file opened successfully");
