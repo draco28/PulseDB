@@ -4319,4 +4319,527 @@ mod tests {
         );
         Box::new(storage).close().unwrap();
     }
+
+    // ====================================================================
+    // redb-2.x representative fixture + migration/concurrency (work 1.04)
+    // ====================================================================
+    //
+    // This section proves the VS-4.0.2 user demo at the INTEGRATION /
+    // value-identity level: a pre-existing v0.5.1 (redb-2.x) PulseDB database
+    // opens under redb 4.x, migrates behind a `.pre-substrate` backup, and every
+    // entity reads back identically with no data loss — plus the audit C2
+    // concurrency cases and the FR-035/C6 read-only carve-out, exercised against
+    // a *representative* programmatically-built v2 fixture (collective +
+    // experience + raw-f32 embedding + secondary-index entries).
+    //
+    // The full real-v0.5.1 checked-in file (every entity type) is VS-4.0.4; the
+    // programmatically-built fixture below is sufficient for the redb-format proof.
+    //
+    // 1.03's `seed_redb_v2_store` (metadata-only) and its unit-level migration
+    // tests are LEFT UNTOUCHED; this is a new, richer builder + five new tests.
+
+    /// redb-2.6 `TableDefinition`/`MultimapTableDefinition` mirrors of the schema
+    /// tables, with the **same string names** as the 4.x consts. The 4.x consts are
+    /// `redb::TableDefinition`s and cannot be used with a `redb_v2::Database`, so the
+    /// v2 seed re-declares each table it needs to write.
+    const V2_COLLECTIVES_TABLE: redb_v2::TableDefinition<&[u8; 16], &[u8]> =
+        redb_v2::TableDefinition::new("collectives");
+    const V2_EXPERIENCES_TABLE: redb_v2::TableDefinition<&[u8; 16], &[u8]> =
+        redb_v2::TableDefinition::new("experiences");
+    const V2_EMBEDDINGS_TABLE: redb_v2::TableDefinition<&[u8; 16], &[u8]> =
+        redb_v2::TableDefinition::new("embeddings");
+    const V2_EXPERIENCES_BY_COLLECTIVE_TABLE: redb_v2::MultimapTableDefinition<
+        &[u8; 16],
+        &[u8; 24],
+    > = redb_v2::MultimapTableDefinition::new("experiences_by_collective");
+    const V2_EXPERIENCES_BY_TYPE_TABLE: redb_v2::MultimapTableDefinition<&[u8; 17], &[u8; 16]> =
+        redb_v2::MultimapTableDefinition::new("experiences_by_type");
+
+    /// Builds a **representative** genuine redb-file-format-v2 PulseDB store via the
+    /// aliased `redb_v2` (2.6 creates v2 files by default), populated the way
+    /// production `save_*` does — bincode `DatabaseMetadata` (schema-v3) + `instance_id`,
+    /// a real `Collective`, a real schema-v3 `Experience`, the raw-f32 embedding blob,
+    /// and both secondary-index entries. **No** `substrate_format` key is written
+    /// (Absent ⇒ a legacy `{redb-v2, bincode}` store).
+    ///
+    /// On-disk encodings mirror `save_collective` / `save_experience` exactly so the
+    /// post-migration readback is a true byte-identity check (audit A3): redb's v2→v3
+    /// `upgrade()` rewrites the file format but preserves stored key/value bytes, so
+    /// the raw tables (embeddings, multimaps, instance_id) carry through byte-identically.
+    ///
+    /// Returns the seeded `(Collective, Experience, Vec<f32>)` so tests assert against
+    /// known ground truth. All values are deterministic. Drops the redb-2.6 handle
+    /// before returning to release its lock ahead of any redb-4.1 open.
+    fn seed_representative_redb_v2_store(path: &Path) -> (Collective, Experience, Vec<f32>) {
+        // Deterministic collective (fixed id + timestamps so ground truth is stable).
+        let ts = Timestamp::from_millis(1_700_000_000_000);
+        let collective = Collective {
+            id: CollectiveId::from_bytes(*b"REPRESENTATIVE__"),
+            name: "representative-v2-collective".into(),
+            owner_id: Some("owner-42".into()),
+            embedding_dimension: 384,
+            created_at: ts,
+            updated_at: ts,
+        };
+
+        // Deterministic schema-v3 experience: per-instance `applications` BTreeMap +
+        // `last_reinforced`, a non-trivial experience_type, multi-tag domain.
+        let mut applications: BTreeMap<InstanceId, u32> = BTreeMap::new();
+        applications.insert(InstanceId::from_bytes(*b"INSTANCE_ALPHA__"), 3);
+        applications.insert(InstanceId::from_bytes(*b"INSTANCE_BETA___"), 5);
+
+        let exp_ts = Timestamp::from_millis(1_700_000_123_456);
+        let experience = Experience {
+            id: ExperienceId::from_bytes(*b"REPRESENTATIVEXP"),
+            collective_id: collective.id,
+            content: "representative v0.5.1 experience carried across the redb v2->v3 upgrade"
+                .into(),
+            // embedding is #[serde(skip)] — NOT in the bincode blob; carried in
+            // EMBEDDINGS_TABLE as raw f32 bytes. Set here so the in-memory ground
+            // truth matches what get_experience reconstitutes.
+            embedding: Vec::new(),
+            experience_type: ExperienceType::Fact {
+                statement: "redb v2->v3 upgrade preserves stored key/value bytes".into(),
+                source: "VS-4.0.2 design §2a".into(),
+            },
+            importance: 0.73,
+            confidence: 0.91,
+            applications,
+            domain: vec!["migration".into(), "redb".into(), "storage-format".into()],
+            related_files: vec!["src/storage/redb.rs".into(), "src/storage/schema.rs".into()],
+            source_agent: AgentId::new("representative-agent"),
+            source_task: None,
+            timestamp: exp_ts,
+            last_reinforced: exp_ts,
+            archived: false,
+        };
+
+        // Deterministic 384-length embedding with a NON-uniform pattern, so a
+        // silently-wrong copy is caught and the length matches D384.
+        let embedding: Vec<f32> = (0..384).map(|i| (i as f32) * 0.0013 - 0.1).collect();
+
+        // Serialize entities the way production does. The embedding is serde-skipped,
+        // so the experience blob does NOT contain it.
+        let metadata = DatabaseMetadata::new(EmbeddingDimension::D384);
+        assert_eq!(metadata.schema_version, SCHEMA_VERSION, "fixture must be schema-v3");
+        let metadata_bytes = bincode::serialize(&metadata).unwrap();
+        let collective_bytes = bincode::serialize(&collective).unwrap();
+        let experience_bytes = bincode::serialize(&experience).unwrap();
+        let embedding_bytes = f32_slice_to_bytes(&embedding);
+
+        let instance_id = InstanceId::from_bytes(*b"FIXTUREINSTANCE_");
+
+        // 24-byte by-collective index value: [timestamp_be: 8][exp_id: 16].
+        let mut by_collective_value = [0u8; 24];
+        by_collective_value[..8].copy_from_slice(&experience.timestamp.to_be_bytes());
+        by_collective_value[8..24].copy_from_slice(experience.id.as_bytes());
+
+        // 17-byte by-type index key: [collective_id: 16][type_tag: 1].
+        let type_key = encode_type_index_key(
+            collective.id.as_bytes(),
+            experience.experience_type.type_tag(),
+        );
+
+        let db = redb_v2::Database::builder().create(path).unwrap();
+        let write_txn = db.begin_write().unwrap();
+        {
+            // metadata table: db_metadata (bincode) + instance_id (raw 16 bytes),
+            // NO substrate_format key (Absent ⇒ legacy v2).
+            let mut meta = write_txn.open_table(V2_METADATA_TABLE).unwrap();
+            meta.insert(METADATA_KEY, metadata_bytes.as_slice()).unwrap();
+            meta.insert(INSTANCE_ID_KEY, instance_id.as_bytes().as_slice())
+                .unwrap();
+
+            let mut collectives = write_txn.open_table(V2_COLLECTIVES_TABLE).unwrap();
+            collectives
+                .insert(collective.id.as_bytes(), collective_bytes.as_slice())
+                .unwrap();
+
+            let mut experiences = write_txn.open_table(V2_EXPERIENCES_TABLE).unwrap();
+            experiences
+                .insert(experience.id.as_bytes(), experience_bytes.as_slice())
+                .unwrap();
+
+            let mut embeddings = write_txn.open_table(V2_EMBEDDINGS_TABLE).unwrap();
+            embeddings
+                .insert(experience.id.as_bytes(), embedding_bytes.as_slice())
+                .unwrap();
+
+            let mut by_collective = write_txn
+                .open_multimap_table(V2_EXPERIENCES_BY_COLLECTIVE_TABLE)
+                .unwrap();
+            by_collective
+                .insert(collective.id.as_bytes(), &by_collective_value)
+                .unwrap();
+
+            let mut by_type = write_txn
+                .open_multimap_table(V2_EXPERIENCES_BY_TYPE_TABLE)
+                .unwrap();
+            by_type.insert(&type_key, experience.id.as_bytes()).unwrap();
+        }
+        write_txn.commit().unwrap();
+        drop(db); // release the redb-2.6 lock before any redb-4.1 open
+
+        // Return the experience with the embedding set in-memory (ground truth).
+        let mut experience = experience;
+        experience.embedding = embedding.clone();
+        (collective, experience, embedding)
+    }
+
+    /// Asserts two experiences are field-by-field identical, EXCLUDING the serde-skip
+    /// embedding (compared separately by the byte-identity assertions). `Experience`
+    /// does not derive `PartialEq`, so this compares every persisted field.
+    fn assert_experience_eq(got: &Experience, want: &Experience) {
+        assert_eq!(got.id, want.id, "experience id");
+        assert_eq!(got.collective_id, want.collective_id, "collective_id");
+        assert_eq!(got.content, want.content, "content");
+        // ExperienceType does not derive PartialEq (and production types are out of
+        // scope for this work item), so compare its tag + its bincode encoding — a
+        // true structural value-identity check for the enum + its payload.
+        assert_eq!(
+            got.experience_type.type_tag(),
+            want.experience_type.type_tag(),
+            "experience_type tag"
+        );
+        assert_eq!(
+            bincode::serialize(&got.experience_type).unwrap(),
+            bincode::serialize(&want.experience_type).unwrap(),
+            "experience_type payload"
+        );
+        assert_eq!(got.importance, want.importance, "importance");
+        assert_eq!(got.confidence, want.confidence, "confidence");
+        assert_eq!(got.applications, want.applications, "applications BTreeMap");
+        assert_eq!(got.applications(), want.applications(), "applications() total");
+        assert_eq!(got.domain, want.domain, "domain");
+        assert_eq!(got.related_files, want.related_files, "related_files");
+        assert_eq!(got.source_agent, want.source_agent, "source_agent");
+        assert_eq!(got.source_task, want.source_task, "source_task");
+        assert_eq!(got.timestamp, want.timestamp, "timestamp");
+        assert_eq!(got.last_reinforced, want.last_reinforced, "last_reinforced");
+        assert_eq!(got.archived, want.archived, "archived");
+    }
+
+    fn assert_collective_eq(got: &Collective, want: &Collective) {
+        assert_eq!(got.id, want.id, "collective id");
+        assert_eq!(got.name, want.name, "name");
+        assert_eq!(got.owner_id, want.owner_id, "owner_id");
+        assert_eq!(
+            got.embedding_dimension, want.embedding_dimension,
+            "embedding_dimension"
+        );
+        assert_eq!(got.created_at, want.created_at, "created_at");
+        assert_eq!(got.updated_at, want.updated_at, "updated_at");
+    }
+
+    #[test]
+    fn test_representative_redb_v2_store_is_genuinely_v2() {
+        // Guard against a false-green v3 fixture: the representative fixture is a
+        // genuine redb-file-format-v2 file, so a redb-4.1 `create` hard-refuses it
+        // with `SubstrateUpgradeRequired` BEFORE any value is reachable.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("representative_v2.db");
+        let (_c, _e, _emb) = seed_representative_redb_v2_store(&path);
+
+        let err = RedbStorage::create_database(&path, &default_config()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PulseDBError::Storage(StorageError::SubstrateUpgradeRequired { .. })
+            ),
+            "representative fixture must be genuinely redb-v2 (SubstrateUpgradeRequired), got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_writable_migrate_of_representative_v2_store_preserves_every_entity() {
+        // THE USER DEMO: open the representative v0.5.1 (redb-v2) fixture WRITABLE
+        // under redb 4.1 -> migrates behind a `.pre-substrate` backup, marker becomes
+        // Current, and EVERY entity reads back identically (value-identity for the
+        // collective + experience; byte-identity for the embedding + index entries).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("representative_v2.db");
+        let (collective, experience, embedding) = seed_representative_redb_v2_store(&path);
+
+        let backup_path = pre_substrate_backup_path(&path);
+        assert!(!backup_path.exists(), "no backup before migration");
+
+        // Opens Ok — no UpgradeRequired / error leaks to the caller.
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        // The pristine {redb-v2, bincode} backup sidecar exists (rollback point).
+        assert!(
+            backup_path.exists(),
+            "writable migrate must retain a .pre-substrate backup"
+        );
+
+        // Marker reads as Current (= {redb-v3, bincode}).
+        assert_eq!(
+            RedbStorage::read_substrate_marker(storage.database()).unwrap(),
+            SubstrateFormat::Current
+        );
+
+        // --- value identity: collective + experience read back field-for-field ---
+        let got_collective = storage.get_collective(collective.id).unwrap().unwrap();
+        assert_collective_eq(&got_collective, &collective);
+
+        let got_experience = storage.get_experience(experience.id).unwrap().unwrap();
+        assert_experience_eq(&got_experience, &experience);
+        // The reconstituted embedding (joined from EMBEDDINGS_TABLE) equals ground truth.
+        assert_eq!(
+            got_experience.embedding, embedding,
+            "reconstituted embedding must equal the seeded vector"
+        );
+        assert_eq!(got_experience.embedding.len(), 384, "D384 length preserved");
+
+        // --- byte identity (audit A3): embedding raw bytes carried through unchanged ---
+        {
+            let read_txn = storage.database().begin_read().unwrap();
+            let emb_table = read_txn.open_table(EMBEDDINGS_TABLE).unwrap();
+            let raw = emb_table.get(experience.id.as_bytes()).unwrap().unwrap();
+            assert_eq!(
+                raw.value(),
+                f32_slice_to_bytes(&embedding).as_slice(),
+                "embedding bytes must survive the v2->v3 upgrade byte-for-byte"
+            );
+            assert_eq!(
+                bytes_to_f32_vec(raw.value()),
+                embedding,
+                "embedding decodes back to the seeded vector"
+            );
+        }
+
+        // --- byte identity (audit A3): secondary-index entries carried through ---
+        {
+            let read_txn = storage.database().begin_read().unwrap();
+
+            // by-collective multimap: exact 24-byte [ts_be][exp_id] value present.
+            let by_collective = read_txn
+                .open_multimap_table(EXPERIENCES_BY_COLLECTIVE_TABLE)
+                .unwrap();
+            let mut expected_idx = [0u8; 24];
+            expected_idx[..8].copy_from_slice(&experience.timestamp.to_be_bytes());
+            expected_idx[8..24].copy_from_slice(experience.id.as_bytes());
+            let mut found_idx = false;
+            for entry in by_collective.get(collective.id.as_bytes()).unwrap() {
+                let entry = entry.unwrap();
+                if entry.value() == &expected_idx {
+                    found_idx = true;
+                }
+            }
+            assert!(
+                found_idx,
+                "by-collective index must contain the exact [ts_be][exp_id] 24-byte value"
+            );
+
+            // by-type multimap: e.id present under the (collective_id, type_tag) key.
+            let by_type = read_txn
+                .open_multimap_table(EXPERIENCES_BY_TYPE_TABLE)
+                .unwrap();
+            let type_key = encode_type_index_key(
+                collective.id.as_bytes(),
+                experience.experience_type.type_tag(),
+            );
+            let mut found_type = false;
+            for entry in by_type.get(&type_key).unwrap() {
+                let entry = entry.unwrap();
+                if entry.value() == experience.id.as_bytes() {
+                    found_type = true;
+                }
+            }
+            assert!(
+                found_type,
+                "by-type index must contain e.id under the (collective_id, type_tag) key"
+            );
+        }
+
+        // --- functional queries over the migrated indices ---
+        assert_eq!(
+            storage
+                .list_experience_ids_in_collective(collective.id)
+                .unwrap(),
+            vec![experience.id],
+            "by-collective functional query must yield exactly the seeded experience"
+        );
+        let recent = storage.get_recent_experience_ids(collective.id, 10).unwrap();
+        assert_eq!(
+            recent,
+            vec![(experience.id, experience.timestamp)],
+            "get_recent_experience_ids must yield (e.id, e.timestamp)"
+        );
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_read_only_open_of_representative_v2_store_refuses_with_zero_writes() {
+        // FR-035 / audit C6: a read-only open of the un-migrated representative v2
+        // fixture returns ReadOnly with ZERO writes — proving both that the fixture is
+        // genuinely v2 AND that a read-only open touches nothing.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("representative_v2.db");
+        let (_c, _e, _emb) = seed_representative_redb_v2_store(&path);
+
+        let backup_path = pre_substrate_backup_path(&path);
+        assert!(!backup_path.exists(), "no backup before the read-only attempt");
+        let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let err = RedbStorage::open(&path, &Config::read_only()).unwrap_err();
+        assert!(
+            matches!(err, PulseDBError::ReadOnly),
+            "read-only open of representative v2 store must return ReadOnly, got: {err}"
+        );
+
+        // ZERO writes: mtime unchanged, no backup created, file still genuinely v2.
+        let mtime_after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "read-only refusal must not modify the fixture file (mtime unchanged)"
+        );
+        assert!(
+            !backup_path.exists(),
+            "read-only refusal must happen BEFORE any backup write (zero writes)"
+        );
+        let still_v2 = RedbStorage::create_database(&path, &Config::read_only());
+        assert!(
+            matches!(
+                still_v2,
+                Err(PulseDBError::Storage(StorageError::SubstrateUpgradeRequired { .. }))
+            ),
+            "read-only open must NOT have upgraded the file (still genuinely v2)"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_writable_openers_migrate_exactly_once_without_corruption() {
+        // Audit C2(a): two concurrent writable openers of the same v2 fixture. The
+        // fs2 migration lock serializes the destructive upgrade => exactly one
+        // `.pre-substrate.bak`; `DatabaseLocked` is the typed, recoverable contention
+        // outcome (redb 4.1 holds an exclusive file lock, so a concurrent opener may
+        // transiently collide), NEVER corruption. Any OTHER error fails the test.
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("representative_v2.db");
+        let (collective, experience, _emb) = seed_representative_redb_v2_store(&path);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let barrier = Arc::clone(&barrier);
+            let path = path.clone();
+            let collective_id = collective.id;
+            let experience_id = experience.id;
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                // Bounded retry: the ONLY acceptable transient error is the typed
+                // DatabaseLocked (the redb-4.1 exclusive file lock). Anything else
+                // is a hard failure (returned as Err for the joiner to surface).
+                let mut last_locked: Option<String> = None;
+                for _ in 0..200 {
+                    match RedbStorage::open(&path, &default_config()) {
+                        Ok(storage) => {
+                            // Validate the migrated handle reads the seeded data, then
+                            // drop promptly to release the redb-4.1 handle.
+                            let c = storage
+                                .get_collective(collective_id)
+                                .expect("get_collective")
+                                .expect("collective present");
+                            assert_eq!(c.id, collective_id);
+                            let e = storage
+                                .get_experience(experience_id)
+                                .expect("get_experience")
+                                .expect("experience present");
+                            assert_eq!(e.id, experience_id);
+                            Box::new(storage).close().expect("close");
+                            return Ok(());
+                        }
+                        Err(PulseDBError::Storage(StorageError::DatabaseLocked)) => {
+                            last_locked = Some("DatabaseLocked".into());
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(other) => {
+                            return Err(format!("unexpected non-locked error: {other}"));
+                        }
+                    }
+                }
+                Err(format!(
+                    "exhausted retries still contending (last transient: {last_locked:?})"
+                ))
+            }));
+        }
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("thread panicked")
+                .expect("opener failed");
+        }
+
+        // Exactly one destructive upgrade => exactly one .pre-substrate backup.
+        assert!(
+            pre_substrate_backup_path(&path).exists(),
+            "the migration must have produced a .pre-substrate backup"
+        );
+
+        // Final reopen: marker Current and ALL seeded data intact (no corruption).
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+        assert_eq!(
+            RedbStorage::read_substrate_marker(storage.database()).unwrap(),
+            SubstrateFormat::Current
+        );
+        let got_collective = storage.get_collective(collective.id).unwrap().unwrap();
+        assert_collective_eq(&got_collective, &collective);
+        let got_experience = storage.get_experience(experience.id).unwrap().unwrap();
+        assert_experience_eq(&got_experience, &experience);
+        assert_eq!(
+            storage
+                .list_experience_ids_in_collective(collective.id)
+                .unwrap(),
+            vec![experience.id]
+        );
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_old_version_lock_holder_fails_typed_not_corrupt() {
+        // Audit C2(b): an old-version process still holding the v2 file (simulated by
+        // an open redb_v2::Database handle) must make a concurrent writable migrate
+        // surface the TYPED DatabaseLocked (the DatabaseAlreadyOpen -> DatabaseLocked
+        // mapping fires — empirically either at redb-4.1 `create` or inside
+        // upgrade_redb_v2_to_v3's redb_v2::Database::open; either path yields the typed
+        // error), NEVER corruption. Do NOT assert on backup presence here.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("representative_v2.db");
+        let (collective, experience, embedding) = seed_representative_redb_v2_store(&path);
+
+        // Hold an old-version (redb 2.6) handle open across the contended attempt.
+        let held = redb_v2::Database::builder().open(&path).unwrap();
+
+        let err = RedbStorage::open(&path, &default_config()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PulseDBError::Storage(StorageError::DatabaseLocked)
+            ),
+            "an old-version lock holder must yield the typed DatabaseLocked, got: {err}"
+        );
+
+        // Release the held handle; the file must be uncorrupted and still migratable:
+        // a fresh writable open succeeds, migrates, and reads every entity identically.
+        drop(held);
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+        assert_eq!(
+            RedbStorage::read_substrate_marker(storage.database()).unwrap(),
+            SubstrateFormat::Current
+        );
+        let got_collective = storage.get_collective(collective.id).unwrap().unwrap();
+        assert_collective_eq(&got_collective, &collective);
+        let got_experience = storage.get_experience(experience.id).unwrap().unwrap();
+        assert_experience_eq(&got_experience, &experience);
+        assert_eq!(
+            got_experience.embedding, embedding,
+            "embedding intact after the contended-then-successful migrate"
+        );
+        Box::new(storage).close().unwrap();
+    }
 }
