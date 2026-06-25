@@ -27,11 +27,16 @@ sync-websocket = ["sync", "tokio-tungstenite"]
 # Sprint 4.0 (VS-4.0.1 Hybrid co-resolution): bumped 2.1 -> 4.1. redb 4.x reads
 # only file-format v3 and HARD-REFUSES the v2 files written by <=v0.5.1; the
 # upgrade-on-open migration (VS-4.0.2) adds an aliased redb 2.6 to run
-# Database::upgrade() (v2->v3) before opening under 4.x. NOTE: the crate does NOT
-# compile under 4.x until VS-4.0.2 lands the redb API migration (e.g.
-# `use redb::ReadableDatabase`) — this manifest pin is intentionally ahead of the
-# code so the VS-4.0.1 auto-demo (`cargo tree -i redb` => redb v4) passes.
+# Database::upgrade() (v2->v3) before opening under 4.x.
 redb = "4.1"
+
+# Aliased redb 2.6 — the ONLY v2->v3 file-format upgrade bridge (`Database::upgrade()`
+# lives solely on the 2.6.x line; it is absent in 3.x/4.x). Used on the one-time
+# upgrade-on-open migration path (`src/storage/redb.rs`) to rewrite a redb-v2 file to
+# v3 in place, after which redb 4.1 reads it natively. VS-4.0.1/1.04 proved
+# 2.6.3 + 4.1.0 co-resolve. `cargo-deny [bans] multiple-versions = "warn"` warns (not
+# fails) on the dual-redb window — that is expected and tolerated (deny.toml).
+redb_v2 = { package = "redb", version = "2.6" }
 
 # Serialization - postcard replaces the unmaintained bincode (RUSTSEC-2025-0141;
 # ADR-006). bincode is retained ONLY until VS-4.0.3 lands the vendored decode path

@@ -81,10 +81,20 @@ pub const SUBSTRATE_MAGIC: [u8; 2] = *b"PS";
 
 /// Current substrate-format version (redb file-format + value serializer axis).
 ///
-/// `1` = redb-v3 + postcard. Bumped whenever *either* the redb file format *or*
-/// the serializer changes — independently of [`SCHEMA_VERSION`]. A fresh database
-/// is written at this value; an existing database whose marker is **absent** is
-/// treated as substrate-format `0` (the pre-4.0 bincode era).
+/// The marker is **monotonic** over the storage-substrate axes:
+///
+/// - `0` / **absent** = `{redb-v2, bincode}` — the legacy v0.5.1 state (no marker
+///   key existed before Sprint 4.0).
+/// - `1` = `{redb-v3, bincode}` — the **VS-4.0.2 end-state** (what this slice
+///   produces). The redb file format is upgraded v2→v3, but values stay bincode;
+///   the bincode→postcard codec swap is VS-4.0.3.
+/// - `2` = `{redb-v3, postcard}` — VS-4.0.3 will bump `CURRENT` to `2` and add the
+///   bincode→postcard codec migration gated on `marker < 2`.
+///
+/// Bumped whenever *either* the redb file format *or* the serializer changes —
+/// independently of [`SCHEMA_VERSION`]. A fresh database is written at this value;
+/// an existing database whose marker is **absent** is treated as substrate-format
+/// `0` (the pre-4.0 `{redb-v2, bincode}` era).
 pub const CURRENT_SUBSTRATE_FORMAT: u8 = 1;
 
 /// Substrate-format version implied by an **absent** marker.

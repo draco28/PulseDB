@@ -64,9 +64,12 @@ const METADATA_KEY: &str = "db_metadata";
 
 /// Outcome of reading the on-disk substrate-format marker.
 ///
-/// This is the codec/redb-format axis (distinct from the logical schema version).
-/// The migration gate (a later work item) keys off this enum to decide whether a
-/// store opens directly, must migrate forward, or is forward-incompatible.
+/// This is the redb-file-format + value-codec axis (distinct from the logical
+/// schema version). The marker is **monotonic**: `0`/absent = `{redb-v2, bincode}`
+/// (legacy v0.5.1), `1` = `{redb-v3, bincode}` (the VS-4.0.2 end-state, values
+/// still bincode), `2` = `{redb-v3, postcard}` (VS-4.0.3). The migration gate keys
+/// off this enum to decide whether a store opens directly, must migrate forward,
+/// or is forward-incompatible. See [`CURRENT_SUBSTRATE_FORMAT`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubstrateFormat {
     /// No marker key present ⇒ a pre-4.0 (bincode-era) database; treated as
@@ -96,9 +99,6 @@ impl SubstrateFormat {
     }
 
     /// Classifies a found substrate-format version against the current build.
-    // Exercised by tests + `read_substrate_marker`; the open-path consumer (the
-    // migration gate) is wired in work 1.03, so the non-test build sees it unused.
-    #[allow(dead_code)]
     fn classify(found: u8) -> Self {
         use std::cmp::Ordering;
         match found.cmp(&CURRENT_SUBSTRATE_FORMAT) {
@@ -123,8 +123,6 @@ fn encode_substrate_marker(version: u8) -> [u8; SUBSTRATE_MARKER_LEN] {
 /// Returns the substrate-format version on success. A wrong length or a magic
 /// mismatch is a corruption signal (NOT an Absent/legacy database — absence is
 /// detected by the key being missing, which the caller handles separately).
-// Used by `read_substrate_marker` + tests; the open-path consumer lands in 1.03.
-#[allow(dead_code)]
 fn decode_substrate_marker(bytes: &[u8]) -> Result<u8> {
     if bytes.len() != SUBSTRATE_MARKER_LEN {
         return Err(StorageError::corrupted(format!(
@@ -154,6 +152,134 @@ fn pre_v3_backup_path(path: &Path) -> PathBuf {
         .unwrap_or_else(|| "pulsedb.redb".into());
     backup.set_file_name(format!("{file_name}.pre-v3.bak"));
     backup
+}
+
+/// Deterministic sibling path retained before the redb-format substrate migration
+/// (the v2→v3 in-place `upgrade()`).
+///
+/// This is a **distinct sidecar** from [`pre_v3_backup_path`] (`.pre-v3.bak`, the
+/// logical-schema migration backup). It captures the pristine `{redb-v2, bincode}`
+/// file before the destructive in-place redb upgrade and is the rollback point for
+/// the substrate migration. Never clobbers an existing `.pre-v3.bak`.
+fn pre_substrate_backup_path(path: &Path) -> PathBuf {
+    let mut backup = path.to_path_buf();
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "pulsedb.redb".into());
+    backup.set_file_name(format!("{file_name}.pre-substrate.bak"));
+    backup
+}
+
+/// Atomically claim and write a backup sidecar of `src` at `backup_path`.
+///
+/// Uses the same `create_new`/O_EXCL atomic claim + partial-copy cleanup as the
+/// schema-v3 backup. The first writer to claim the path performs the copy; a
+/// concurrent migrator that lost the race sees `AlreadyExists` and leaves the
+/// genuine sidecar untouched (no TOCTOU between `exists()` and `copy()`). On a
+/// copy failure after the claim (disk full, short write), the partial backup is
+/// removed so a later open does not treat it as a valid sidecar.
+///
+/// Idempotent: a second call against an already-claimed path is a no-op `Ok(())`.
+fn backup_once(src: &Path, backup_path: &Path) -> Result<()> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(backup_path)
+    {
+        Ok(mut backup_file) => {
+            let copy_result = std::fs::File::open(src).and_then(|mut source| {
+                std::io::copy(&mut source, &mut backup_file).map(|_| ())
+            });
+            if let Err(error) = copy_result {
+                drop(backup_file);
+                let _ = std::fs::remove_file(backup_path);
+                return Err(PulseDBError::Io(error));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            debug!("backup sidecar already exists; preserving it");
+            Ok(())
+        }
+        Err(error) => Err(PulseDBError::Io(error)),
+    }
+}
+
+/// Deterministic sibling path for the PulseDB-owned migration lock.
+///
+/// Distinct from redb's own `.lock` and the watch coordinator's `.watch.lock`.
+/// Serializes concurrent substrate migrators so two processes cannot race the
+/// destructive in-place redb `upgrade()`.
+fn migration_lock_path(db_path: &Path) -> PathBuf {
+    let mut lock_path = db_path.as_os_str().to_owned();
+    lock_path.push(".migrate.lock");
+    PathBuf::from(lock_path)
+}
+
+/// An exclusive advisory lock guarding the substrate migration, released on drop.
+///
+/// Mirrors the `fs2` advisory-lock seam used by `src/watch/lock.rs` (the
+/// `WatchLock`). Acquired **before** the backup + redb-v2 `upgrade()` and held
+/// until the redb-4.1 reopen completes, so two upgraders cannot race the
+/// destructive in-place upgrade (audit C2).
+struct MigrationLock {
+    // The locked file handle. Dropping it releases the OS advisory lock on all
+    // platforms (POSIX + Windows); no explicit unlock (`unlock` needs Rust 1.89+,
+    // above MSRV — see watch/lock.rs).
+    _file: std::fs::File,
+}
+
+impl MigrationLock {
+    /// Acquires the exclusive migration lock, blocking until it is available.
+    fn acquire_exclusive(db_path: &Path) -> Result<Self> {
+        use fs2::FileExt;
+        let path = migration_lock_path(db_path);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(PulseDBError::Io)?;
+        file.lock_exclusive().map_err(PulseDBError::Io)?;
+        Ok(Self { _file: file })
+    }
+}
+
+/// Runs the one-time redb file-format upgrade (v2 → v3) in place via the aliased
+/// redb 2.6 dependency, then drops the 2.6 handle to release its lock.
+///
+/// `Database::upgrade()` lives **only** on the redb 2.6.x line (absent in 3.x/4.x).
+/// It rewrites the on-disk file format v2 → v3 in place; values are untouched
+/// (still bincode). The call is idempotent — `upgrade()` returns `Ok(false)` if
+/// the file is already v3.
+///
+/// An old-version process still holding the redb file surfaces as a redb-2.6
+/// `DatabaseError::DatabaseAlreadyOpen`, which we map to the typed
+/// [`StorageError::DatabaseLocked`] rather than corrupting or spinning (audit C2).
+fn upgrade_redb_v2_to_v3(path: &Path) -> Result<()> {
+    // Open under redb 2.6 (the v2→v3 bridge). A lock conflict means an old-version
+    // process still holds the file — fail typed, do not corrupt.
+    let mut db = redb_v2::Database::open(path).map_err(|e| match e {
+        redb_v2::DatabaseError::DatabaseAlreadyOpen => {
+            PulseDBError::Storage(StorageError::DatabaseLocked)
+        }
+        other => PulseDBError::Storage(StorageError::Redb(format!(
+            "redb 2.6 open (for v2->v3 upgrade) failed: {other}"
+        ))),
+    })?;
+
+    db.upgrade().map_err(|e| {
+        PulseDBError::Storage(StorageError::Redb(format!(
+            "redb 2.6 v2->v3 upgrade() failed: {e}"
+        )))
+    })?;
+
+    // Drop the redb-2.6 handle explicitly to release its file lock BEFORE the
+    // redb-4.1 reopen. (Returning would drop it anyway; explicit for clarity.)
+    drop(db);
+    Ok(())
 }
 
 /// Reserved legacy bucket for scalar v2 application counts.
@@ -282,8 +408,13 @@ impl RedbStorage {
 
         debug!(db_exists = db_exists, "Opening storage engine");
 
-        // Create or open the database
-        let db = Self::create_database(path, config)?;
+        // Create or open the database under redb 4.1. A v2-format file (every
+        // <=v0.5.1 database) hard-refuses here with `UpgradeRequired` *before* any
+        // value is reachable — the redb-format axis is detected here, the
+        // codec/schema axes inside `open_existing`. `create_or_migrate` runs the
+        // one-time redb v2->v3 upgrade-on-open (FR-035 read-only gate + lock +
+        // backup) and returns a v3 handle. (upgrade-on-open design §2 step A.)
+        let db = Self::create_or_migrate(path, config)?;
 
         if db_exists {
             // Validate existing database
@@ -291,6 +422,82 @@ impl RedbStorage {
         } else {
             // Initialize new database
             Self::initialize_new(db, path.to_path_buf(), config)
+        }
+    }
+
+    /// Opens the redb-4.1 database, running the one-time redb file-format
+    /// (v2 → v3) upgrade-on-open if the file is a legacy v2 store.
+    ///
+    /// Flow (upgrade-on-open design §2 step A + §11 C2/C6):
+    /// 1. Try `redb 4.1` `create(path)`. `Ok` ⇒ already v3, return the handle.
+    /// 2. `Err(UpgradeRequired)` ⇒ a redb-v2 file needing migration:
+    ///    - **FR-035 read-only gate** — a read-only open returns
+    ///      [`PulseDBError::ReadOnly`] with **zero writes** (no lock, no backup, no
+    ///      upgrade) *before* anything else.
+    ///    - acquire the exclusive migration lock (audit C2);
+    ///    - **re-try** `redb 4.1` create — another migrator may have finished while
+    ///      we blocked on the lock; if so, release + proceed;
+    ///    - back up the pristine `{redb-v2, bincode}` file to `.pre-substrate.bak`;
+    ///    - run the redb-2.6 `upgrade()` (v2→v3, in place, values untouched), drop
+    ///      the 2.6 handle to release its lock;
+    ///    - release the migration lock, reopen under redb 4.1 (now v3).
+    fn create_or_migrate(path: &Path, config: &Config) -> Result<Database> {
+        match Self::create_database(path, config) {
+            Ok(db) => Ok(db),
+            Err(PulseDBError::Storage(StorageError::SubstrateUpgradeRequired { found, .. })) => {
+                // FR-035 / audit C6: a read-only open of an un-migrated (redb-v2)
+                // store returns ReadOnly BEFORE any write — no lock, no backup, no
+                // upgrade. A read-only open performs ZERO writes.
+                if config.read_only {
+                    debug!(
+                        redb_format = found,
+                        "read-only open of redb-v2 store; refusing (migration needs write access)"
+                    );
+                    return Err(PulseDBError::ReadOnly);
+                }
+
+                info!(
+                    redb_format = found,
+                    "redb file-format v2 detected; migrating in place to v3 (one-time, \
+                     exempt from the <100ms open budget — values stay bincode)"
+                );
+
+                // Audit C2: serialize concurrent migrators so two processes cannot
+                // race the destructive in-place upgrade(). Hold the lock across the
+                // backup + upgrade + reopen.
+                let _migration_lock = MigrationLock::acquire_exclusive(path)?;
+
+                // Re-check after acquiring the lock: another migrator may have
+                // completed the upgrade while we blocked. If `create` now succeeds,
+                // the file is already v3 — release the lock and proceed.
+                match Self::create_database(path, config) {
+                    Ok(db) => {
+                        debug!("file already migrated by a concurrent upgrader; proceeding");
+                        return Ok(db);
+                    }
+                    Err(PulseDBError::Storage(StorageError::SubstrateUpgradeRequired {
+                        ..
+                    })) => {
+                        // Still v2 — we own the migration.
+                    }
+                    Err(other) => return Err(other),
+                }
+
+                // Back up the pristine {redb-v2, bincode} file (the rollback point)
+                // before the destructive in-place upgrade. Distinct sidecar from
+                // the schema-v3 `.pre-v3.bak`.
+                backup_once(path, &pre_substrate_backup_path(path))?;
+
+                // redb v2 -> v3 in place via the aliased redb 2.6; drop the 2.6
+                // handle (release its lock) before the redb-4.1 reopen.
+                upgrade_redb_v2_to_v3(path)?;
+
+                // Reopen under redb 4.1 — now a v3 file, so `create` succeeds.
+                let db = Self::create_database(path, config)?;
+                info!("redb file-format migration complete (v2 -> v3)");
+                Ok(db)
+            }
+            Err(other) => Err(other),
         }
     }
 
@@ -308,9 +515,20 @@ impl RedbStorage {
         // "locked" no longer appears, so the prior string match on "locked" would
         // have silently fallen through to the generic Redb error). Match the typed
         // variant instead of string-matching.
+        //
+        // `UpgradeRequired(found)` means the on-disk file is an OLD redb format
+        // (v2 — every <=v0.5.1 PulseDB database) that redb 4.x refuses to open.
+        // It is surfaced as the typed `SubstrateUpgradeRequired` so the caller
+        // (`create_or_migrate`) can run the upgrade-on-open path; `found` carries
+        // the on-disk redb format version redb reported.
         let db = builder.create(path).map_err(|e| match e {
-            ::redb::DatabaseError::DatabaseAlreadyOpen => StorageError::DatabaseLocked,
-            other => StorageError::Redb(other.to_string()),
+            ::redb::DatabaseError::DatabaseAlreadyOpen => {
+                PulseDBError::Storage(StorageError::DatabaseLocked)
+            }
+            ::redb::DatabaseError::UpgradeRequired(found) => PulseDBError::Storage(
+                StorageError::substrate_upgrade_required(found, CURRENT_SUBSTRATE_FORMAT),
+            ),
+            other => PulseDBError::Storage(StorageError::Redb(other.to_string())),
         })?;
 
         debug!("Database file opened successfully");
@@ -331,11 +549,8 @@ impl RedbStorage {
     /// being missing entirely.
     ///
     /// Note: this is a pure read primitive. It does NOT itself trigger any
-    /// migration; the migration gate that acts on `Older`/`Absent` is wired in a
-    /// later work item.
-    // Plumbing primitive consumed by the work-1.03 migration gate; exercised by
-    // tests here. Until 1.03 wires the open path, the non-test build sees it unused.
-    #[allow(dead_code)]
+    /// migration; the migration decision (acting on `Older`/`Absent`/`Newer`) lives
+    /// in `open_existing`, which consumes this.
     pub(crate) fn read_substrate_marker(db: &Database) -> Result<SubstrateFormat> {
         let read_txn = db.begin_read().map_err(StorageError::from)?;
         let meta_table = read_txn
@@ -538,50 +753,102 @@ impl RedbStorage {
             db
         };
 
-        // Update last_opened_at timestamp and bump schema version if migrating.
-        metadata.touch();
-        if needs_v2_migration || needs_v3_migration {
-            metadata.schema_version = SCHEMA_VERSION;
-        }
+        // Substrate-format marker gate (codec/redb-format axis, distinct from the
+        // logical schema_version handled above). At this point the file is
+        // redb-v3 (the redb-format upgrade ran in `create_or_migrate` before we got
+        // here, if it was needed). Read the raw marker BEFORE deciding on any write.
+        //
+        //  - `Newer(found)` ⇒ a file written by a future PulseDB (e.g. a VS-4.0.3
+        //    postcard store). Refuse with the typed `SubstrateFormatTooNew`; do not
+        //    touch it (forward-incompatibility).
+        //  - `Absent`/`Older` ⇒ this store is at `{redb-v3, bincode}` but carries no
+        //    (or an older) marker. We are about to bring it to CURRENT (=1) by
+        //    writing the marker. A read-only open cannot do that → ReadOnly
+        //    (FR-035); it has already been gated for the redb-v2 case in
+        //    `create_or_migrate`, this is the bincode-era-marker leg.
+        //  - `Current` ⇒ nothing to write for the marker axis.
+        let substrate_marker = Self::read_substrate_marker(&db)?;
+        let needs_marker_write = match substrate_marker {
+            SubstrateFormat::Newer(found) => {
+                return Err(PulseDBError::Storage(StorageError::substrate_format_too_new(
+                    found,
+                    CURRENT_SUBSTRATE_FORMAT,
+                )));
+            }
+            SubstrateFormat::Absent | SubstrateFormat::Older(_) => {
+                if config.read_only {
+                    return Err(PulseDBError::ReadOnly);
+                }
+                true
+            }
+            SubstrateFormat::Current => false,
+        };
 
-        let write_txn = db.begin_write().map_err(StorageError::from)?;
-        {
-            // Ensure watch_events table exists (migration for pre-E4-S02 databases)
-            let _ = write_txn.open_table(WATCH_EVENTS_TABLE)?;
-            let _ = write_txn.open_table(DECAY_CONFIGS_TABLE)?;
-
-            // Migrate WAL records from v1 → v2 (add entity_type field)
-            if needs_v2_migration {
-                Self::migrate_wal_v1_to_v2(&write_txn)?;
-                info!("Migrated WAL records from schema v1 to v2");
+        // Audit C6 / FR-035: a read-only open performs ZERO writes — it must not
+        // write `last_opened_at` (`touch()`) nor open a write txn, so it can run
+        // against a locked/old store without faulting. (An un-migrated store has
+        // already been refused above: redb-v2 in `create_or_migrate`, bincode-era
+        // marker via the `needs_marker_write` read-only gate.) A writable open
+        // always touches + writes, preserving prior behavior + the migration writes.
+        if !config.read_only {
+            // Update last_opened_at timestamp and bump schema version if migrating.
+            metadata.touch();
+            if needs_v2_migration || needs_v3_migration {
+                metadata.schema_version = SCHEMA_VERSION;
             }
 
-            let mut meta_table = write_txn.open_table(METADATA_TABLE)?;
-
-            if meta_table.get(INSTANCE_ID_KEY)?.is_none() {
-                let instance_id = InstanceId::new();
-                meta_table.insert(INSTANCE_ID_KEY, instance_id.as_bytes().as_slice())?;
-                debug!("Generated new instance_id for existing database");
-            }
-
-            #[cfg(feature = "sync")]
+            let write_txn = db.begin_write().map_err(StorageError::from)?;
             {
-                let _ = write_txn.open_table(SYNC_CURSORS_TABLE)?;
+                // Ensure watch_events table exists (migration for pre-E4-S02 databases)
+                let _ = write_txn.open_table(WATCH_EVENTS_TABLE)?;
+                let _ = write_txn.open_table(DECAY_CONFIGS_TABLE)?;
+
+                // Migrate WAL records from v1 → v2 (add entity_type field)
+                if needs_v2_migration {
+                    Self::migrate_wal_v1_to_v2(&write_txn)?;
+                    info!("Migrated WAL records from schema v1 to v2");
+                }
+
+                let mut meta_table = write_txn.open_table(METADATA_TABLE)?;
+
+                if meta_table.get(INSTANCE_ID_KEY)?.is_none() {
+                    let instance_id = InstanceId::new();
+                    meta_table.insert(INSTANCE_ID_KEY, instance_id.as_bytes().as_slice())?;
+                    debug!("Generated new instance_id for existing database");
+                }
+
+                // Write the substrate-format marker = CURRENT (=1 = {redb-v3,
+                // bincode}) in the SAME txn as the final metadata, so the marker is
+                // the commit point of the substrate migration. Raw, hand-encoded
+                // bytes (NEVER serde) — see `read_substrate_marker`.
+                if needs_marker_write {
+                    let marker = encode_substrate_marker(CURRENT_SUBSTRATE_FORMAT);
+                    meta_table.insert(SUBSTRATE_FORMAT_KEY, marker.as_slice())?;
+                    debug!(
+                        marker = CURRENT_SUBSTRATE_FORMAT,
+                        "wrote substrate-format marker (now {{redb-v3, bincode}})"
+                    );
+                }
+
+                #[cfg(feature = "sync")]
+                {
+                    let _ = write_txn.open_table(SYNC_CURSORS_TABLE)?;
+                }
+
+                drop(meta_table);
+
+                if needs_v3_migration {
+                    Self::migrate_experiences_v2_to_v3(&write_txn)?;
+                    info!("Migrated experiences from schema v2 to v3");
+                }
+
+                let mut meta_table = write_txn.open_table(METADATA_TABLE)?;
+                let metadata_bytes = bincode::serialize(&metadata)
+                    .map_err(|e| StorageError::serialization(e.to_string()))?;
+                meta_table.insert(METADATA_KEY, metadata_bytes.as_slice())?;
             }
-
-            drop(meta_table);
-
-            if needs_v3_migration {
-                Self::migrate_experiences_v2_to_v3(&write_txn)?;
-                info!("Migrated experiences from schema v2 to v3");
-            }
-
-            let mut meta_table = write_txn.open_table(METADATA_TABLE)?;
-            let metadata_bytes = bincode::serialize(&metadata)
-                .map_err(|e| StorageError::serialization(e.to_string()))?;
-            meta_table.insert(METADATA_KEY, metadata_bytes.as_slice())?;
+            write_txn.commit().map_err(StorageError::from)?;
         }
-        write_txn.commit().map_err(StorageError::from)?;
 
         let instance_id = {
             let read_txn = db.begin_read().map_err(StorageError::from)?;
@@ -3813,6 +4080,243 @@ mod tests {
         assert_eq!(events.len(), 3);
         assert_eq!(max_seq, 6);
 
+        Box::new(storage).close().unwrap();
+    }
+
+    // ====================================================================
+    // redb file-format upgrade-on-open (dual-redb migrator, work 1.03)
+    // ====================================================================
+
+    /// redb-2.6 `TableDefinition` mirror of `schema::METADATA_TABLE` ("metadata",
+    /// `&str -> &[u8]`). The 4.x `METADATA_TABLE` const is a `redb::TableDefinition`
+    /// and cannot be used with a `redb_v2::Database`, so the v2 seed re-declares it.
+    const V2_METADATA_TABLE: redb_v2::TableDefinition<&str, &[u8]> =
+        redb_v2::TableDefinition::new("metadata");
+
+    /// Builds a genuine **redb file-format v2** PulseDB store via the aliased
+    /// `redb_v2` (2.6) dependency, populated so that after the v2→v3 upgrade it is a
+    /// valid schema-v3 store. The store carries `DatabaseMetadata` (bincode),
+    /// `instance_id`, and — optionally — a substrate-format marker.
+    ///
+    /// `marker`: `None` ⇒ no `substrate_format` key (a legacy `{redb-v2, bincode}`
+    /// store, Absent); `Some(v)` ⇒ a raw marker with version `v`.
+    ///
+    /// redb 2.6 creates v2 files by default (no `create_with_file_format_v3`), so
+    /// opening this file under redb 4.1 yields `UpgradeRequired`.
+    fn seed_redb_v2_store(path: &Path, marker: Option<u8>) {
+        let db = redb_v2::Database::builder().create(path).unwrap();
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut meta = write_txn.open_table(V2_METADATA_TABLE).unwrap();
+
+            let metadata = DatabaseMetadata::new(EmbeddingDimension::D384);
+            let metadata_bytes = bincode::serialize(&metadata).unwrap();
+            meta.insert(METADATA_KEY, metadata_bytes.as_slice()).unwrap();
+
+            let instance_id = InstanceId::new();
+            meta.insert(INSTANCE_ID_KEY, instance_id.as_bytes().as_slice())
+                .unwrap();
+
+            if let Some(version) = marker {
+                let raw = encode_substrate_marker(version);
+                meta.insert(SUBSTRATE_FORMAT_KEY, raw.as_slice()).unwrap();
+            }
+        }
+        write_txn.commit().unwrap();
+        drop(db); // release the redb-2.6 lock before any redb-4.1 open
+    }
+
+    #[test]
+    fn test_redb_v2_file_triggers_upgrade_required_under_redb4() {
+        // The premise of the whole migrator: a redb-2.6-created file is format v2,
+        // and redb 4.1's `create()` hard-refuses it with `UpgradeRequired` — which
+        // `create_database` surfaces as the typed `SubstrateUpgradeRequired`. (This
+        // is audit A4 / VS-4.0.1 §10 q3 — the residual un-code-verified claim.)
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy_v2.db");
+        seed_redb_v2_store(&path, None);
+
+        let err = RedbStorage::create_database(&path, &default_config()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PulseDBError::Storage(StorageError::SubstrateUpgradeRequired { .. })
+            ),
+            "redb-v2 file must surface as SubstrateUpgradeRequired, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_writable_open_of_redb_v2_store_migrates_and_writes_marker() {
+        // A WRITABLE open of a redb-v2 store migrates it in place (v2->v3), creates
+        // the .pre-substrate.bak backup, reopens under redb 4.1, and writes the
+        // substrate marker = CURRENT (= {redb-v3, bincode}).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy_v2.db");
+        seed_redb_v2_store(&path, None);
+
+        let backup_path = pre_substrate_backup_path(&path);
+        assert!(!backup_path.exists(), "no backup before migration");
+
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        // Backup of the pristine {redb-v2, bincode} file exists (rollback point).
+        assert!(
+            backup_path.exists(),
+            "redb-format migration must retain a .pre-substrate backup"
+        );
+
+        // The reopened store reads under redb 4.1 (file is now v3) and carries the
+        // CURRENT marker.
+        let marker = RedbStorage::read_substrate_marker(storage.database()).unwrap();
+        assert_eq!(marker, SubstrateFormat::Current);
+        assert_eq!(marker.version(), CURRENT_SUBSTRATE_FORMAT);
+
+        // The schema-v3 .pre-v3.bak sidecar is DISTINCT and not clobbered.
+        assert_ne!(backup_path, pre_v3_backup_path(&path));
+
+        Box::new(storage).close().unwrap();
+
+        // Reopening the now-v3 store is a no-op redb-format-wise (idempotent) and
+        // still reads as Current.
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+        assert_eq!(
+            RedbStorage::read_substrate_marker(storage.database()).unwrap(),
+            SubstrateFormat::Current
+        );
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_read_only_open_of_redb_v2_store_refuses_with_zero_writes() {
+        // FR-035 / audit C6: a read-only open of an un-migrated redb-v2 store returns
+        // ReadOnly BEFORE any write — no backup, no migration-lock content, no
+        // upgrade. The file stays redb-v2 (untouched).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy_v2.db");
+        seed_redb_v2_store(&path, None);
+
+        let err = RedbStorage::open(&path, &Config::read_only()).unwrap_err();
+        assert!(
+            matches!(err, PulseDBError::ReadOnly),
+            "read-only open of redb-v2 store must return ReadOnly, got: {err}"
+        );
+        assert!(
+            !pre_substrate_backup_path(&path).exists(),
+            "read-only refusal must happen BEFORE any backup write (zero writes)"
+        );
+
+        // The file is untouched — still redb-v2 (a fresh redb-4.1 create still
+        // refuses it).
+        let still_v2 = RedbStorage::create_database(&path, &Config::read_only());
+        assert!(
+            matches!(
+                still_v2,
+                Err(PulseDBError::Storage(StorageError::SubstrateUpgradeRequired { .. }))
+            ),
+            "read-only open must NOT have upgraded the file"
+        );
+    }
+
+    #[test]
+    fn test_migration_lock_serializes_and_releases() {
+        // The PulseDB-owned migration lock (audit C2) is exclusive: a second
+        // acquisition fails while the first is held, and succeeds once released.
+        // (fs2 advisory lock; same seam as src/watch/lock.rs.)
+        use fs2::FileExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("locked.db");
+
+        let lock_path = migration_lock_path(&path);
+        {
+            let _held = MigrationLock::acquire_exclusive(&path).unwrap();
+            assert!(lock_path.exists(), "lock sidecar must be created");
+
+            // A non-blocking try on the same advisory lock must fail while held.
+            let probe = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+                .unwrap();
+            assert!(
+                probe.try_lock_exclusive().is_err(),
+                "migration lock must be exclusive while held"
+            );
+        }
+        // After drop, the lock is released — a fresh acquisition succeeds.
+        let _reacquired = MigrationLock::acquire_exclusive(&path).unwrap();
+    }
+
+    #[test]
+    fn test_backup_once_is_atomic_and_idempotent() {
+        // The .pre-substrate backup claim is atomic (create_new) and idempotent: a
+        // second call against an already-claimed path is a no-op and does NOT
+        // clobber the genuine pristine sidecar.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data.db");
+        std::fs::write(&path, b"pristine-v2-bytes").unwrap();
+        let backup_path = pre_substrate_backup_path(&path);
+
+        backup_once(&path, &backup_path).unwrap();
+        assert_eq!(std::fs::read(&backup_path).unwrap(), b"pristine-v2-bytes");
+
+        // Mutate the source, then call backup_once again — the existing backup must
+        // be preserved (idempotent no-op), NOT overwritten with the new bytes.
+        std::fs::write(&path, b"already-migrated-v3-bytes").unwrap();
+        backup_once(&path, &backup_path).unwrap();
+        assert_eq!(
+            std::fs::read(&backup_path).unwrap(),
+            b"pristine-v2-bytes",
+            "backup_once must not clobber an existing pristine sidecar"
+        );
+    }
+
+    #[test]
+    fn test_substrate_format_too_new_is_refused() {
+        // A store whose substrate marker is NEWER than this build (a future
+        // VS-4.0.3 postcard file, marker = 2) is forward-incompatible: opening it
+        // returns the typed SubstrateFormatTooNew and does NOT touch the file.
+        //
+        // Built as a redb-v2 store with marker=2 so it exercises the full path
+        // (redb upgrade -> reopen -> marker gate). After the redb-format upgrade the
+        // marker (a copied-through raw entry) still reads as Newer(2).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("future.db");
+        seed_redb_v2_store(&path, Some(CURRENT_SUBSTRATE_FORMAT + 1));
+
+        let err = RedbStorage::open(&path, &default_config()).unwrap_err();
+        match err {
+            PulseDBError::Storage(StorageError::SubstrateFormatTooNew { found, current }) => {
+                assert_eq!(found, CURRENT_SUBSTRATE_FORMAT + 1);
+                assert_eq!(current, CURRENT_SUBSTRATE_FORMAT);
+            }
+            other => panic!("expected SubstrateFormatTooNew, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_read_only_open_of_current_store_writes_nothing() {
+        // Audit C6: a read-only open of an already-current store performs ZERO
+        // writes — in particular it must NOT update last_opened_at (`touch()`).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("current.db");
+
+        // Create + close a fresh (current) store, capturing last_opened_at.
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+        let opened_at_before = storage.metadata().last_opened_at;
+        Box::new(storage).close().unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Read-only reopen must not bump last_opened_at (no write txn at all).
+        let storage = RedbStorage::open(&path, &Config::read_only()).unwrap();
+        assert_eq!(
+            storage.metadata().last_opened_at,
+            opened_at_before,
+            "read-only open must not write last_opened_at"
+        );
         Box::new(storage).close().unwrap();
     }
 }
