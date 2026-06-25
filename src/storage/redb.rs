@@ -39,11 +39,12 @@ use super::schema::SYNC_CURSORS_TABLE;
 use super::schema::{
     decode_collective_from_activity_key, encode_activity_key, encode_type_index_key,
     DatabaseMetadata, EntityTypeTag, ExperienceTypeTag, ExperienceV2, WatchEventRecord,
-    WatchEventTypeTag, ACTIVITIES_TABLE, COLLECTIVES_TABLE, DECAY_CONFIGS_TABLE, EMBEDDINGS_TABLE,
-    EXPERIENCES_BY_COLLECTIVE_TABLE, EXPERIENCES_BY_TYPE_TABLE, EXPERIENCES_TABLE,
-    INSIGHTS_BY_COLLECTIVE_TABLE, INSIGHTS_TABLE, INSTANCE_ID_KEY, METADATA_TABLE,
-    RELATIONS_BY_SOURCE_TABLE, RELATIONS_BY_TARGET_TABLE, RELATIONS_TABLE, SCHEMA_VERSION,
-    WAL_SEQUENCE_KEY, WATCH_EVENTS_TABLE,
+    WatchEventTypeTag, ACTIVITIES_TABLE, COLLECTIVES_TABLE, CURRENT_SUBSTRATE_FORMAT,
+    DECAY_CONFIGS_TABLE, EMBEDDINGS_TABLE, EXPERIENCES_BY_COLLECTIVE_TABLE,
+    EXPERIENCES_BY_TYPE_TABLE, EXPERIENCES_TABLE, INSIGHTS_BY_COLLECTIVE_TABLE, INSIGHTS_TABLE,
+    INSTANCE_ID_KEY, LEGACY_SUBSTRATE_FORMAT, METADATA_TABLE, RELATIONS_BY_SOURCE_TABLE,
+    RELATIONS_BY_TARGET_TABLE, RELATIONS_TABLE, SCHEMA_VERSION, SUBSTRATE_FORMAT_KEY,
+    SUBSTRATE_MAGIC, SUBSTRATE_MARKER_LEN, WAL_SEQUENCE_KEY, WATCH_EVENTS_TABLE,
 };
 use super::StorageEngine;
 use crate::config::{Config, EmbeddingDimension, RecallWeights};
@@ -51,6 +52,98 @@ use crate::error::{PulseDBError, Result, StorageError, ValidationError};
 
 /// Metadata key in the metadata table.
 const METADATA_KEY: &str = "db_metadata";
+
+// ============================================================================
+// Substrate-format marker — raw, serializer-independent (NOT serde)
+// ============================================================================
+//
+// The marker tells the open path which serializer wrote the file's values
+// (bincode-era vs postcard-era). It therefore CANNOT itself be a serde/bincode
+// blob — it is hand-encoded as raw bytes and read *before* any value is decoded.
+// See `schema.rs` (`SUBSTRATE_FORMAT_KEY`, `CURRENT_SUBSTRATE_FORMAT`).
+
+/// Outcome of reading the on-disk substrate-format marker.
+///
+/// This is the codec/redb-format axis (distinct from the logical schema version).
+/// The migration gate (a later work item) keys off this enum to decide whether a
+/// store opens directly, must migrate forward, or is forward-incompatible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubstrateFormat {
+    /// No marker key present ⇒ a pre-4.0 (bincode-era) database; treated as
+    /// substrate format `0` (`LEGACY_SUBSTRATE_FORMAT`).
+    Absent,
+    /// Marker present and equal to `CURRENT_SUBSTRATE_FORMAT` ⇒ open directly.
+    Current,
+    /// Marker present and **older** than current ⇒ migrate forward. Carries the
+    /// found version.
+    Older(u8),
+    /// Marker present and **newer** than current ⇒ forward-incompatible; do not
+    /// touch. Carries the found version.
+    Newer(u8),
+}
+
+impl SubstrateFormat {
+    /// The substrate-format version this value represents.
+    ///
+    /// `Absent` maps to `LEGACY_SUBSTRATE_FORMAT` (0); the others carry their
+    /// stored version.
+    pub fn version(self) -> u8 {
+        match self {
+            SubstrateFormat::Absent => LEGACY_SUBSTRATE_FORMAT,
+            SubstrateFormat::Current => CURRENT_SUBSTRATE_FORMAT,
+            SubstrateFormat::Older(v) | SubstrateFormat::Newer(v) => v,
+        }
+    }
+
+    /// Classifies a found substrate-format version against the current build.
+    // Exercised by tests + `read_substrate_marker`; the open-path consumer (the
+    // migration gate) is wired in work 1.03, so the non-test build sees it unused.
+    #[allow(dead_code)]
+    fn classify(found: u8) -> Self {
+        use std::cmp::Ordering;
+        match found.cmp(&CURRENT_SUBSTRATE_FORMAT) {
+            Ordering::Equal => SubstrateFormat::Current,
+            Ordering::Less => SubstrateFormat::Older(found),
+            Ordering::Greater => SubstrateFormat::Newer(found),
+        }
+    }
+}
+
+/// Encodes the substrate-format marker as raw fixed-layout bytes.
+///
+/// Layout: `[SUBSTRATE_MAGIC[0], SUBSTRATE_MAGIC[1], version]` — 3 bytes,
+/// hand-written, never through serde. This is the byte sequence stored under
+/// `SUBSTRATE_FORMAT_KEY`.
+fn encode_substrate_marker(version: u8) -> [u8; SUBSTRATE_MARKER_LEN] {
+    [SUBSTRATE_MAGIC[0], SUBSTRATE_MAGIC[1], version]
+}
+
+/// Decodes a raw substrate-format marker, validating the magic prefix.
+///
+/// Returns the substrate-format version on success. A wrong length or a magic
+/// mismatch is a corruption signal (NOT an Absent/legacy database — absence is
+/// detected by the key being missing, which the caller handles separately).
+// Used by `read_substrate_marker` + tests; the open-path consumer lands in 1.03.
+#[allow(dead_code)]
+fn decode_substrate_marker(bytes: &[u8]) -> Result<u8> {
+    if bytes.len() != SUBSTRATE_MARKER_LEN {
+        return Err(StorageError::corrupted(format!(
+            "substrate_format marker has wrong length: expected {} bytes, found {}",
+            SUBSTRATE_MARKER_LEN,
+            bytes.len()
+        ))
+        .into());
+    }
+    if bytes[0] != SUBSTRATE_MAGIC[0] || bytes[1] != SUBSTRATE_MAGIC[1] {
+        return Err(StorageError::corrupted(format!(
+            "substrate_format marker magic mismatch: expected {:?}, found {:?}",
+            SUBSTRATE_MAGIC,
+            &bytes[..2.min(bytes.len())]
+        ))
+        .into());
+    }
+    Ok(bytes[2])
+}
 
 /// Deterministic sibling path retained before schema-v3 migrations.
 fn pre_v3_backup_path(path: &Path) -> PathBuf {
@@ -224,6 +317,40 @@ impl RedbStorage {
         Ok(db)
     }
 
+    /// Reads the raw substrate-format marker, before decoding any serde value.
+    ///
+    /// This is the bootstrapping read: it inspects raw bytes under
+    /// `SUBSTRATE_FORMAT_KEY` directly, so it is valid regardless of which
+    /// serializer wrote the rest of the file. The result classifies the store as
+    /// [`SubstrateFormat::Absent`] (no key ⇒ pre-4.0 / bincode era),
+    /// [`SubstrateFormat::Current`], [`SubstrateFormat::Older`], or
+    /// [`SubstrateFormat::Newer`].
+    ///
+    /// A present-but-malformed marker (wrong length or bad magic) is a corruption
+    /// error, *not* an Absent database — absence is signalled only by the key
+    /// being missing entirely.
+    ///
+    /// Note: this is a pure read primitive. It does NOT itself trigger any
+    /// migration; the migration gate that acts on `Older`/`Absent` is wired in a
+    /// later work item.
+    // Plumbing primitive consumed by the work-1.03 migration gate; exercised by
+    // tests here. Until 1.03 wires the open path, the non-test build sees it unused.
+    #[allow(dead_code)]
+    pub(crate) fn read_substrate_marker(db: &Database) -> Result<SubstrateFormat> {
+        let read_txn = db.begin_read().map_err(StorageError::from)?;
+        let meta_table = read_txn
+            .open_table(METADATA_TABLE)
+            .map_err(|e| StorageError::corrupted(format!("Cannot open metadata table: {}", e)))?;
+
+        match meta_table.get(SUBSTRATE_FORMAT_KEY).map_err(StorageError::from)? {
+            None => Ok(SubstrateFormat::Absent),
+            Some(entry) => {
+                let version = decode_substrate_marker(entry.value())?;
+                Ok(SubstrateFormat::classify(version))
+            }
+        }
+    }
+
     fn read_metadata(db: &Database) -> Result<DatabaseMetadata> {
         let read_txn = db.begin_read().map_err(StorageError::from)?;
         let meta_table = read_txn
@@ -303,6 +430,12 @@ impl RedbStorage {
 
             let instance_id = InstanceId::new();
             meta_table.insert(INSTANCE_ID_KEY, instance_id.as_bytes().as_slice())?;
+
+            // A fresh database is created at the current substrate format. The
+            // marker is raw, hand-encoded bytes (NEVER serde) so it is readable
+            // before the serializer identity is known — see `read_substrate_marker`.
+            let substrate_marker = encode_substrate_marker(CURRENT_SUBSTRATE_FORMAT);
+            meta_table.insert(SUBSTRATE_FORMAT_KEY, substrate_marker.as_slice())?;
 
             #[cfg(feature = "sync")]
             {
@@ -2079,6 +2212,129 @@ mod tests {
     use super::*;
     use crate::PulseDB;
     use tempfile::tempdir;
+
+    // ====================================================================
+    // Substrate-format marker tests (work 1.02)
+    // ====================================================================
+
+    #[test]
+    fn test_substrate_marker_fixed_layout_encoding() {
+        // The marker is 3 raw bytes: [magic, magic, version]. It must be
+        // parseable WITHOUT serde — assert the exact byte layout.
+        let bytes = encode_substrate_marker(CURRENT_SUBSTRATE_FORMAT);
+        assert_eq!(bytes.len(), SUBSTRATE_MARKER_LEN);
+        assert_eq!(bytes[0], SUBSTRATE_MAGIC[0]);
+        assert_eq!(bytes[1], SUBSTRATE_MAGIC[1]);
+        assert_eq!(bytes[2], CURRENT_SUBSTRATE_FORMAT);
+        // Magic spells "PS".
+        assert_eq!(&bytes[..2], b"PS");
+    }
+
+    #[test]
+    fn test_substrate_marker_encode_decode_roundtrip() {
+        for version in [0u8, 1, 7, 42, 255] {
+            let bytes = encode_substrate_marker(version);
+            let decoded = decode_substrate_marker(&bytes).unwrap();
+            assert_eq!(decoded, version);
+        }
+    }
+
+    #[test]
+    fn test_decode_substrate_marker_rejects_wrong_length() {
+        // Too short and too long are both corruption, not Absent.
+        assert!(decode_substrate_marker(&[]).is_err());
+        assert!(decode_substrate_marker(&[b'P', b'S']).is_err());
+        assert!(decode_substrate_marker(&[b'P', b'S', 1, 0]).is_err());
+    }
+
+    #[test]
+    fn test_decode_substrate_marker_rejects_bad_magic() {
+        // Right length, wrong magic ⇒ corruption error (not a legacy DB).
+        let err = decode_substrate_marker(&[b'X', b'Y', 1]).unwrap_err();
+        assert!(err.is_storage());
+        assert!(err.to_string().contains("magic"), "err: {err}");
+    }
+
+    #[test]
+    fn test_substrate_format_classify() {
+        assert_eq!(
+            SubstrateFormat::classify(CURRENT_SUBSTRATE_FORMAT),
+            SubstrateFormat::Current
+        );
+        assert_eq!(
+            SubstrateFormat::classify(CURRENT_SUBSTRATE_FORMAT - 1),
+            SubstrateFormat::Older(CURRENT_SUBSTRATE_FORMAT - 1)
+        );
+        assert_eq!(
+            SubstrateFormat::classify(CURRENT_SUBSTRATE_FORMAT + 1),
+            SubstrateFormat::Newer(CURRENT_SUBSTRATE_FORMAT + 1)
+        );
+        assert_eq!(SubstrateFormat::Absent.version(), LEGACY_SUBSTRATE_FORMAT);
+        assert_eq!(SubstrateFormat::Older(0).version(), 0);
+        assert_eq!(SubstrateFormat::Newer(9).version(), 9);
+    }
+
+    #[test]
+    fn test_fresh_db_writes_current_substrate_marker() {
+        // A freshly initialized database carries the marker and reads as Current.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("fresh.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        let marker = RedbStorage::read_substrate_marker(storage.database()).unwrap();
+        assert_eq!(marker, SubstrateFormat::Current);
+        assert_eq!(marker.version(), CURRENT_SUBSTRATE_FORMAT);
+
+        // And the on-disk bytes are exactly the raw fixed layout (not serde).
+        let read_txn = storage.database().begin_read().unwrap();
+        let meta = read_txn.open_table(METADATA_TABLE).unwrap();
+        let raw = meta.get(SUBSTRATE_FORMAT_KEY).unwrap().unwrap();
+        assert_eq!(raw.value(), &[b'P', b'S', CURRENT_SUBSTRATE_FORMAT][..]);
+    }
+
+    #[test]
+    fn test_db_without_marker_reads_as_absent() {
+        // A database written WITHOUT the substrate_format key (a pre-4.0,
+        // bincode-era store) reads as Absent — the additive marker read does not
+        // require the key to exist.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        {
+            let db = Database::builder().create(&path).unwrap();
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut meta = write_txn.open_table(METADATA_TABLE).unwrap();
+                // Write some unrelated metadata, but NOT the substrate marker.
+                let metadata = DatabaseMetadata::new(EmbeddingDimension::D384);
+                let bytes = bincode::serialize(&metadata).unwrap();
+                meta.insert(METADATA_KEY, bytes.as_slice()).unwrap();
+            }
+            write_txn.commit().unwrap();
+
+            let marker = RedbStorage::read_substrate_marker(&db).unwrap();
+            assert_eq!(marker, SubstrateFormat::Absent);
+            assert_eq!(marker.version(), LEGACY_SUBSTRATE_FORMAT);
+        }
+    }
+
+    #[test]
+    fn test_malformed_marker_is_corruption_not_absent() {
+        // A present-but-malformed marker is a corruption error, NOT Absent.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("corrupt.db");
+        let db = Database::builder().create(&path).unwrap();
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut meta = write_txn.open_table(METADATA_TABLE).unwrap();
+            // Wrong magic bytes under the right key.
+            meta.insert(SUBSTRATE_FORMAT_KEY, &[0xDE_u8, 0xAD, 0x01][..])
+                .unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        let err = RedbStorage::read_substrate_marker(&db).unwrap_err();
+        assert!(err.is_storage(), "expected storage/corruption error: {err}");
+    }
 
     #[derive(Serialize)]
     struct SeedExperienceV2 {

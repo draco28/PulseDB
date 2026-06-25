@@ -216,6 +216,45 @@ pub enum StorageError {
     /// Table not found in database.
     #[error("Table not found: {0}")]
     TableNotFound(String),
+
+    /// The database was written by an **older** substrate format and must be
+    /// migrated before it can be opened.
+    ///
+    /// The substrate format is the storage-substrate axis (redb file format +
+    /// value serializer), distinct from the logical `schema_version`. This is the
+    /// *typed, actionable* signal a guided migration keys off — it must never be a
+    /// raw redb `UpgradeRequired` or a bincode decode panic leaking through.
+    ///
+    /// A **writable** open of such a store migrates automatically (the migration
+    /// gate is wired in a later work item); this error is surfaced only when
+    /// migration cannot proceed (e.g. a read-only open).
+    #[error(
+        "Database substrate format {found} is older than the current format {current}; \
+         open the database writable once to migrate it (read-only opens of an \
+         un-migrated store cannot upgrade)"
+    )]
+    SubstrateUpgradeRequired {
+        /// Substrate format found in the database (0 = pre-4.0 / bincode era).
+        found: u8,
+        /// Current substrate format this build writes and reads.
+        current: u8,
+    },
+
+    /// The database was written by a **newer** PulseDB whose substrate format is
+    /// ahead of this build — a forward-incompatibility.
+    ///
+    /// This build must not touch the file: doing so risks silent corruption.
+    /// Upgrade PulseDB to a version that understands substrate format `found`.
+    #[error(
+        "Database substrate format {found} is newer than this build's format {current}; \
+         upgrade PulseDB to open this database (do not modify it with an older build)"
+    )]
+    SubstrateFormatTooNew {
+        /// Substrate format found in the database.
+        found: u8,
+        /// Current substrate format this build supports.
+        current: u8,
+    },
 }
 
 impl StorageError {
@@ -237,6 +276,19 @@ impl StorageError {
     /// Creates a redb error with the given message.
     pub fn redb(msg: impl Into<String>) -> Self {
         Self::Redb(msg.into())
+    }
+
+    /// Creates a substrate-upgrade-required error.
+    ///
+    /// `found` is the substrate format stored in the database (0 = pre-4.0
+    /// bincode era), `current` is the format this build writes.
+    pub fn substrate_upgrade_required(found: u8, current: u8) -> Self {
+        Self::SubstrateUpgradeRequired { found, current }
+    }
+
+    /// Creates a substrate-format-too-new error (forward-incompatibility).
+    pub fn substrate_format_too_new(found: u8, current: u8) -> Self {
+        Self::SubstrateFormatTooNew { found, current }
     }
 }
 
@@ -585,5 +637,47 @@ mod tests {
         ));
         assert!(err.is_io());
         assert!(!err.is_storage());
+    }
+
+    #[test]
+    fn test_substrate_upgrade_required_display_is_actionable() {
+        let err = StorageError::substrate_upgrade_required(0, 1);
+        assert!(matches!(
+            err,
+            StorageError::SubstrateUpgradeRequired {
+                found: 0,
+                current: 1
+            }
+        ));
+        let msg = err.to_string();
+        // Names both versions and tells the operator HOW to recover.
+        assert!(msg.contains("substrate format 0"), "msg: {msg}");
+        assert!(msg.contains("current format 1"), "msg: {msg}");
+        assert!(msg.contains("writable"), "msg: {msg}");
+    }
+
+    #[test]
+    fn test_substrate_format_too_new_display_is_actionable() {
+        let err = StorageError::substrate_format_too_new(7, 1);
+        assert!(matches!(
+            err,
+            StorageError::SubstrateFormatTooNew {
+                found: 7,
+                current: 1
+            }
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("substrate format 7"), "msg: {msg}");
+        assert!(msg.contains("format 1"), "msg: {msg}");
+        // Tells the operator to upgrade rather than touch the file.
+        assert!(msg.contains("upgrade PulseDB"), "msg: {msg}");
+    }
+
+    #[test]
+    fn test_substrate_errors_propagate_as_storage() {
+        let err: PulseDBError = StorageError::substrate_upgrade_required(0, 1).into();
+        assert!(err.is_storage());
+        let err: PulseDBError = StorageError::substrate_format_too_new(2, 1).into();
+        assert!(err.is_storage());
     }
 }
