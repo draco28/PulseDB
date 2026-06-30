@@ -85,17 +85,18 @@ pub const SUBSTRATE_MAGIC: [u8; 2] = *b"PS";
 ///
 /// - `0` / **absent** = `{redb-v2, bincode}` — the legacy v0.5.1 state (no marker
 ///   key existed before Sprint 4.0).
-/// - `1` = `{redb-v3, bincode}` — the **VS-4.0.2 end-state** (what this slice
-///   produces). The redb file format is upgraded v2→v3, but values stay bincode;
-///   the bincode→postcard codec swap is VS-4.0.3.
-/// - `2` = `{redb-v3, postcard}` — VS-4.0.3 will bump `CURRENT` to `2` and add the
-///   bincode→postcard codec migration gated on `marker < 2`.
+/// - `1` = `{redb-v3, bincode}` — the **VS-4.0.2 end-state**. The redb file format
+///   is upgraded v2→v3, but values stay bincode.
+/// - `2` = `{redb-v3, postcard}` — the **VS-4.0.3 end-state** (what this slice
+///   produces). `CURRENT` is `2`; the bincode→postcard codec migration is gated on
+///   `marker < 2` (an `Absent | Older` store re-encodes every serde-blob row to
+///   postcard, then the marker bumps to `2` as the commit point).
 ///
 /// Bumped whenever *either* the redb file format *or* the serializer changes —
 /// independently of [`SCHEMA_VERSION`]. A fresh database is written at this value;
 /// an existing database whose marker is **absent** is treated as substrate-format
 /// `0` (the pre-4.0 `{redb-v2, bincode}` era).
-pub const CURRENT_SUBSTRATE_FORMAT: u8 = 1;
+pub const CURRENT_SUBSTRATE_FORMAT: u8 = 2;
 
 /// Substrate-format version implied by an **absent** marker.
 ///
@@ -735,8 +736,8 @@ mod tests {
     #[test]
     fn test_database_metadata_serialization() {
         let meta = DatabaseMetadata::new(EmbeddingDimension::D768);
-        let bytes = bincode::serialize(&meta).unwrap();
-        let restored: DatabaseMetadata = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_stdvec(&meta).unwrap();
+        let restored: DatabaseMetadata = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(meta.schema_version, restored.schema_version);
         assert_eq!(meta.embedding_dimension, restored.embedding_dimension);
     }
@@ -806,10 +807,10 @@ mod tests {
     }
 
     #[test]
-    fn test_experience_type_tag_bincode_roundtrip() {
+    fn test_experience_type_tag_postcard_roundtrip() {
         for tag in ExperienceTypeTag::all() {
-            let bytes = bincode::serialize(tag).unwrap();
-            let restored: ExperienceTypeTag = bincode::deserialize(&bytes).unwrap();
+            let bytes = postcard::to_stdvec(tag).unwrap();
+            let restored: ExperienceTypeTag = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(*tag, restored);
         }
     }

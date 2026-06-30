@@ -255,6 +255,34 @@ pub enum StorageError {
         /// Current substrate format this build supports.
         current: u8,
     },
+
+    /// The bincode→postcard codec migration cannot run as a single transaction
+    /// because the store is larger than the safe single-txn ceiling, and no
+    /// declared available-memory budget (or a too-small one) authorizes it.
+    ///
+    /// This is the **fail-closed-above-floor** valve (VS-4.0.3 work-1.04 §6.4):
+    /// rather than risk an OOM mid-migration (which would leave the migration
+    /// unfinishable) or ship a half-correct phased path, the codec pass refuses
+    /// with **zero destructive writes**. The caller can either declare an
+    /// available-memory budget via `Config` to raise the single-txn ceiling, or
+    /// use the offline `pulsedb migrate` tool (VS-4.0.4) for very large stores.
+    ///
+    /// `store_size` is the on-disk file size at open; `projected_peak` is the
+    /// conservative peak-RSS estimate (`store_size × coefficient`); `budget` is
+    /// the single-txn ceiling that was exceeded.
+    #[error(
+        "store too large for a single-transaction codec migration: store size {store_size} bytes \
+         (projected peak ~{projected_peak} bytes) exceeds the single-txn budget of {budget} bytes; \
+         declare available memory via Config to raise the ceiling, or run the offline migration tool"
+    )]
+    SubstrateMigrationTooLarge {
+        /// On-disk redb file size at open, in bytes.
+        store_size: u64,
+        /// Conservative peak-RSS estimate for a single-txn re-encode, in bytes.
+        projected_peak: u64,
+        /// The single-txn budget (ceiling) that `projected_peak` exceeded, in bytes.
+        budget: u64,
+    },
 }
 
 impl StorageError {
@@ -289,6 +317,15 @@ impl StorageError {
     /// Creates a substrate-format-too-new error (forward-incompatibility).
     pub fn substrate_format_too_new(found: u8, current: u8) -> Self {
         Self::SubstrateFormatTooNew { found, current }
+    }
+
+    /// Creates a substrate-migration-too-large error (single-txn ceiling exceeded).
+    pub fn substrate_migration_too_large(store_size: u64, projected_peak: u64, budget: u64) -> Self {
+        Self::SubstrateMigrationTooLarge {
+            store_size,
+            projected_peak,
+            budget,
+        }
     }
 }
 
@@ -329,9 +366,9 @@ impl From<redb::StorageError> for StorageError {
     }
 }
 
-// Convert bincode errors to StorageError
-impl From<bincode::Error> for StorageError {
-    fn from(err: bincode::Error) -> Self {
+// Convert postcard errors to StorageError
+impl From<postcard::Error> for StorageError {
+    fn from(err: postcard::Error) -> Self {
         StorageError::Serialization(err.to_string())
     }
 }
@@ -373,8 +410,8 @@ impl From<redb::StorageError> for PulseDBError {
     }
 }
 
-impl From<bincode::Error> for PulseDBError {
-    fn from(err: bincode::Error) -> Self {
+impl From<postcard::Error> for PulseDBError {
+    fn from(err: postcard::Error) -> Self {
         PulseDBError::Storage(StorageError::from(err))
     }
 }

@@ -486,5 +486,8 @@ impl<'de, 'a> VariantAccess<'de> for VariantDeserializer<'a, 'de> {
     }
 }
 
+// `pub(crate)` (not private) so VS-4.0.3/1.04's migration fixtures + decay
+// goldens in `storage::redb::tests` can reuse the frozen `*_GOLDEN` oracle byte
+// constants (audit C2) rather than re-minting them via the live serializer.
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

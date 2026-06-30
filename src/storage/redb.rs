@@ -46,6 +46,7 @@ use super::schema::{
     RELATIONS_BY_TARGET_TABLE, RELATIONS_TABLE, SCHEMA_VERSION, SUBSTRATE_FORMAT_KEY,
     SUBSTRATE_MAGIC, SUBSTRATE_MARKER_LEN, WAL_SEQUENCE_KEY, WATCH_EVENTS_TABLE,
 };
+use super::legacy_bincode;
 use super::StorageEngine;
 use crate::config::{Config, EmbeddingDimension, RecallWeights};
 use crate::error::{PulseDBError, Result, StorageError, ValidationError};
@@ -566,7 +567,20 @@ impl RedbStorage {
         }
     }
 
+    /// Reads `db_metadata`, decoding with the codec implied by the substrate
+    /// marker (bootstrapping — design §2.2).
+    ///
+    /// This runs at `open_existing` start, **before** the codec re-encode pass, so
+    /// it cannot assume the values are postcard yet. It branches on the raw marker
+    /// (read serializer-independently via [`read_substrate_marker`]):
+    /// - `marker == Current` (`{redb-v3, postcard}`) ⇒ `postcard::from_bytes`;
+    /// - `Absent | Older` (bincode-era values not yet re-encoded) ⇒
+    ///   `legacy_bincode::decode` (1.01 vendored reader).
+    ///
+    /// `Newer` is handled by the caller (`open_existing`) before any value read, so
+    /// it never reaches here; we treat it as the postcard path defensively.
     fn read_metadata(db: &Database) -> Result<DatabaseMetadata> {
+        let marker = Self::read_substrate_marker(db)?;
         let read_txn = db.begin_read().map_err(StorageError::from)?;
         let meta_table = read_txn
             .open_table(METADATA_TABLE)
@@ -577,8 +591,18 @@ impl RedbStorage {
             .map_err(StorageError::from)?
             .ok_or_else(|| StorageError::corrupted("Missing database metadata"))?;
 
-        bincode::deserialize::<DatabaseMetadata>(metadata_bytes.value())
-            .map_err(|e| StorageError::corrupted(format!("Invalid metadata format: {}", e)).into())
+        match marker {
+            SubstrateFormat::Absent | SubstrateFormat::Older(_) => {
+                legacy_bincode::decode::<DatabaseMetadata>(metadata_bytes.value()).map_err(|e| {
+                    StorageError::corrupted(format!("Invalid legacy metadata format: {}", e)).into()
+                })
+            }
+            SubstrateFormat::Current | SubstrateFormat::Newer(_) => {
+                postcard::from_bytes::<DatabaseMetadata>(metadata_bytes.value()).map_err(|e| {
+                    StorageError::corrupted(format!("Invalid metadata format: {}", e)).into()
+                })
+            }
+        }
     }
 
     fn validate_existing_metadata(metadata: &DatabaseMetadata, config: &Config) -> Result<()> {
@@ -624,7 +648,7 @@ impl RedbStorage {
         {
             // Create the metadata table and write metadata
             let mut meta_table = write_txn.open_table(METADATA_TABLE)?;
-            let metadata_bytes = bincode::serialize(&metadata)
+            let metadata_bytes = postcard::to_stdvec(&metadata)
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             meta_table.insert(METADATA_KEY, metadata_bytes.as_slice())?;
 
@@ -784,6 +808,17 @@ impl RedbStorage {
             SubstrateFormat::Current => false,
         };
 
+        // Codec migration (bincode→postcard) runs when the marker is Absent|Older
+        // (`needs_marker_write`). Decide the transaction shape CONFIG-FIRST and
+        // BEFORE opening any write txn, so a too-large store fails closed with the
+        // typed `SubstrateMigrationTooLarge` and ZERO destructive writes (design
+        // §6.3 / §6.4(3)). The common path (store below the conservative floor, or
+        // a declared memory budget) is the realized single-txn primary path.
+        if needs_marker_write && !config.read_only {
+            let store_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            Self::resolve_codec_txn_shape(store_size, config)?;
+        }
+
         // Audit C6 / FR-035: a read-only open performs ZERO writes — it must not
         // write `last_opened_at` (`touch()`) nor open a write txn, so it can run
         // against a locked/old store without faulting. (An un-migrated store has
@@ -803,7 +838,9 @@ impl RedbStorage {
                 let _ = write_txn.open_table(WATCH_EVENTS_TABLE)?;
                 let _ = write_txn.open_table(DECAY_CONFIGS_TABLE)?;
 
-                // Migrate WAL records from v1 → v2 (add entity_type field)
+                // Migrate WAL records from v1 → v2 (add entity_type field). The
+                // reshape READ side decodes legacy bincode; the rewrite is current
+                // schema (the codec loop below re-encodes it idempotently).
                 if needs_v2_migration {
                     Self::migrate_wal_v1_to_v2(&write_txn)?;
                     info!("Migrated WAL records from schema v1 to v2");
@@ -817,19 +854,6 @@ impl RedbStorage {
                     debug!("Generated new instance_id for existing database");
                 }
 
-                // Write the substrate-format marker = CURRENT (=1 = {redb-v3,
-                // bincode}) in the SAME txn as the final metadata, so the marker is
-                // the commit point of the substrate migration. Raw, hand-encoded
-                // bytes (NEVER serde) — see `read_substrate_marker`.
-                if needs_marker_write {
-                    let marker = encode_substrate_marker(CURRENT_SUBSTRATE_FORMAT);
-                    meta_table.insert(SUBSTRATE_FORMAT_KEY, marker.as_slice())?;
-                    debug!(
-                        marker = CURRENT_SUBSTRATE_FORMAT,
-                        "wrote substrate-format marker (now {{redb-v3, bincode}})"
-                    );
-                }
-
                 #[cfg(feature = "sync")]
                 {
                     let _ = write_txn.open_table(SYNC_CURSORS_TABLE)?;
@@ -837,15 +861,44 @@ impl RedbStorage {
 
                 drop(meta_table);
 
+                // Schema reshape v2→v3 (READ side decodes legacy bincode; rewrite is
+                // current schema). Orthogonal to the codec axis below.
                 if needs_v3_migration {
                     Self::migrate_experiences_v2_to_v3(&write_txn)?;
                     info!("Migrated experiences from schema v2 to v3");
                 }
 
+                // DECOUPLED CODEC RE-ENCODE (design §2.3 / grill Q1): driven SOLELY
+                // by the substrate marker (`needs_marker_write` ⇒ Absent|Older),
+                // re-encode EVERY serde-blob table bincode→postcard, unconditionally
+                // — no table is covered only by a reshape migrator. A `{redb-v3,
+                // bincode}` store hits NO-OP reshape above yet has every row
+                // re-encoded here. Copy-through tables (EMBEDDINGS, the 5 multimaps,
+                // raw metadata keys) are NEVER touched → byte-identical.
+                if needs_marker_write {
+                    Self::reencode_serde_blobs_to_postcard(&write_txn)?;
+                    info!("Re-encoded storage values from bincode to postcard");
+                }
+
+                // Final metadata (touched + schema-bumped) in postcard.
                 let mut meta_table = write_txn.open_table(METADATA_TABLE)?;
-                let metadata_bytes = bincode::serialize(&metadata)
+                let metadata_bytes = postcard::to_stdvec(&metadata)
                     .map_err(|e| StorageError::serialization(e.to_string()))?;
                 meta_table.insert(METADATA_KEY, metadata_bytes.as_slice())?;
+
+                // MARKER = COMMIT POINT (design §2.3): write the substrate-format
+                // marker = CURRENT (= 2 = {redb-v3, postcard}) as the **LAST write**
+                // in this txn, AFTER the re-encode loop succeeded. A crash mid-pass
+                // leaves the old marker (1/Absent) + old-codec-decodable data →
+                // clean rollback. Raw, hand-encoded bytes (NEVER serde).
+                if needs_marker_write {
+                    let marker = encode_substrate_marker(CURRENT_SUBSTRATE_FORMAT);
+                    meta_table.insert(SUBSTRATE_FORMAT_KEY, marker.as_slice())?;
+                    debug!(
+                        marker = CURRENT_SUBSTRATE_FORMAT,
+                        "wrote substrate-format marker LAST (now {{redb-v3, postcard}})"
+                    );
+                }
             }
             write_txn.commit().map_err(StorageError::from)?;
         }
@@ -942,7 +995,7 @@ impl RedbStorage {
             entity_type,
         };
         let record_bytes =
-            bincode::serialize(&record).map_err(|e| StorageError::serialization(e.to_string()))?;
+            postcard::to_stdvec(&record).map_err(|e| StorageError::serialization(e.to_string()))?;
 
         let mut events_table = write_txn.open_table(WATCH_EVENTS_TABLE)?;
         events_table.insert(&seq_bytes, record_bytes.as_slice())?;
@@ -959,12 +1012,16 @@ impl RedbStorage {
 
         let events_table = write_txn.open_table(WATCH_EVENTS_TABLE)?;
 
-        // Collect all (key, v1_record) pairs
+        // Collect all (key, v1_record) pairs. The reshape READ side decodes the
+        // legacy-bincode v1 bytes via the 1.01 vendored reader (design §2.3 — the
+        // reshape migrators read legacy bincode; the codec loop owns the postcard
+        // re-encode). The rewrite below is at current schema in postcard, which the
+        // codec loop then treats idempotently.
         let mut entries: Vec<([u8; 8], WatchEventRecordV1)> = Vec::new();
         for entry in events_table.iter()? {
             let (key, value) = entry.map_err(StorageError::from)?;
             let seq_bytes: [u8; 8] = *key.value();
-            let v1_record: WatchEventRecordV1 = bincode::deserialize(value.value())
+            let v1_record: WatchEventRecordV1 = legacy_bincode::decode(value.value())
                 .map_err(|e| StorageError::serialization(format!("v1 WAL record: {}", e)))?;
             entries.push((seq_bytes, v1_record));
         }
@@ -981,7 +1038,7 @@ impl RedbStorage {
                 entity_type: EntityTypeTag::Experience,
             };
             let v2_bytes =
-                bincode::serialize(&v2).map_err(|e| StorageError::serialization(e.to_string()))?;
+                postcard::to_stdvec(&v2).map_err(|e| StorageError::serialization(e.to_string()))?;
             events_table.insert(seq_bytes, v2_bytes.as_slice())?;
         }
 
@@ -1009,7 +1066,10 @@ impl RedbStorage {
             let entry = experiences_table.get(&experience_id)?.ok_or_else(|| {
                 StorageError::corrupted("experience disappeared during migration")
             })?;
-            let v2: ExperienceV2 = bincode::deserialize(entry.value())
+            // Reshape READ side: decode the legacy-bincode v2 bytes via the 1.01
+            // vendored reader (design §2.3). The rewrite below is current-schema
+            // postcard, which the codec loop then treats idempotently.
+            let v2: ExperienceV2 = legacy_bincode::decode(entry.value())
                 .map_err(|e| StorageError::serialization(format!("v2 experience record: {}", e)))?;
             drop(entry);
 
@@ -1034,12 +1094,354 @@ impl RedbStorage {
                 archived: v2.archived,
             };
             let bytes =
-                bincode::serialize(&v3).map_err(|e| StorageError::serialization(e.to_string()))?;
+                postcard::to_stdvec(&v3).map_err(|e| StorageError::serialization(e.to_string()))?;
             experiences_table.insert(&experience_id, bytes.as_slice())?;
         }
 
         debug!("Migrated experience records to v3");
         Ok(())
+    }
+
+    // ========================================================================
+    // Codec re-encode pass (bincode → postcard) — VS-4.0.3 / work-1.04
+    // ========================================================================
+    //
+    // Driven SOLELY by the substrate marker (Absent | Older), this pass is
+    // ORTHOGONAL to the schema-reshape migrators (which key off `schema_version`).
+    // It re-encodes EVERY serde-blob table unconditionally — no table is covered
+    // only by a reshape migrator (design §2.3 / grill Q1). A `{redb-v3, bincode}`
+    // store hits NO-OP reshape yet still gets every row re-encoded here.
+    //
+    // §2a copy-through matrix: this pass touches ONLY the 9 serde-blob tables. It
+    // NEVER reads or rewrites `EMBEDDINGS_TABLE` (raw LE f32), the 5 multimap index
+    // tables, or the raw `METADATA_TABLE` keys `instance_id` / `wal_sequence` /
+    // `substrate_format` — those are left untouched in the same redb file, which IS
+    // byte-identical copy-through.
+
+    /// Single-txn re-encode budget (the conservative small-host store-size floor).
+    ///
+    /// 1 GiB: at the 1.02 peak-RSS coefficient (`0.10 × store_size`) a 1 GiB store
+    /// projects to ~100 MB peak, which fits a ~512 MB–1 GB box. Below this floor we
+    /// always take the single-txn path; above it we require a *declared* memory
+    /// budget (config-first) or fail closed (design §6.3 / audit C1).
+    const SINGLE_TXN_STORE_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
+
+    /// 1.02 conservative peak-RSS coefficient: `peak ≈ store_size × 0.10`.
+    /// (Measured 0.06–0.10 flat across 10k→500k; 0.10 is the conservative envelope.)
+    const PEAK_RSS_NUMERATOR: u64 = 10; // peak ≈ store_size * 10 / 100
+    const PEAK_RSS_DENOMINATOR: u64 = 100;
+
+    /// Safety margin applied to a *declared* available-memory budget before it is
+    /// allowed to authorize a single-txn migration of an above-floor store.
+    const DECLARED_MEM_SAFETY_NUMERATOR: u64 = 1; // projected_peak < declared * (1/2)
+    const DECLARED_MEM_SAFETY_DENOMINATOR: u64 = 2;
+
+    /// The realized shape of the codec re-encode pass.
+    ///
+    /// 1.05 (the headroom preflight) can call [`Self::resolve_codec_txn_shape`] to
+    /// learn this + the `projected_peak` without re-deriving the rule.
+    fn projected_peak_rss(store_size: u64) -> u64 {
+        store_size
+            .saturating_mul(Self::PEAK_RSS_NUMERATOR)
+            / Self::PEAK_RSS_DENOMINATOR
+    }
+
+    /// Config-first transaction-shape decision for the codec re-encode pass
+    /// (design §6.3 — the baked-in 1.02 deliverable).
+    ///
+    /// Returns `Ok(())` if a **single transaction** is safe (the realized primary
+    /// path — `store_size <= FLOOR`, or a declared memory budget covers the
+    /// projected peak with margin). Returns `Err(SubstrateMigrationTooLarge)` —
+    /// the **fail-closed-above-floor valve** (work-1.04 §6.4(3)) — if the store is
+    /// above the floor and no declared budget authorizes it: a typed, actionable
+    /// error with **zero destructive writes** (1.05's preflight surfaces the same;
+    /// the offline `pulsedb migrate` tool, VS-4.0.4, is the large-store escape).
+    ///
+    /// **Config-first, NOT host-memory auto-detect** (a cgroup-limited container
+    /// over-reports host RAM → would wrongly pick single-txn → OOM). The embedder
+    /// *declares* `migration_available_memory_bytes` to opt into a higher ceiling.
+    fn resolve_codec_txn_shape(store_size: u64, config: &Config) -> Result<()> {
+        let projected_peak = Self::projected_peak_rss(store_size);
+
+        // Common path: below the conservative absolute floor → single-txn is safe.
+        if store_size <= Self::SINGLE_TXN_STORE_FLOOR_BYTES {
+            debug!(
+                store_size,
+                projected_peak,
+                floor = Self::SINGLE_TXN_STORE_FLOOR_BYTES,
+                "codec migration: single-txn (store below the conservative floor)"
+            );
+            return Ok(());
+        }
+
+        // Above the floor: only a *declared* budget (config-first) can authorize a
+        // single-txn migration. projected_peak < declared * SAFETY_MARGIN.
+        if let Some(declared) = config.migration_available_memory_bytes {
+            let allowed = declared
+                .saturating_mul(Self::DECLARED_MEM_SAFETY_NUMERATOR)
+                / Self::DECLARED_MEM_SAFETY_DENOMINATOR;
+            if projected_peak < allowed {
+                debug!(
+                    store_size,
+                    projected_peak,
+                    declared,
+                    "codec migration: single-txn (declared memory budget covers projected peak)"
+                );
+                return Ok(());
+            }
+        }
+
+        // Fail closed above the floor with a typed, actionable error and ZERO
+        // destructive writes (work-1.04 §6.4(3) scope-relief valve; a correct
+        // phased durable-resume path is deferred — VS-4.0.4 / #46).
+        warn!(
+            store_size,
+            projected_peak,
+            floor = Self::SINGLE_TXN_STORE_FLOOR_BYTES,
+            declared = ?config.migration_available_memory_bytes,
+            "codec migration: store above single-txn floor with no covering memory budget; \
+             failing closed (no destructive write)"
+        );
+        Err(PulseDBError::Storage(StorageError::substrate_migration_too_large(
+            store_size,
+            projected_peak,
+            Self::SINGLE_TXN_STORE_FLOOR_BYTES,
+        )))
+    }
+
+    /// Re-encodes every serde-blob table from legacy bincode to postcard, in the
+    /// caller's single write transaction (design §2.3 + §2a matrix).
+    ///
+    /// Per-row decode is **try-legacy-bincode-then-postcard**: a row still in
+    /// bincode decodes via the 1.01 vendored reader and is rewritten as postcard;
+    /// a row already in postcard (e.g. one a reshape migrator just rewrote at
+    /// current schema) is read back via postcard and rewritten idempotently. This
+    /// keeps the pass unconditional and safe regardless of whether a reshape ran,
+    /// and never feeds a postcard row to `legacy_bincode::decode` blindly.
+    ///
+    /// EXPERIENCES and WATCH_EVENTS additionally fall back to their legacy *schema*
+    /// shape (ExperienceV2 / WatchEventRecordV1) so a store whose reshape did not
+    /// run (pure codec migration of an already-current-schema store) is still
+    /// reshaped+re-encoded by this single owner.
+    fn reencode_serde_blobs_to_postcard(write_txn: &::redb::WriteTransaction) -> Result<()> {
+        // --- METADATA_TABLE["db_metadata"] only (per-key; mixed table) ---
+        // instance_id / wal_sequence / substrate_format are RAW bytes — NEVER decode.
+        {
+            let meta_table = write_txn.open_table(METADATA_TABLE)?;
+            let existing = meta_table
+                .get(METADATA_KEY)?
+                .map(|v| v.value().to_vec());
+            drop(meta_table);
+            if let Some(bytes) = existing {
+                let meta: DatabaseMetadata = Self::decode_blob_legacy_or_postcard(&bytes, "db_metadata")?;
+                let re = postcard::to_stdvec(&meta)
+                    .map_err(|e| StorageError::serialization(e.to_string()))?;
+                let mut meta_table = write_txn.open_table(METADATA_TABLE)?;
+                meta_table.insert(METADATA_KEY, re.as_slice())?;
+            }
+        }
+
+        // --- COLLECTIVES_TABLE: Collective ---
+        Self::reencode_keyed_table::<Collective>(write_txn, COLLECTIVES_TABLE, "collective")?;
+
+        // --- DECAY_CONFIGS_TABLE: StoredDecayConfig (try) then StoredDecayConfigV1 ---
+        {
+            let table = write_txn.open_table(DECAY_CONFIGS_TABLE)?;
+            let mut rows: Vec<([u8; 16], Vec<u8>)> = Vec::new();
+            for entry in table.iter()? {
+                let (k, v) = entry.map_err(StorageError::from)?;
+                rows.push((*k.value(), v.value().to_vec()));
+            }
+            drop(table);
+            let mut table = write_txn.open_table(DECAY_CONFIGS_TABLE)?;
+            for (key, bytes) in rows {
+                let stored: StoredDecayConfig = match Self::decode_blob_legacy_or_postcard::<
+                    StoredDecayConfig,
+                >(&bytes, "decay_config")
+                {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let v1: StoredDecayConfigV1 =
+                            Self::decode_blob_legacy_or_postcard(&bytes, "decay_config_v1")?;
+                        // Re-shape V1 → current via DecayConfig, then back to stored.
+                        let cfg: DecayConfig = v1.into();
+                        StoredDecayConfig::from(&cfg)
+                    }
+                };
+                let re = postcard::to_stdvec(&stored)
+                    .map_err(|e| StorageError::serialization(e.to_string()))?;
+                table.insert(&key, re.as_slice())?;
+            }
+        }
+
+        // --- EXPERIENCES_TABLE: Experience (try) then ExperienceV2 + reshape ---
+        {
+            let table = write_txn.open_table(EXPERIENCES_TABLE)?;
+            let mut rows: Vec<([u8; 16], Vec<u8>)> = Vec::new();
+            for entry in table.iter()? {
+                let (k, v) = entry.map_err(StorageError::from)?;
+                rows.push((*k.value(), v.value().to_vec()));
+            }
+            drop(table);
+            let mut table = write_txn.open_table(EXPERIENCES_TABLE)?;
+            for (key, bytes) in rows {
+                let exp: Experience = match Self::decode_blob_legacy_or_postcard::<Experience>(
+                    &bytes,
+                    "experience",
+                ) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let v2: ExperienceV2 =
+                            Self::decode_blob_legacy_or_postcard(&bytes, "experience_v2")?;
+                        let mut applications = BTreeMap::new();
+                        applications.insert(legacy_applications_instance_id(), v2.applications);
+                        Experience {
+                            id: v2.id,
+                            collective_id: v2.collective_id,
+                            content: v2.content,
+                            embedding: v2.embedding,
+                            experience_type: v2.experience_type,
+                            importance: v2.importance,
+                            confidence: v2.confidence,
+                            applications,
+                            domain: v2.domain,
+                            related_files: v2.related_files,
+                            source_agent: v2.source_agent,
+                            source_task: v2.source_task,
+                            timestamp: v2.timestamp,
+                            last_reinforced: v2.timestamp,
+                            archived: v2.archived,
+                        }
+                    }
+                };
+                let re = postcard::to_stdvec(&exp)
+                    .map_err(|e| StorageError::serialization(e.to_string()))?;
+                table.insert(&key, re.as_slice())?;
+            }
+        }
+
+        // --- RELATIONS_TABLE: ExperienceRelation ---
+        Self::reencode_keyed_table::<ExperienceRelation>(
+            write_txn,
+            RELATIONS_TABLE,
+            "relation",
+        )?;
+
+        // --- INSIGHTS_TABLE: DerivedInsight ---
+        Self::reencode_keyed_table::<DerivedInsight>(write_txn, INSIGHTS_TABLE, "insight")?;
+
+        // --- ACTIVITIES_TABLE: Activity (variable-length key) ---
+        {
+            let table = write_txn.open_table(ACTIVITIES_TABLE)?;
+            let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            for entry in table.iter()? {
+                let (k, v) = entry.map_err(StorageError::from)?;
+                rows.push((k.value().to_vec(), v.value().to_vec()));
+            }
+            drop(table);
+            let mut table = write_txn.open_table(ACTIVITIES_TABLE)?;
+            for (key, bytes) in rows {
+                let activity: Activity =
+                    Self::decode_blob_legacy_or_postcard(&bytes, "activity")?;
+                let re = postcard::to_stdvec(&activity)
+                    .map_err(|e| StorageError::serialization(e.to_string()))?;
+                table.insert(key.as_slice(), re.as_slice())?;
+            }
+        }
+
+        // --- WATCH_EVENTS_TABLE: WatchEventRecord (try) then WatchEventRecordV1 ---
+        {
+            use super::schema::WatchEventRecordV1;
+            let table = write_txn.open_table(WATCH_EVENTS_TABLE)?;
+            let mut rows: Vec<([u8; 8], Vec<u8>)> = Vec::new();
+            for entry in table.iter()? {
+                let (k, v) = entry.map_err(StorageError::from)?;
+                rows.push((*k.value(), v.value().to_vec()));
+            }
+            drop(table);
+            let mut table = write_txn.open_table(WATCH_EVENTS_TABLE)?;
+            for (key, bytes) in rows {
+                let record: WatchEventRecord = match Self::decode_blob_legacy_or_postcard::<
+                    WatchEventRecord,
+                >(&bytes, "watch_event")
+                {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let v1: WatchEventRecordV1 =
+                            Self::decode_blob_legacy_or_postcard(&bytes, "watch_event_v1")?;
+                        WatchEventRecord {
+                            entity_id: v1.experience_id,
+                            collective_id: v1.collective_id,
+                            event_type: v1.event_type,
+                            timestamp_ms: v1.timestamp_ms,
+                            entity_type: EntityTypeTag::Experience,
+                        }
+                    }
+                };
+                let re = postcard::to_stdvec(&record)
+                    .map_err(|e| StorageError::serialization(e.to_string()))?;
+                table.insert(&key, re.as_slice())?;
+            }
+        }
+
+        // --- SYNC_CURSORS_TABLE: SyncCursor (feature: sync) ---
+        #[cfg(feature = "sync")]
+        Self::reencode_keyed_table::<crate::sync::SyncCursor>(
+            write_txn,
+            SYNC_CURSORS_TABLE,
+            "sync_cursor",
+        )?;
+
+        debug!("re-encoded all serde-blob tables from bincode to postcard");
+        Ok(())
+    }
+
+    /// Re-encodes a 16-byte-keyed serde-blob table in place (legacy bincode →
+    /// postcard, idempotent on already-postcard rows).
+    fn reencode_keyed_table<V>(
+        write_txn: &::redb::WriteTransaction,
+        table_def: ::redb::TableDefinition<&[u8; 16], &[u8]>,
+        what: &str,
+    ) -> Result<()>
+    where
+        V: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let table = write_txn.open_table(table_def)?;
+        let mut rows: Vec<([u8; 16], Vec<u8>)> = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry.map_err(StorageError::from)?;
+            rows.push((*k.value(), v.value().to_vec()));
+        }
+        drop(table);
+        let mut table = write_txn.open_table(table_def)?;
+        for (key, bytes) in rows {
+            let value: V = Self::decode_blob_legacy_or_postcard(&bytes, what)?;
+            let re = postcard::to_stdvec(&value)
+                .map_err(|e| StorageError::serialization(e.to_string()))?;
+            table.insert(&key, re.as_slice())?;
+        }
+        Ok(())
+    }
+
+    /// Decodes a serde-blob value trying legacy bincode first, then postcard.
+    ///
+    /// The codec pass runs only when the marker is `Absent | Older`, so the rows
+    /// are *expected* to be bincode; the postcard fallback covers a row a reshape
+    /// migrator just rewrote at current schema in the same txn (idempotent).
+    fn decode_blob_legacy_or_postcard<V>(bytes: &[u8], what: &str) -> Result<V>
+    where
+        V: serde::de::DeserializeOwned,
+    {
+        match legacy_bincode::decode::<V>(bytes) {
+            Ok(v) => Ok(v),
+            Err(bincode_err) => postcard::from_bytes::<V>(bytes).map_err(|postcard_err| {
+                StorageError::serialization(format!(
+                    "{what}: legacy bincode decode failed ({bincode_err}); \
+                     postcard decode also failed ({postcard_err})"
+                ))
+                .into()
+            }),
+        }
     }
 
     /// Returns the embedding dimension configured for this database.
@@ -1081,7 +1483,7 @@ impl StorageEngine for RedbStorage {
     // =========================================================================
 
     fn save_collective(&self, collective: &Collective) -> Result<()> {
-        let bytes = bincode::serialize(collective)
+        let bytes = postcard::to_stdvec(collective)
             .map_err(|e| StorageError::serialization(e.to_string()))?;
 
         let write_txn = self.db.begin_write().map_err(StorageError::from)?;
@@ -1109,7 +1511,7 @@ impl StorageEngine for RedbStorage {
 
         match table.get(id.as_bytes())? {
             Some(value) => {
-                let collective: Collective = bincode::deserialize(value.value())
+                let collective: Collective = postcard::from_bytes(value.value())
                     .map_err(|e| StorageError::serialization(e.to_string()))?;
                 Ok(Some(collective))
             }
@@ -1124,7 +1526,7 @@ impl StorageEngine for RedbStorage {
         let mut collectives = Vec::new();
         for result in table.iter()? {
             let (_, value) = result.map_err(StorageError::from)?;
-            let collective: Collective = bincode::deserialize(value.value())
+            let collective: Collective = postcard::from_bytes(value.value())
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             collectives.push(collective);
         }
@@ -1152,11 +1554,11 @@ impl StorageEngine for RedbStorage {
         let table = read_txn.open_table(DECAY_CONFIGS_TABLE)?;
 
         match table.get(collective_id.as_bytes())? {
-            Some(value) => match bincode::deserialize::<StoredDecayConfig>(value.value()) {
+            Some(value) => match postcard::from_bytes::<StoredDecayConfig>(value.value()) {
                 Ok(stored) => Ok(Some(stored.into())),
                 Err(current_error) => {
                     let legacy: StoredDecayConfigV1 =
-                        bincode::deserialize(value.value()).map_err(|legacy_error| {
+                        postcard::from_bytes(value.value()).map_err(|legacy_error| {
                             StorageError::serialization(format!(
                                 "decay config current format: {}; legacy format: {}",
                                 current_error, legacy_error
@@ -1172,7 +1574,7 @@ impl StorageEngine for RedbStorage {
     fn set_decay_config(&self, collective_id: CollectiveId, config: DecayConfig) -> Result<()> {
         let stored = StoredDecayConfig::from(&config);
         let bytes =
-            bincode::serialize(&stored).map_err(|e| StorageError::serialization(e.to_string()))?;
+            postcard::to_stdvec(&stored).map_err(|e| StorageError::serialization(e.to_string()))?;
 
         let write_txn = self.db.begin_write().map_err(StorageError::from)?;
         {
@@ -1351,7 +1753,7 @@ impl StorageEngine for RedbStorage {
 
     fn save_experience(&self, experience: &Experience) -> Result<()> {
         // Serialize experience (embedding is #[serde(skip)], excluded automatically)
-        let exp_bytes = bincode::serialize(experience)
+        let exp_bytes = postcard::to_stdvec(experience)
             .map_err(|e| StorageError::serialization(e.to_string()))?;
 
         // Convert embedding to raw little-endian bytes
@@ -1418,7 +1820,7 @@ impl StorageEngine for RedbStorage {
             None => return Ok(None),
         };
 
-        let mut experience: Experience = bincode::deserialize(exp_entry.value())
+        let mut experience: Experience = postcard::from_bytes(exp_entry.value())
             .map_err(|e| StorageError::serialization(e.to_string()))?;
 
         // Read embedding from separate table and reconstitute
@@ -1444,7 +1846,7 @@ impl StorageEngine for RedbStorage {
                 None => return Ok(false),
             };
 
-            let mut experience: Experience = bincode::deserialize(entry.value())
+            let mut experience: Experience = postcard::from_bytes(entry.value())
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
 
             // Drop the borrow on entry before mutating the table
@@ -1473,7 +1875,7 @@ impl StorageEngine for RedbStorage {
             }
 
             // Re-serialize and write back
-            let bytes = bincode::serialize(&experience)
+            let bytes = postcard::to_stdvec(&experience)
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             exp_table.insert(id.as_bytes(), bytes.as_slice())?;
         }
@@ -1512,7 +1914,7 @@ impl StorageEngine for RedbStorage {
                 None => return Ok(false),
             };
 
-            let mut experience: Experience = bincode::deserialize(entry.value())
+            let mut experience: Experience = postcard::from_bytes(entry.value())
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             drop(entry);
 
@@ -1525,7 +1927,7 @@ impl StorageEngine for RedbStorage {
                 experience.last_reinforced = experience.last_reinforced.max(incoming);
             }
 
-            let bytes = bincode::serialize(&experience)
+            let bytes = postcard::to_stdvec(&experience)
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             exp_table.insert(id.as_bytes(), bytes.as_slice())?;
             true
@@ -1545,7 +1947,7 @@ impl StorageEngine for RedbStorage {
 
             match exp_table.get(id.as_bytes())? {
                 Some(entry) => {
-                    let exp: Experience = bincode::deserialize(entry.value())
+                    let exp: Experience = postcard::from_bytes(entry.value())
                         .map_err(|e| StorageError::serialization(e.to_string()))?;
                     (
                         exp.collective_id,
@@ -1606,7 +2008,7 @@ impl StorageEngine for RedbStorage {
                 None => return Ok(None),
             };
 
-            let mut experience: Experience = bincode::deserialize(entry.value())
+            let mut experience: Experience = postcard::from_bytes(entry.value())
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             drop(entry);
 
@@ -1617,7 +2019,7 @@ impl StorageEngine for RedbStorage {
             let collective_id = experience.collective_id;
             let timestamp = experience.timestamp;
 
-            let bytes = bincode::serialize(&experience)
+            let bytes = postcard::to_stdvec(&experience)
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             exp_table.insert(id.as_bytes(), bytes.as_slice())?;
             (new_count, collective_id, timestamp)
@@ -1667,7 +2069,7 @@ impl StorageEngine for RedbStorage {
 
     fn save_relation(&self, relation: &ExperienceRelation) -> Result<()> {
         let bytes =
-            bincode::serialize(relation).map_err(|e| StorageError::serialization(e.to_string()))?;
+            postcard::to_stdvec(relation).map_err(|e| StorageError::serialization(e.to_string()))?;
 
         let write_txn = self.db.begin_write().map_err(StorageError::from)?;
         {
@@ -1690,7 +2092,7 @@ impl StorageEngine for RedbStorage {
                 .ok_or_else(|| {
                     StorageError::corrupted("relation source experience not found for WAL record")
                 })?;
-            let exp: Experience = bincode::deserialize(entry.value())
+            let exp: Experience = postcard::from_bytes(entry.value())
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             exp.collective_id
         };
@@ -1714,7 +2116,7 @@ impl StorageEngine for RedbStorage {
 
         match table.get(id.as_bytes())? {
             Some(value) => {
-                let relation: ExperienceRelation = bincode::deserialize(value.value())
+                let relation: ExperienceRelation = postcard::from_bytes(value.value())
                     .map_err(|e| StorageError::serialization(e.to_string()))?;
                 Ok(Some(relation))
             }
@@ -1731,13 +2133,13 @@ impl StorageEngine for RedbStorage {
 
             match rel_table.get(id.as_bytes())? {
                 Some(entry) => {
-                    let rel: ExperienceRelation = bincode::deserialize(entry.value())
+                    let rel: ExperienceRelation = postcard::from_bytes(entry.value())
                         .map_err(|e| StorageError::serialization(e.to_string()))?;
                     // Look up collective_id from source experience
                     let exp_table = read_txn.open_table(EXPERIENCES_TABLE)?;
                     let cid = match exp_table.get(rel.source_id.as_bytes())? {
                         Some(exp_entry) => {
-                            let exp: Experience = bincode::deserialize(exp_entry.value())
+                            let exp: Experience = postcard::from_bytes(exp_entry.value())
                                 .map_err(|e| StorageError::serialization(e.to_string()))?;
                             exp.collective_id
                         }
@@ -1843,7 +2245,7 @@ impl StorageEngine for RedbStorage {
             let mut rels = Vec::with_capacity(relation_ids.len());
             for rel_id in &relation_ids {
                 if let Some(entry) = table.get(rel_id.as_bytes())? {
-                    let rel: ExperienceRelation = bincode::deserialize(entry.value())
+                    let rel: ExperienceRelation = postcard::from_bytes(entry.value())
                         .map_err(|e| StorageError::serialization(e.to_string()))?;
                     rels.push(rel);
                 }
@@ -1897,7 +2299,7 @@ impl StorageEngine for RedbStorage {
             let rel_id = RelationId::from_bytes(*value.value());
 
             if let Some(entry) = rel_table.get(rel_id.as_bytes())? {
-                let rel: ExperienceRelation = bincode::deserialize(entry.value())
+                let rel: ExperienceRelation = postcard::from_bytes(entry.value())
                     .map_err(|e| StorageError::serialization(e.to_string()))?;
                 if rel.target_id == target_id && rel.relation_type == relation_type {
                     return Ok(true);
@@ -1914,7 +2316,7 @@ impl StorageEngine for RedbStorage {
 
     fn save_insight(&self, insight: &DerivedInsight) -> Result<()> {
         let bytes =
-            bincode::serialize(insight).map_err(|e| StorageError::serialization(e.to_string()))?;
+            postcard::to_stdvec(insight).map_err(|e| StorageError::serialization(e.to_string()))?;
 
         let write_txn = self.db.begin_write().map_err(StorageError::from)?;
         {
@@ -1945,7 +2347,7 @@ impl StorageEngine for RedbStorage {
 
         match table.get(id.as_bytes())? {
             Some(value) => {
-                let insight: DerivedInsight = bincode::deserialize(value.value())
+                let insight: DerivedInsight = postcard::from_bytes(value.value())
                     .map_err(|e| StorageError::serialization(e.to_string()))?;
                 Ok(Some(insight))
             }
@@ -1961,7 +2363,7 @@ impl StorageEngine for RedbStorage {
 
             match table.get(id.as_bytes())? {
                 Some(entry) => {
-                    let insight: DerivedInsight = bincode::deserialize(entry.value())
+                    let insight: DerivedInsight = postcard::from_bytes(entry.value())
                         .map_err(|e| StorageError::serialization(e.to_string()))?;
                     insight.collective_id
                 }
@@ -2050,7 +2452,7 @@ impl StorageEngine for RedbStorage {
     fn save_activity(&self, activity: &Activity) -> Result<()> {
         let key = encode_activity_key(activity.collective_id.as_bytes(), &activity.agent_id);
         let bytes =
-            bincode::serialize(activity).map_err(|e| StorageError::serialization(e.to_string()))?;
+            postcard::to_stdvec(activity).map_err(|e| StorageError::serialization(e.to_string()))?;
 
         let write_txn = self.db.begin_write().map_err(StorageError::from)?;
         {
@@ -2079,7 +2481,7 @@ impl StorageEngine for RedbStorage {
 
         match table.get(key.as_slice())? {
             Some(value) => {
-                let activity: Activity = bincode::deserialize(value.value())
+                let activity: Activity = postcard::from_bytes(value.value())
                     .map_err(|e| StorageError::serialization(e.to_string()))?;
                 Ok(Some(activity))
             }
@@ -2117,7 +2519,7 @@ impl StorageEngine for RedbStorage {
 
             // Check if this key belongs to the requested collective (16-byte prefix)
             if key_bytes.len() >= 16 && decode_collective_from_activity_key(key_bytes) == *prefix {
-                let activity: Activity = bincode::deserialize(value.value())
+                let activity: Activity = postcard::from_bytes(value.value())
                     .map_err(|e| StorageError::serialization(e.to_string()))?;
                 activities.push(activity);
             }
@@ -2234,7 +2636,7 @@ impl StorageEngine for RedbStorage {
 
                 if let Some(entry) = rel_table.get(rel_id.as_bytes())? {
                     let relation: crate::relation::ExperienceRelation =
-                        bincode::deserialize(entry.value())
+                        postcard::from_bytes(entry.value())
                             .map_err(|e| StorageError::serialization(e.to_string()))?;
                     relations.push(relation);
                     if relations.len() >= limit {
@@ -2309,7 +2711,7 @@ impl StorageEngine for RedbStorage {
         for entry in events_table.range::<&[u8; 8]>(&start_key..=&end_key)? {
             let (key, value) = entry.map_err(StorageError::from)?;
             let seq = u64::from_be_bytes(*key.value());
-            let record: WatchEventRecord = bincode::deserialize(value.value())
+            let record: WatchEventRecord = postcard::from_bytes(value.value())
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             events.push(record);
             max_seq = seq;
@@ -2341,7 +2743,7 @@ impl StorageEngine for RedbStorage {
         for entry in events_table.range::<&[u8; 8]>(&start_key..=&end_key)? {
             let (key, value) = entry.map_err(StorageError::from)?;
             let seq = u64::from_be_bytes(*key.value());
-            let record: WatchEventRecord = bincode::deserialize(value.value())
+            let record: WatchEventRecord = postcard::from_bytes(value.value())
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             events.push((seq, record));
             if events.len() >= limit {
@@ -2362,7 +2764,7 @@ impl StorageEngine for RedbStorage {
         let write_txn = self.db.begin_write().map_err(StorageError::from)?;
         {
             let mut table = write_txn.open_table(SYNC_CURSORS_TABLE)?;
-            let bytes = bincode::serialize(cursor)
+            let bytes = postcard::to_stdvec(cursor)
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             table.insert(cursor.instance_id.as_bytes(), bytes.as_slice())?;
         }
@@ -2384,7 +2786,7 @@ impl StorageEngine for RedbStorage {
         let table = read_txn.open_table(SYNC_CURSORS_TABLE)?;
         match table.get(instance_id.as_bytes())? {
             Some(entry) => {
-                let cursor: crate::sync::SyncCursor = bincode::deserialize(entry.value())
+                let cursor: crate::sync::SyncCursor = postcard::from_bytes(entry.value())
                     .map_err(|e| StorageError::serialization(e.to_string()))?;
                 Ok(Some(cursor))
             }
@@ -2399,7 +2801,7 @@ impl StorageEngine for RedbStorage {
         let mut cursors = Vec::new();
         for entry in table.iter()? {
             let (_, value) = entry.map_err(StorageError::from)?;
-            let cursor: crate::sync::SyncCursor = bincode::deserialize(value.value())
+            let cursor: crate::sync::SyncCursor = postcard::from_bytes(value.value())
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             cursors.push(cursor);
         }
@@ -2479,6 +2881,100 @@ mod tests {
     use super::*;
     use crate::PulseDB;
     use tempfile::tempdir;
+
+    // 1.01 frozen oracle byte constants (audit C2): the {v3, bincode} migration
+    // fixtures + decay goldens reuse these FROZEN legacy bytes rather than calling
+    // the live serializer, so `src/storage/redb.rs` is free of bare-crate serde
+    // calls (AC-3) while still seeding genuine legacy on-disk values.
+    use crate::storage::legacy_bincode::tests::{
+        COLLECTIVE_GOLDEN, EXPERIENCE_GOLDEN, EXPERIENCE_V2_GOLDEN, INSIGHT_GOLDEN, RELATION_GOLDEN,
+        WATCH_EVENT_GOLDEN,
+    };
+
+    // ====================================================================
+    // Frozen oracle byte constants for 1.04 (audit C2)
+    // ====================================================================
+    //
+    // Minted ONCE via a throwaway `examples/oracle_gen_104.rs` generator (deleted
+    // before commit, per the legacy_bincode/tests.rs regen procedure) so no live
+    // serializer call survives in `src/`. These are bincode-1.3 `DefaultOptions`
+    // (fixint LE) bytes — the same wire format the vendored reader reproduces.
+
+    // DatabaseMetadata: schema_version 3, D384, created/last_opened = 1_700_000_000_000ms.
+    pub(crate) const META_V3_D384_GOLDEN: &[u8] = &[
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0xe5, 0xcf, 0x8b, 0x01, 0x00,
+        0x00, 0x00, 0x68, 0xe5, 0xcf, 0x8b, 0x01, 0x00, 0x00,
+    ];
+
+    // DatabaseMetadata: schema_version 2 (triggers the v2→v3 reshape), D384.
+    pub(crate) const META_V2_D384_GOLDEN: &[u8] = &[
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0xe5, 0xcf, 0x8b, 0x01, 0x00,
+        0x00, 0x00, 0x68, 0xe5, 0xcf, 0x8b, 0x01, 0x00, 0x00,
+    ];
+
+    // Collective with id [0;16] (matches EXPERIENCE_V2_GOLDEN's collective_id so the
+    // HNSW index, keyed by the decoded collective id, indexes the migrated row),
+    // name "v2coll", no owner, dim 384.
+    pub(crate) const COLLECTIVE_ZERO_ID_GOLDEN: &[u8] = &[
+        0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x76, 0x32, 0x63, 0x6f, 0x6c, 0x6c, 0x00, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    // StoredDecayConfig (current schema: half_life_secs=86400 + half_life_nanos=500,
+    // freq_weight 0.25, floor 0.1, auto_archive true, weights Some(0.6,0.4)).
+    pub(crate) const STORED_DECAY_CONFIG_GOLDEN: &[u8] = &[
+        0x80, 0x51, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf4, 0x01, 0x00, 0x00, 0x00, 0x00, 0x80,
+        0x3e, 0xcd, 0xcc, 0xcc, 0x3d, 0x01, 0x01, 0x9a, 0x99, 0x19, 0x3f, 0xcd, 0xcc, 0xcc, 0x3e,
+    ];
+
+    // StoredDecayConfigV1 (legacy second-precision: half_life_secs=3600, freq 0.5,
+    // floor 0.2, auto_archive false, weights None — NO half_life_nanos field).
+    pub(crate) const STORED_DECAY_CONFIG_V1_GOLDEN: &[u8] = &[
+        0x10, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xcd, 0xcc, 0x4c,
+        0x3e, 0x00, 0x00,
+    ];
+
+    /// The ground-truth `Collective` that `COLLECTIVE_GOLDEN` decodes to.
+    fn oracle_collective() -> Collective {
+        Collective {
+            id: CollectiveId::from_bytes([0x11; 16]),
+            name: "demo".into(),
+            owner_id: Some("owner".into()),
+            embedding_dimension: 384,
+            created_at: Timestamp::from_millis(1000),
+            updated_at: Timestamp::from_millis(2000),
+        }
+    }
+
+    /// The ground-truth `Experience` that `EXPERIENCE_GOLDEN` decodes to (Fact,
+    /// id [0x21;16], collective [0x11;16], content "hello").
+    fn oracle_experience() -> Experience {
+        let mut applications: BTreeMap<InstanceId, u32> = BTreeMap::new();
+        applications.insert(InstanceId::from_bytes([0x01; 16]), 3);
+        applications.insert(InstanceId::from_bytes([0x02; 16]), 7);
+        Experience {
+            id: ExperienceId::from_bytes([0x21; 16]),
+            collective_id: CollectiveId::from_bytes([0x11; 16]),
+            content: "hello".into(),
+            embedding: Vec::new(),
+            experience_type: crate::experience::ExperienceType::Fact {
+                statement: "rust".into(),
+                source: "docs".into(),
+            },
+            importance: 0.5,
+            confidence: 0.25,
+            applications,
+            domain: vec!["a".into(), "bb".into()],
+            related_files: Vec::new(),
+            source_agent: AgentId::new("agent"),
+            source_task: Some(crate::types::TaskId::new("task")),
+            timestamp: Timestamp::from_millis(111),
+            last_reinforced: Timestamp::from_millis(222),
+            archived: false,
+        }
+    }
 
     // ====================================================================
     // Substrate-format marker tests (work 1.02)
@@ -2573,7 +3069,7 @@ mod tests {
                 let mut meta = write_txn.open_table(METADATA_TABLE).unwrap();
                 // Write some unrelated metadata, but NOT the substrate marker.
                 let metadata = DatabaseMetadata::new(EmbeddingDimension::D384);
-                let bytes = bincode::serialize(&metadata).unwrap();
+                let bytes = postcard::to_stdvec(&metadata).unwrap();
                 meta.insert(METADATA_KEY, bytes.as_slice()).unwrap();
             }
             write_txn.commit().unwrap();
@@ -2604,23 +3100,6 @@ mod tests {
     }
 
     #[derive(Serialize)]
-    struct SeedExperienceV2 {
-        id: ExperienceId,
-        collective_id: CollectiveId,
-        content: String,
-        experience_type: ExperienceType,
-        importance: f32,
-        confidence: f32,
-        applications: u32,
-        domain: Vec<String>,
-        related_files: Vec<String>,
-        source_agent: AgentId,
-        source_task: Option<crate::types::TaskId>,
-        timestamp: Timestamp,
-        archived: bool,
-    }
-
-    #[derive(Serialize)]
     struct LegacyStoredDecayConfig {
         half_life_secs: u64,
         freq_weight: f32,
@@ -2633,38 +3112,27 @@ mod tests {
         Config::default()
     }
 
-    fn seed_schema_v2_store(
-        path: &Path,
-        applications: u32,
-    ) -> (ExperienceId, CollectiveId, Timestamp) {
+    /// Seeds a redb-v3 file at schema-v2 + Absent marker, using the FROZEN
+    /// 1.01 frozen oracle bytes (audit C2 — no live serializer call).
+    ///
+    /// `EXPERIENCE_V2_GOLDEN` decodes to: id [0;16], collective [0;16], content
+    /// "v2", Generic, importance 0.5, **scalar applications = 42**, timestamp 0.
+    /// On open the v2→v3 reshape maps that scalar into the LEGACY bucket and the
+    /// codec loop re-encodes to postcard. Returns the FIXED golden ids/timestamp.
+    fn seed_schema_v2_store(path: &Path) -> (ExperienceId, CollectiveId, Timestamp) {
         let db = Database::builder().create(path).unwrap();
-        let collective = Collective::new("migrated-collective", 384);
-        let experience_id = ExperienceId::new();
-        let timestamp = Timestamp::from_millis(1_717_171_717_000);
-        let experience = SeedExperienceV2 {
-            id: experience_id,
-            collective_id: collective.id,
-            content: "legacy v2 experience".into(),
-            experience_type: ExperienceType::Fact {
-                statement: "legacy fact".into(),
-                source: "fixture".into(),
-            },
-            importance: 0.7,
-            confidence: 0.8,
-            applications,
-            domain: vec!["migration".into()],
-            related_files: vec!["src/storage/redb.rs".into()],
-            source_agent: AgentId::new("legacy-agent"),
-            source_task: None,
-            timestamp,
-            archived: false,
-        };
+        // Golden experience facts (frozen): the experience's collective is [0;16].
+        let experience_id = ExperienceId::from_bytes([0; 16]);
+        let collective_id = CollectiveId::from_bytes([0; 16]);
+        let timestamp = Timestamp::from_millis(0);
 
-        let mut metadata = DatabaseMetadata::new(EmbeddingDimension::D384);
-        metadata.schema_version = 2;
-        let metadata_bytes = bincode::serialize(&metadata).unwrap();
-        let collective_bytes = bincode::serialize(&collective).unwrap();
-        let experience_bytes = bincode::serialize(&experience).unwrap();
+        let metadata_bytes = META_V2_D384_GOLDEN.to_vec();
+        // COLLECTIVES is keyed by the experience's collective_id [0;16] and the
+        // frozen value decodes to a Collective whose id is also [0;16], so the HNSW
+        // index (keyed by the decoded collective id) indexes the migrated row and
+        // `search_similar`/`get_collective` resolve. The codec loop re-encodes it.
+        let collective_bytes = COLLECTIVE_ZERO_ID_GOLDEN.to_vec();
+        let experience_bytes = EXPERIENCE_V2_GOLDEN.to_vec();
         let embedding = vec![0.25_f32; 384];
         let embedding_bytes = f32_slice_to_bytes(&embedding);
 
@@ -2676,7 +3144,7 @@ mod tests {
                 .unwrap();
             let mut collectives = write_txn.open_table(COLLECTIVES_TABLE).unwrap();
             collectives
-                .insert(collective.id.as_bytes(), collective_bytes.as_slice())
+                .insert(collective_id.as_bytes(), collective_bytes.as_slice())
                 .unwrap();
             let mut experiences = write_txn.open_table(EXPERIENCES_TABLE).unwrap();
             experiences
@@ -2694,13 +3162,14 @@ mod tests {
             value[..8].copy_from_slice(&timestamp.to_be_bytes());
             value[8..24].copy_from_slice(experience_id.as_bytes());
             by_collective
-                .insert(collective.id.as_bytes(), &value)
+                .insert(collective_id.as_bytes(), &value)
                 .unwrap();
 
             let mut by_type = write_txn
                 .open_multimap_table(EXPERIENCES_BY_TYPE_TABLE)
                 .unwrap();
-            let type_key = encode_type_index_key(collective.id.as_bytes(), ExperienceTypeTag::Fact);
+            let type_key =
+                encode_type_index_key(collective_id.as_bytes(), ExperienceTypeTag::Generic);
             by_type.insert(&type_key, experience_id.as_bytes()).unwrap();
 
             let _ = write_txn.open_table(DECAY_CONFIGS_TABLE).unwrap();
@@ -2722,14 +3191,14 @@ mod tests {
 
         drop(db);
 
-        (experience_id, collective.id, timestamp)
+        (experience_id, collective_id, timestamp)
     }
 
     #[test]
     fn test_schema_v2_experience_migration_writes_legacy_bucket_backup_and_preserves_queries() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let (experience_id, collective_id, timestamp) = seed_schema_v2_store(&path, 7);
+        let (experience_id, collective_id, timestamp) = seed_schema_v2_store(&path);
 
         let backup_path = pre_v3_backup_path(&path);
         assert!(!backup_path.exists());
@@ -2739,12 +3208,13 @@ mod tests {
         assert!(backup_path.exists(), "v2 migration must retain a backup");
         let experience = db.get_experience(experience_id).unwrap().unwrap();
         assert_eq!(experience.last_reinforced, timestamp);
-        assert_eq!(experience.applications(), 7);
+        // EXPERIENCE_V2_GOLDEN carries scalar applications = 42 → LEGACY bucket.
+        assert_eq!(experience.applications(), 42);
         assert_eq!(
             experience
                 .applications
                 .get(&legacy_applications_instance_id()),
-            Some(&7)
+            Some(&42)
         );
 
         let query = vec![0.25_f32; 384];
@@ -2771,7 +3241,7 @@ mod tests {
     fn test_read_only_open_refuses_unmigrated_schema_v2_store() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        seed_schema_v2_store(&path, 3);
+        seed_schema_v2_store(&path);
 
         let err = RedbStorage::open(&path, &Config::read_only()).unwrap_err();
         assert!(matches!(err, PulseDBError::ReadOnly));
@@ -3027,6 +3497,11 @@ mod tests {
         let storage = RedbStorage::open(&path, &default_config()).unwrap();
         let collective_id = CollectiveId::new();
 
+        // Post-cutover, `get_decay_config` reads postcard and tries the current
+        // `StoredDecayConfig` shape then falls back to the V1 shape (no
+        // `half_life_nanos`). Seed a postcard-encoded V1-shaped row to exercise the
+        // steady-state dual-version fallback. (A live serializer call would
+        // fail AC-3; the legacy V1 byte layout is covered by the decay GOLDEN test.)
         let legacy = LegacyStoredDecayConfig {
             half_life_secs: 42,
             freq_weight: 0.5,
@@ -3034,7 +3509,7 @@ mod tests {
             auto_archive_below_floor: true,
             default_recall_weights: Some(RecallWeights::new(0.7, 0.3)),
         };
-        let bytes = bincode::serialize(&legacy).unwrap();
+        let bytes = postcard::to_stdvec(&legacy).unwrap();
         let write_txn = storage.db.begin_write().unwrap();
         {
             let mut table = write_txn.open_table(DECAY_CONFIGS_TABLE).unwrap();
@@ -3061,7 +3536,7 @@ mod tests {
     fn test_schema_v3_reopen_skips_pre_v3_migration_path() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let (experience_id, _, _) = seed_schema_v2_store(&path, 11);
+        let (experience_id, _, _) = seed_schema_v2_store(&path);
 
         let backup_path = pre_v3_backup_path(&path);
         let db = RedbStorage::open(&path, &default_config()).unwrap();
@@ -3076,7 +3551,7 @@ mod tests {
             experience
                 .applications
                 .get(&legacy_applications_instance_id()),
-            Some(&11)
+            Some(&42)
         );
 
         Box::new(reopened).close().unwrap();
@@ -3186,7 +3661,7 @@ mod tests {
 
         let collective = Collective::new("phantom", 384);
         let id = collective.id;
-        let bytes = bincode::serialize(&collective).unwrap();
+        let bytes = postcard::to_stdvec(&collective).unwrap();
 
         // Open a write transaction, insert data, but DON'T commit -- just drop
         {
@@ -3235,7 +3710,7 @@ mod tests {
 
         let collective = Collective::new("multi-table", 384);
         let id = collective.id;
-        let collective_bytes = bincode::serialize(&collective).unwrap();
+        let collective_bytes = postcard::to_stdvec(&collective).unwrap();
 
         // Write to TWO tables in a single transaction
         let write_txn = storage.database().begin_write().unwrap();
@@ -4109,8 +4584,8 @@ mod tests {
         {
             let mut meta = write_txn.open_table(V2_METADATA_TABLE).unwrap();
 
-            let metadata = DatabaseMetadata::new(EmbeddingDimension::D384);
-            let metadata_bytes = bincode::serialize(&metadata).unwrap();
+            // Frozen oracle schema-v3 metadata bytes (audit C2; no live serializer).
+            let metadata_bytes = META_V3_D384_GOLDEN.to_vec();
             meta.insert(METADATA_KEY, metadata_bytes.as_slice()).unwrap();
 
             let instance_id = InstanceId::new();
@@ -4371,60 +4846,22 @@ mod tests {
     /// known ground truth. All values are deterministic. Drops the redb-2.6 handle
     /// before returning to release its lock ahead of any redb-4.1 open.
     fn seed_representative_redb_v2_store(path: &Path) -> (Collective, Experience, Vec<f32>) {
-        // Deterministic collective (fixed id + timestamps so ground truth is stable).
-        let ts = Timestamp::from_millis(1_700_000_000_000);
-        let collective = Collective {
-            id: CollectiveId::from_bytes(*b"REPRESENTATIVE__"),
-            name: "representative-v2-collective".into(),
-            owner_id: Some("owner-42".into()),
-            embedding_dimension: 384,
-            created_at: ts,
-            updated_at: ts,
-        };
-
-        // Deterministic schema-v3 experience: per-instance `applications` BTreeMap +
-        // `last_reinforced`, a non-trivial experience_type, multi-tag domain.
-        let mut applications: BTreeMap<InstanceId, u32> = BTreeMap::new();
-        applications.insert(InstanceId::from_bytes(*b"INSTANCE_ALPHA__"), 3);
-        applications.insert(InstanceId::from_bytes(*b"INSTANCE_BETA___"), 5);
-
-        let exp_ts = Timestamp::from_millis(1_700_000_123_456);
-        let experience = Experience {
-            id: ExperienceId::from_bytes(*b"REPRESENTATIVEXP"),
-            collective_id: collective.id,
-            content: "representative v0.5.1 experience carried across the redb v2->v3 upgrade"
-                .into(),
-            // embedding is #[serde(skip)] — NOT in the bincode blob; carried in
-            // EMBEDDINGS_TABLE as raw f32 bytes. Set here so the in-memory ground
-            // truth matches what get_experience reconstitutes.
-            embedding: Vec::new(),
-            experience_type: ExperienceType::Fact {
-                statement: "redb v2->v3 upgrade preserves stored key/value bytes".into(),
-                source: "VS-4.0.2 design §2a".into(),
-            },
-            importance: 0.73,
-            confidence: 0.91,
-            applications,
-            domain: vec!["migration".into(), "redb".into(), "storage-format".into()],
-            related_files: vec!["src/storage/redb.rs".into(), "src/storage/schema.rs".into()],
-            source_agent: AgentId::new("representative-agent"),
-            source_task: None,
-            timestamp: exp_ts,
-            last_reinforced: exp_ts,
-            archived: false,
-        };
+        // Ground truth is the 1.01 oracle entities (audit C2): the on-disk
+        // collective / experience / metadata blobs are the FROZEN oracle bincode
+        // bytes (`*_GOLDEN`), NOT a live serializer call. So this fixture seeds
+        // genuine legacy on-disk values without any bare-crate serde call in `src/`.
+        let collective = oracle_collective();
+        let experience = oracle_experience();
 
         // Deterministic 384-length embedding with a NON-uniform pattern, so a
         // silently-wrong copy is caught and the length matches D384.
         let embedding: Vec<f32> = (0..384).map(|i| (i as f32) * 0.0013 - 0.1).collect();
 
-        // Serialize entities the way production does. The embedding is serde-skipped,
-        // so the experience blob does NOT contain it.
-        let metadata = DatabaseMetadata::new(EmbeddingDimension::D384);
-        assert_eq!(metadata.schema_version, SCHEMA_VERSION, "fixture must be schema-v3");
-        let metadata_bytes = bincode::serialize(&metadata).unwrap();
-        let collective_bytes = bincode::serialize(&collective).unwrap();
-        let experience_bytes = bincode::serialize(&experience).unwrap();
+        // Frozen oracle bincode bytes (the embedding is serde-skipped, so the
+        // experience blob does NOT contain it).
+        let metadata_bytes = META_V3_D384_GOLDEN.to_vec();
+        let collective_bytes = COLLECTIVE_GOLDEN.to_vec();
+        let experience_bytes = EXPERIENCE_GOLDEN.to_vec();
         let embedding_bytes = f32_slice_to_bytes(&embedding);
 
         let instance_id = InstanceId::from_bytes(*b"FIXTUREINSTANCE_");
@@ -4502,8 +4939,8 @@ mod tests {
             "experience_type tag"
         );
         assert_eq!(
-            bincode::serialize(&got.experience_type).unwrap(),
-            bincode::serialize(&want.experience_type).unwrap(),
+            postcard::to_stdvec(&got.experience_type).unwrap(),
+            postcard::to_stdvec(&want.experience_type).unwrap(),
             "experience_type payload"
         );
         assert_eq!(got.importance, want.importance, "importance");
@@ -4841,5 +5278,370 @@ mod tests {
             "embedding intact after the contended-then-successful migrate"
         );
         Box::new(storage).close().unwrap();
+    }
+
+    // ====================================================================
+    // NEW {redb-v3, bincode} "Older" fixture — the gate-2 grill Q1 pin
+    // (decoupled codec axis; work-1.04 §7)
+    // ====================================================================
+
+    /// Seeds a genuine **redb-v3** (redb 4.1) store at marker `1`
+    /// (`{redb-v3, bincode}`, schema v3), every serde-blob value being the FROZEN
+    /// 1.01 oracle bincode bytes (audit C2). This is the NO-OP-reshape path: schema
+    /// is already v3, so the reshape migrators do nothing — yet the codec loop must
+    /// still re-encode EVERY serde-blob row to postcard. A fused codec-in-reshape
+    /// would silently skip EXPERIENCES + WAL here (grill Q1 = silent corruption).
+    ///
+    /// The redb-4.1 file scaffold + the raw `substrate_format = 1` marker carry NO
+    /// serde — only the value blobs are bincode (frozen oracle bytes).
+    fn seed_redb_v3_bincode_older_store(path: &Path) -> (Collective, Experience) {
+        let collective = oracle_collective(); // id [0x11;16]
+        let experience = oracle_experience(); // id [0x21;16], collective [0x11;16]
+        let embedding: Vec<f32> = (0..384).map(|i| (i as f32) * 0.0011 + 0.05).collect();
+        let embedding_bytes = f32_slice_to_bytes(&embedding);
+
+        // WATCH_EVENTS: WATCH_EVENT_GOLDEN decodes to entity_id [0x71;16],
+        // collective [0x72;16], Updated, ts 12345, Experience. Seq key = 1 (BE).
+        let wal_seq: u64 = 1;
+        let wal_key = wal_seq.to_be_bytes();
+
+        let db = Database::builder().create(path).unwrap(); // redb 4.1 ⇒ v3 file
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut meta = write_txn.open_table(METADATA_TABLE).unwrap();
+            meta.insert(METADATA_KEY, META_V3_D384_GOLDEN).unwrap();
+            meta.insert(
+                INSTANCE_ID_KEY,
+                InstanceId::from_bytes(*b"OLDERFIXTUREINST").as_bytes().as_slice(),
+            )
+            .unwrap();
+            // wal_sequence: raw 8-byte BE (copy-through; NEVER decoded).
+            meta.insert(WAL_SEQUENCE_KEY, wal_seq.to_be_bytes().as_slice())
+                .unwrap();
+            // Raw marker = 1 (Older): 3 hand-encoded bytes, no serde.
+            meta.insert(SUBSTRATE_FORMAT_KEY, encode_substrate_marker(1).as_slice())
+                .unwrap();
+
+            write_txn
+                .open_table(COLLECTIVES_TABLE)
+                .unwrap()
+                .insert(collective.id.as_bytes(), COLLECTIVE_GOLDEN)
+                .unwrap();
+            write_txn
+                .open_table(EXPERIENCES_TABLE)
+                .unwrap()
+                .insert(experience.id.as_bytes(), EXPERIENCE_GOLDEN)
+                .unwrap();
+            write_txn
+                .open_table(EMBEDDINGS_TABLE)
+                .unwrap()
+                .insert(experience.id.as_bytes(), embedding_bytes.as_slice())
+                .unwrap();
+            write_txn
+                .open_table(RELATIONS_TABLE)
+                .unwrap()
+                .insert(&[0x41u8; 16], RELATION_GOLDEN)
+                .unwrap();
+            write_txn
+                .open_table(INSIGHTS_TABLE)
+                .unwrap()
+                .insert(&[0x51u8; 16], INSIGHT_GOLDEN)
+                .unwrap();
+            write_txn
+                .open_table(WATCH_EVENTS_TABLE)
+                .unwrap()
+                .insert(&wal_key, WATCH_EVENT_GOLDEN)
+                .unwrap();
+
+            // Secondary indexes (copy-through, NEVER decoded).
+            let mut idx_value = [0u8; 24];
+            idx_value[..8].copy_from_slice(&experience.timestamp.to_be_bytes());
+            idx_value[8..24].copy_from_slice(experience.id.as_bytes());
+            write_txn
+                .open_multimap_table(EXPERIENCES_BY_COLLECTIVE_TABLE)
+                .unwrap()
+                .insert(collective.id.as_bytes(), &idx_value)
+                .unwrap();
+            let type_key = encode_type_index_key(
+                collective.id.as_bytes(),
+                experience.experience_type.type_tag(),
+            );
+            write_txn
+                .open_multimap_table(EXPERIENCES_BY_TYPE_TABLE)
+                .unwrap()
+                .insert(&type_key, experience.id.as_bytes())
+                .unwrap();
+            let _ = write_txn.open_table(DECAY_CONFIGS_TABLE).unwrap();
+            let _ = write_txn.open_table(ACTIVITIES_TABLE).unwrap();
+            let _ = write_txn.open_multimap_table(RELATIONS_BY_SOURCE_TABLE).unwrap();
+            let _ = write_txn.open_multimap_table(RELATIONS_BY_TARGET_TABLE).unwrap();
+            let _ = write_txn.open_multimap_table(INSIGHTS_BY_COLLECTIVE_TABLE).unwrap();
+        }
+        write_txn.commit().unwrap();
+        drop(db);
+
+        let mut experience = experience;
+        experience.embedding = embedding;
+        (collective, experience)
+    }
+
+    #[test]
+    fn test_older_marker1_store_reads_as_older_before_migration() {
+        // Premise: the seeder builds a genuine marker-1 {redb-v3, bincode} store
+        // (Older), NOT Absent and NOT a redb-v2 file.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("older.db");
+        let _ = seed_redb_v3_bincode_older_store(&path);
+
+        // redb-4.1 opens it directly (already v3 — no UpgradeRequired).
+        let db = RedbStorage::create_database(&path, &default_config()).unwrap();
+        assert_eq!(
+            RedbStorage::read_substrate_marker(&db).unwrap(),
+            SubstrateFormat::Older(1),
+            "marker-1 v3 store must classify as Older(1) once CURRENT bumped to 2"
+        );
+    }
+
+    #[test]
+    fn test_writable_migrate_of_older_marker1_store_reencodes_experiences_and_wal_to_postcard() {
+        // THE gate-2 grill Q1 PIN: the {redb-v3, bincode} no-op-reshape path. A
+        // writable open must re-encode EXPERIENCES + WAL (and every serde-blob) to
+        // postcard via the DECOUPLED codec loop — NOT merely flip the marker. A
+        // fused codec-in-reshape would silently skip these rows (silent corruption).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("older.db");
+        let (collective, experience) = seed_redb_v3_bincode_older_store(&path);
+
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+
+        // Marker bumped to CURRENT (2 = {redb-v3, postcard}).
+        assert_eq!(
+            RedbStorage::read_substrate_marker(storage.database()).unwrap(),
+            SubstrateFormat::Current
+        );
+        assert_eq!(CURRENT_SUBSTRATE_FORMAT, 2);
+
+        // --- EXPERIENCES re-encoded to postcard (decodes as postcard, NOT bincode) ---
+        {
+            let read_txn = storage.database().begin_read().unwrap();
+            let exp_table = read_txn.open_table(EXPERIENCES_TABLE).unwrap();
+            let raw = exp_table.get(experience.id.as_bytes()).unwrap().unwrap();
+            let raw_bytes = raw.value().to_vec();
+            // Postcard-decodable (the codec loop re-encoded it)...
+            let as_postcard: Experience = postcard::from_bytes(&raw_bytes)
+                .expect("migrated EXPERIENCES row must decode as postcard");
+            assert_eq!(as_postcard.id, experience.id);
+            assert_eq!(as_postcard.content, "hello");
+            // ...and NO LONGER the original frozen bincode bytes (proves a rewrite).
+            assert_ne!(
+                raw_bytes.as_slice(),
+                EXPERIENCE_GOLDEN,
+                "EXPERIENCES must have been re-encoded away from the bincode bytes"
+            );
+        }
+
+        // --- WAL (WATCH_EVENTS) re-encoded to postcard ---
+        {
+            let read_txn = storage.database().begin_read().unwrap();
+            let wal_table = read_txn.open_table(WATCH_EVENTS_TABLE).unwrap();
+            let raw = wal_table.get(&1u64.to_be_bytes()).unwrap().unwrap();
+            let raw_bytes = raw.value().to_vec();
+            let as_postcard: WatchEventRecord = postcard::from_bytes(&raw_bytes)
+                .expect("migrated WATCH_EVENTS row must decode as postcard");
+            assert_eq!(as_postcard.entity_id, [0x71; 16]);
+            assert_eq!(as_postcard.timestamp_ms, 12345);
+            assert_ne!(
+                raw_bytes.as_slice(),
+                WATCH_EVENT_GOLDEN,
+                "WAL must have been re-encoded away from the bincode bytes"
+            );
+        }
+
+        // --- value identity through the steady-state postcard read path ---
+        let got_collective = storage.get_collective(collective.id).unwrap().unwrap();
+        assert_collective_eq(&got_collective, &collective);
+        let got_experience = storage.get_experience(experience.id).unwrap().unwrap();
+        assert_experience_eq(&got_experience, &experience);
+
+        // --- §2a copy-through byte-identity: embeddings + indexes + raw meta keys ---
+        {
+            let read_txn = storage.database().begin_read().unwrap();
+            let emb = read_txn.open_table(EMBEDDINGS_TABLE).unwrap();
+            let raw = emb.get(experience.id.as_bytes()).unwrap().unwrap();
+            assert_eq!(
+                raw.value(),
+                f32_slice_to_bytes(&experience.embedding).as_slice(),
+                "embedding bytes copied through byte-identically (never decoded)"
+            );
+            let meta = read_txn.open_table(METADATA_TABLE).unwrap();
+            // wal_sequence raw 8-byte BE copied through untouched.
+            assert_eq!(
+                meta.get(WAL_SEQUENCE_KEY).unwrap().unwrap().value(),
+                1u64.to_be_bytes().as_slice(),
+                "wal_sequence raw bytes copied through (never decoded)"
+            );
+            // instance_id raw 16 bytes copied through untouched.
+            assert_eq!(
+                meta.get(INSTANCE_ID_KEY).unwrap().unwrap().value(),
+                InstanceId::from_bytes(*b"OLDERFIXTUREINST").as_bytes().as_slice(),
+                "instance_id raw bytes copied through (never decoded)"
+            );
+        }
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_read_only_open_of_older_marker1_store_refuses_with_zero_codec_writes() {
+        // FR-035 / audit C6: a read-only open of the marker-1 (Older) {redb-v3,
+        // bincode} store refuses with ReadOnly and performs ZERO PulseDB writes —
+        // no codec migration, no marker bump, the values stay bincode.
+        //
+        // Note on mtime: unlike the redb-v2 read-only test (refused in
+        // `create_or_migrate` BEFORE redb ever opens the file), a marker-1 store is
+        // already redb-v3, so redb's own `Database::create` opens the file (and may
+        // touch its mtime / lock page) BEFORE the codec read-only gate fires. That
+        // open-time touch is redb's bookkeeping, NOT a PulseDB write; the meaningful
+        // FR-035 guarantee here is "no codec migration / marker unchanged", asserted
+        // via the still-`Older(1)` marker + still-bincode values below.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("older.db");
+        let (_collective, experience) = seed_redb_v3_bincode_older_store(&path);
+
+        let err = RedbStorage::open(&path, &Config::read_only()).unwrap_err();
+        assert!(
+            matches!(err, PulseDBError::ReadOnly),
+            "read-only open of an un-migrated (marker-1) store must return ReadOnly, got: {err}"
+        );
+
+        // Still marker 1 (no codec migration ran).
+        let db = RedbStorage::create_database(&path, &Config::read_only()).unwrap();
+        assert_eq!(
+            RedbStorage::read_substrate_marker(&db).unwrap(),
+            SubstrateFormat::Older(1),
+            "read-only refusal must leave the store at marker 1 (no codec migration)"
+        );
+        // And the EXPERIENCES value is STILL the original frozen bincode bytes
+        // (proving the codec loop did not run) — decodes via legacy_bincode, and the
+        // on-disk bytes equal the seeded golden.
+        let read_txn = db.begin_read().unwrap();
+        let exp_table = read_txn.open_table(EXPERIENCES_TABLE).unwrap();
+        let raw = exp_table.get(experience.id.as_bytes()).unwrap().unwrap();
+        assert_eq!(
+            raw.value(),
+            EXPERIENCE_GOLDEN,
+            "read-only refusal must leave EXPERIENCES as the original bincode bytes"
+        );
+    }
+
+    // ====================================================================
+    // Transaction-shape decision (§6.3 config-first) — single-txn primary +
+    // fail-closed-above-floor valve (§6.4(3)).
+    // ====================================================================
+
+    #[test]
+    fn test_codec_txn_shape_below_floor_is_single_txn() {
+        // The common path: a store below the 1 GiB conservative floor always takes
+        // the single-txn path regardless of declared memory.
+        let cfg = default_config();
+        assert!(RedbStorage::resolve_codec_txn_shape(10 * 1024 * 1024, &cfg).is_ok());
+        assert!(RedbStorage::resolve_codec_txn_shape(
+            RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES,
+            &cfg
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_codec_txn_shape_above_floor_undeclared_fails_closed() {
+        // Above the floor with NO declared memory budget: fail closed with the
+        // typed SubstrateMigrationTooLarge — zero destructive writes (§6.4(3)).
+        let cfg = default_config();
+        let store_size = 4 * RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES; // 4 GiB
+        let err = RedbStorage::resolve_codec_txn_shape(store_size, &cfg).unwrap_err();
+        match err {
+            PulseDBError::Storage(StorageError::SubstrateMigrationTooLarge {
+                store_size: s,
+                projected_peak,
+                budget,
+            }) => {
+                assert_eq!(s, store_size);
+                // projected_peak ≈ 0.10 × store_size.
+                assert_eq!(projected_peak, store_size / 10);
+                assert_eq!(budget, RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES);
+            }
+            other => panic!("expected SubstrateMigrationTooLarge, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_codec_txn_shape_above_floor_declared_memory_opts_into_single_txn() {
+        // Config-first opt-in: a declared budget covering the projected peak (with
+        // the 0.5 safety margin) authorizes single-txn for an above-floor store.
+        let store_size = 4 * RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES; // 4 GiB
+        let projected_peak = store_size / 10; // ~400 MiB
+
+        // Budget over 2× projected_peak clears the margin (peak < budget/2).
+        let mut cfg = default_config();
+        cfg.migration_available_memory_bytes = Some(projected_peak * 2 + 2);
+        assert!(
+            RedbStorage::resolve_codec_txn_shape(store_size, &cfg).is_ok(),
+            "a declared budget covering 2× projected peak must allow single-txn"
+        );
+
+        // A too-small declared budget still fails closed.
+        let mut cfg_small = default_config();
+        cfg_small.migration_available_memory_bytes = Some(projected_peak); // peak !< peak/2
+        assert!(matches!(
+            RedbStorage::resolve_codec_txn_shape(store_size, &cfg_small),
+            Err(PulseDBError::Storage(StorageError::SubstrateMigrationTooLarge { .. }))
+        ));
+    }
+
+    // ====================================================================
+    // Decay-config goldens (§4.5 / audit C2) — direct legacy_bincode::decode of
+    // BOTH StoredDecayConfig and StoredDecayConfigV1 from frozen oracle bytes.
+    // ====================================================================
+
+    #[test]
+    fn test_decay_config_golden_decodes_current_shape() {
+        // STORED_DECAY_CONFIG_GOLDEN: half_life 86400s + 500ns, freq 0.25,
+        // floor 0.1, auto_archive true, weights Some(0.6, 0.4).
+        let stored: StoredDecayConfig =
+            legacy_bincode::decode(STORED_DECAY_CONFIG_GOLDEN).expect("StoredDecayConfig decodes");
+        assert_eq!(stored.half_life_secs, 86_400);
+        assert_eq!(stored.half_life_nanos, 500);
+        assert_eq!(stored.freq_weight, 0.25);
+        assert_eq!(stored.floor, 0.1);
+        assert!(stored.auto_archive_below_floor);
+        assert_eq!(stored.default_recall_weights, Some(RecallWeights::new(0.6, 0.4)));
+
+        // Round-trips through the public DecayConfig conversion.
+        let cfg: DecayConfig = stored.into();
+        assert_eq!(cfg.half_life, std::time::Duration::new(86_400, 500));
+    }
+
+    #[test]
+    fn test_decay_config_golden_decodes_v1_legacy_shape() {
+        // STORED_DECAY_CONFIG_V1_GOLDEN: NO half_life_nanos field — half_life 3600s,
+        // freq 0.5, floor 0.2, auto_archive false, weights None.
+        let v1: StoredDecayConfigV1 = legacy_bincode::decode(STORED_DECAY_CONFIG_V1_GOLDEN)
+            .expect("StoredDecayConfigV1 decodes");
+        assert_eq!(v1.half_life_secs, 3_600);
+        assert_eq!(v1.freq_weight, 0.5);
+        assert_eq!(v1.floor, 0.2);
+        assert!(!v1.auto_archive_below_floor);
+        assert!(v1.default_recall_weights.is_none());
+
+        // V1 lacks nanos ⇒ second-precision Duration after conversion.
+        let cfg: DecayConfig = v1.into();
+        assert_eq!(cfg.half_life, std::time::Duration::from_secs(3_600));
+
+        // The two goldens have DISTINCT byte layouts (the nanos field): decoding the
+        // V1 bytes as the current shape would mis-align ⇒ must NOT succeed cleanly.
+        assert!(
+            legacy_bincode::decode::<StoredDecayConfig>(STORED_DECAY_CONFIG_V1_GOLDEN).is_err(),
+            "V1 bytes (no nanos) must not silently decode as the current StoredDecayConfig"
+        );
     }
 }

@@ -144,7 +144,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_insight_type_bincode_roundtrip() {
+    fn test_insight_type_postcard_roundtrip() {
         let types = [
             InsightType::Pattern,
             InsightType::Synthesis,
@@ -152,14 +152,14 @@ mod tests {
             InsightType::Correlation,
         ];
         for it in &types {
-            let bytes = bincode::serialize(it).unwrap();
-            let restored: InsightType = bincode::deserialize(&bytes).unwrap();
+            let bytes = postcard::to_stdvec(it).unwrap();
+            let restored: InsightType = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(*it, restored);
         }
     }
 
     #[test]
-    fn test_derived_insight_bincode_roundtrip() {
+    fn test_derived_insight_postcard_roundtrip() {
         let insight = DerivedInsight {
             id: InsightId::new(),
             collective_id: CollectiveId::new(),
@@ -173,8 +173,8 @@ mod tests {
             updated_at: Timestamp::now(),
         };
 
-        let bytes = bincode::serialize(&insight).unwrap();
-        let restored: DerivedInsight = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_stdvec(&insight).unwrap();
+        let restored: DerivedInsight = postcard::from_bytes(&bytes).unwrap();
 
         assert_eq!(insight.id, restored.id);
         assert_eq!(insight.collective_id, restored.collective_id);
