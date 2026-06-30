@@ -283,6 +283,39 @@ pub enum StorageError {
         /// The single-txn budget (ceiling) that `projected_peak` exceeded, in bytes.
         budget: u64,
     },
+
+    /// The bincode→postcard codec migration cannot run because there is not enough
+    /// free disk space to hold the pristine `.pre-substrate.bak` backup plus the
+    /// migrated file plus a redb transaction-growth margin.
+    ///
+    /// This is the **disk axis** of the unified headroom preflight (VS-4.0.3
+    /// work-1.05 / audit C3), the companion of [`Self::SubstrateMigrationTooLarge`]
+    /// (the memory axis). The pristine backup taken before any destructive write
+    /// (`.pre-substrate.bak`) roughly **doubles** the on-disk footprint, and the
+    /// postcard re-encode does not shrink the size-dominant `Vec<f32>` embedding
+    /// table, so the migrated file is conservatively assumed to be ~1× the store
+    /// size. The preflight fails here with **zero destructive writes** (no
+    /// half-migration that runs the disk out mid-pass) rather than risk an
+    /// unfinishable migration. Free up disk, or run the offline `pulsedb migrate`
+    /// tool (VS-4.0.4) for very large stores.
+    ///
+    /// `store_size` is the on-disk file size at open; `required` is the conservative
+    /// free-space estimate (`backup ≈ store_size` + migrated ≈ store_size + redb
+    /// txn-growth margin); `available` is the free space observed on the store's
+    /// filesystem at open.
+    #[error(
+        "insufficient free disk space for the codec migration: store size {store_size} bytes \
+         needs ~{required} bytes free (pristine backup + migrated file + transaction margin) \
+         but only {available} bytes are available; free up disk or run the offline migration tool"
+    )]
+    SubstrateMigrationInsufficientDisk {
+        /// On-disk redb file size at open, in bytes.
+        store_size: u64,
+        /// Conservative free-space estimate the migration needs, in bytes.
+        required: u64,
+        /// Free space observed on the store's filesystem at open, in bytes.
+        available: u64,
+    },
 }
 
 impl StorageError {
@@ -325,6 +358,19 @@ impl StorageError {
             store_size,
             projected_peak,
             budget,
+        }
+    }
+
+    /// Creates a substrate-migration-insufficient-disk error (disk-headroom axis).
+    pub fn substrate_migration_insufficient_disk(
+        store_size: u64,
+        required: u64,
+        available: u64,
+    ) -> Self {
+        Self::SubstrateMigrationInsufficientDisk {
+            store_size,
+            required,
+            available,
         }
     }
 }

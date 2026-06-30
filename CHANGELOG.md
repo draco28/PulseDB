@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Storage value codec migrated from bincode to postcard** (`SUBSTRATE_FORMAT` marker 1→2). Existing stores upgrade on first writable open via a one-time codec re-encode; embeddings and secondary indexes are copied through byte-identically. See **[docs/storage-migration.md](docs/storage-migration.md)** for the migration & crash-recovery posture — the disk+memory headroom preflight, the single-transaction "re-run from scratch on crash" contract, and the large-store fail-closed behavior.
+
 ## [0.5.1] - 2026-06-20
 
 > **Public-boundary hardening.** Metadata, licensing, and security-posture fixes only — no `src/`, API, or behavior changes.

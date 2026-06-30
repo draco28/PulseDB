@@ -816,7 +816,19 @@ impl RedbStorage {
         // a declared memory budget) is the realized single-txn primary path.
         if needs_marker_write && !config.read_only {
             let store_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            Self::resolve_codec_txn_shape(store_size, config)?;
+            // Unified headroom preflight (work-1.05 / audit C3): disk THEN memory,
+            // BEFORE any destructive write. If free space can't be determined, don't
+            // block on the disk axis (u64::MAX) — the memory axis + backup_once still
+            // guard; the disk check is a best-effort early failure for the common case.
+            let available = fs2::available_space(&path).unwrap_or(u64::MAX);
+            Self::resolve_migration_headroom(store_size, available, config)?;
+            // Progress signal (work-1.05 / C3): the first-open migration is exempt
+            // from NFR-001 (<100ms); make the multi-minute pass non-silent. Per-phase
+            // `info!` lines (reshape / re-encode, below) report progress thereafter.
+            info!(
+                store_size,
+                "migrating store substrate format (codec re-encode); this may take a while for large stores"
+            );
         }
 
         // Audit C6 / FR-035: a read-only open performs ZERO writes — it must not
@@ -1207,6 +1219,50 @@ impl RedbStorage {
             projected_peak,
             Self::SINGLE_TXN_STORE_FLOOR_BYTES,
         )))
+    }
+
+    /// Conservative free-disk estimate the codec migration needs (audit C3 / work-1.05).
+    ///
+    /// The pristine `.pre-substrate.bak` backup taken before any destructive write
+    /// roughly **doubles** the on-disk footprint (~1× store_size), and the postcard
+    /// re-encode does **not** shrink the size-dominant raw-`f32` embedding table
+    /// (1.02 size-delta), so the migrated file is conservatively assumed to be
+    /// ~1× store_size. Add a ~10% redb transaction-growth margin. Saturating
+    /// throughout (never overflows).
+    fn required_migration_disk_bytes(store_size: u64) -> u64 {
+        // backup (~1×) + migrated (~1×) + ~10% txn-growth margin
+        store_size
+            .saturating_mul(2)
+            .saturating_add(store_size / 10)
+    }
+
+    /// Unified migration headroom preflight (audit C3 / work-1.05) — checks the
+    /// **disk** axis THEN the **memory** axis, returning a typed error with ZERO
+    /// destructive writes when either is short, BEFORE the `.pre-substrate.bak`
+    /// backup + codec re-encode pass run.
+    ///
+    /// The disk axis is evaluated first: it is the cheaper, earlier guard against a
+    /// half-migration that exhausts disk mid-pass. `available` is the observed free
+    /// space on the store's filesystem, injected for testability; the open path
+    /// passes `fs2::available_space(path)`. The memory axis reuses
+    /// [`Self::resolve_codec_txn_shape`] (1.02 coefficient + config-first floor /
+    /// declared-memory opt-in — never raw host auto-detect).
+    fn resolve_migration_headroom(store_size: u64, available: u64, config: &Config) -> Result<()> {
+        // Disk axis first (cheaper guard against a half-migration that exhausts disk).
+        let required = Self::required_migration_disk_bytes(store_size);
+        if available < required {
+            warn!(
+                store_size,
+                required,
+                available,
+                "codec migration: insufficient free disk; failing closed (no destructive write)"
+            );
+            return Err(PulseDBError::Storage(
+                StorageError::substrate_migration_insufficient_disk(store_size, required, available),
+            ));
+        }
+        // Memory axis: reuse 1.04's config-first single-txn-vs-fail-closed decision.
+        Self::resolve_codec_txn_shape(store_size, config)
     }
 
     /// Re-encodes every serde-blob table from legacy bincode to postcard, in the
@@ -5596,6 +5652,124 @@ mod tests {
             RedbStorage::resolve_codec_txn_shape(store_size, &cfg_small),
             Err(PulseDBError::Storage(StorageError::SubstrateMigrationTooLarge { .. }))
         ));
+    }
+
+    // ====================================================================
+    // Unified headroom preflight — disk axis (VS-4.0.3 work-1.05 / audit C3).
+    // The memory axis is `resolve_codec_txn_shape` (tested above). These cover
+    // the NEW disk free-space leg and the unification that runs disk THEN memory,
+    // failing with a typed error BEFORE any destructive write.
+    // ====================================================================
+
+    #[test]
+    fn test_required_migration_disk_bytes_accounts_for_backup_and_margin() {
+        // The pristine `.pre-substrate.bak` backup ≈ doubles the on-disk footprint,
+        // the postcard re-encode does NOT shrink the size-dominant embedding table
+        // (so migrated ≈ 1× store_size), and redb needs a txn-growth margin. The
+        // required free-space estimate must therefore exceed the raw store size by
+        // a clear margin — at least ~2× (backup + migrated) is the conservative
+        // floor the disk preflight enforces.
+        let store_size = 100 * 1024 * 1024; // 100 MiB
+        let required = RedbStorage::required_migration_disk_bytes(store_size);
+        assert!(
+            required >= 2 * store_size,
+            "required free ({required}) must cover backup (~1×) + migrated (~1×) for store {store_size}"
+        );
+    }
+
+    #[test]
+    fn test_headroom_preflight_insufficient_disk_fails_closed_before_write() {
+        // Disk axis: when available free space is below the required estimate, the
+        // unified preflight returns the typed SubstrateMigrationInsufficientDisk
+        // with zero destructive writes — and surfaces the observed/required figures.
+        let cfg = default_config();
+        let store_size = 100 * 1024 * 1024; // 100 MiB, well below the memory floor
+        let required = RedbStorage::required_migration_disk_bytes(store_size);
+        let available = required - 1; // one byte short
+        let err =
+            RedbStorage::resolve_migration_headroom(store_size, available, &cfg).unwrap_err();
+        match err {
+            PulseDBError::Storage(StorageError::SubstrateMigrationInsufficientDisk {
+                store_size: s,
+                required: r,
+                available: a,
+            }) => {
+                assert_eq!(s, store_size);
+                assert_eq!(r, required);
+                assert_eq!(a, available);
+            }
+            other => panic!("expected SubstrateMigrationInsufficientDisk, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_headroom_preflight_sufficient_disk_below_floor_proceeds() {
+        // Sufficient disk + a below-floor store (memory axis trivially OK) →
+        // the unified preflight returns Ok and the migration may proceed.
+        let cfg = default_config();
+        let store_size = 100 * 1024 * 1024; // 100 MiB
+        let available = RedbStorage::required_migration_disk_bytes(store_size); // exactly enough
+        assert!(
+            RedbStorage::resolve_migration_headroom(store_size, available, &cfg).is_ok(),
+            "sufficient disk + below-floor store must pass the unified preflight"
+        );
+    }
+
+    #[test]
+    fn test_headroom_preflight_disk_checked_before_memory() {
+        // Unification ordering / fail-closed: an above-floor store with NO declared
+        // memory budget AND insufficient disk must still fail closed. The disk axis
+        // is checked first (it is the cheaper, earlier guard against a half-migration
+        // that exhausts disk), so the surfaced error is the disk one.
+        let cfg = default_config(); // no declared memory budget
+        let store_size = 4 * RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES; // 4 GiB, above floor
+        let required = RedbStorage::required_migration_disk_bytes(store_size);
+        let available = required / 2; // insufficient disk
+        let err =
+            RedbStorage::resolve_migration_headroom(store_size, available, &cfg).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PulseDBError::Storage(StorageError::SubstrateMigrationInsufficientDisk { .. })
+            ),
+            "disk axis must be evaluated before memory; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_headroom_preflight_sufficient_disk_above_floor_undeclared_fails_on_memory() {
+        // Ample disk but an above-floor store with NO declared memory budget must
+        // STILL fail — on the memory axis (SubstrateMigrationTooLarge). This proves
+        // the unified preflight covers BOTH axes (it does not pass just because disk
+        // is fine) and reuses 1.04's resolve_codec_txn_shape rather than re-deriving.
+        let cfg = default_config(); // no declared memory budget
+        let store_size = 4 * RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES; // 4 GiB, above floor
+        // Plenty of disk: far more than required.
+        let available = RedbStorage::required_migration_disk_bytes(store_size) * 2;
+        let err =
+            RedbStorage::resolve_migration_headroom(store_size, available, &cfg).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PulseDBError::Storage(StorageError::SubstrateMigrationTooLarge { .. })
+            ),
+            "ample disk but no memory budget above floor must fail on the memory axis; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_headroom_preflight_above_floor_declared_memory_and_disk_proceeds() {
+        // Both axes satisfied for an above-floor store: a declared memory budget
+        // covering the projected peak AND sufficient disk → Ok.
+        let store_size = 4 * RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES; // 4 GiB
+        let projected_peak = store_size / 10;
+        let mut cfg = default_config();
+        cfg.migration_available_memory_bytes = Some(projected_peak * 2 + 2); // clears the margin
+        let available = RedbStorage::required_migration_disk_bytes(store_size);
+        assert!(
+            RedbStorage::resolve_migration_headroom(store_size, available, &cfg).is_ok(),
+            "declared memory + sufficient disk must pass the unified preflight above the floor"
+        );
     }
 
     // ====================================================================
