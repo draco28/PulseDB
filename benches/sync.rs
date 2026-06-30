@@ -66,7 +66,7 @@ fn bench_sync_change_serialization(c: &mut Criterion) {
 
     c.bench_function("sync/change_serialization", |b| {
         b.iter(|| {
-            let bytes = bincode::serialize(black_box(&change)).unwrap();
+            let bytes = postcard::to_stdvec(black_box(&change)).unwrap();
             black_box(bytes);
         })
     });
@@ -83,11 +83,11 @@ fn bench_sync_change_deserialization(c: &mut Criterion) {
         payload: SyncPayload::ExperienceCreated(exp),
         timestamp: Timestamp::now(),
     };
-    let bytes = bincode::serialize(&change).unwrap();
+    let bytes = postcard::to_stdvec(&change).unwrap();
 
     c.bench_function("sync/change_deserialization", |b| {
         b.iter(|| {
-            let decoded: SyncChange = bincode::deserialize(black_box(&bytes)).unwrap();
+            let decoded: SyncChange = postcard::from_bytes(black_box(&bytes)).unwrap();
             black_box(decoded);
         })
     });

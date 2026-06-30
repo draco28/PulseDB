@@ -38,10 +38,10 @@ redb = "4.1"
 # fails) on the dual-redb window — that is expected and tolerated (deny.toml).
 redb_v2 = { package = "redb", version = "2.6" }
 
-# Serialization - postcard replaces the unmaintained bincode (RUSTSEC-2025-0141;
-# ADR-006). bincode is retained ONLY until VS-4.0.3 lands the vendored decode path
-# + value re-encode; its `deny.toml` ignore drops once the crate dependency is gone.
-bincode = "1.3"
+# Serialization - postcard (ADR-006, Accepted). The unmaintained bincode 1.x
+# (RUSTSEC-2025-0141) was dropped in VS-4.0.3 once the vendored decode path
+# (`storage::legacy_bincode`) + on-open value re-encode landed; the `deny.toml`
+# advisory ignore was removed with it.
 postcard = { version = "=1.1.3", features = ["use-std"] }
 serde = { version = "1.0", features = ["derive"] }
 
@@ -139,13 +139,6 @@ harness = false
 
 [[bench]]
 name = "recall_rerank"
-harness = false
-
-# VS-4.0.3 work-1.02 — scale + codec characterization probe (measurement-only).
-# Part A (size/speed delta) runs under plain `cargo bench --bench codec_probe`;
-# Part B (single-txn viability) is env-gated (CODEC_PROBE_VIABILITY=1).
-[[bench]]
-name = "codec_probe"
 harness = false
 
 [[bench]]
