@@ -141,6 +141,13 @@ harness = false
 name = "recall_rerank"
 harness = false
 
+# VS-4.0.3 work-1.02 — scale + codec characterization probe (measurement-only).
+# Part A (size/speed delta) runs under plain `cargo bench --bench codec_probe`;
+# Part B (single-txn viability) is env-gated (CODEC_PROBE_VIABILITY=1).
+[[bench]]
+name = "codec_probe"
+harness = false
+
 [[bench]]
 name = "sync"
 harness = false
