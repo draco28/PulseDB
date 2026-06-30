@@ -37,7 +37,7 @@ use super::types::{
     HandshakeRequest, HandshakeResponse, InstanceId, PullRequest, PullResponse, PushResponse,
     SyncChange, SyncCursor,
 };
-use super::SYNC_PROTOCOL_VERSION;
+use super::{read_wire_preamble, write_wire_preamble, SYNC_PROTOCOL_VERSION};
 
 /// Server-side sync handler.
 ///
@@ -181,27 +181,46 @@ impl SyncServer {
         Ok(())
     }
 
-    // ─── Byte-level handlers (bincode in/out for HTTP) ───────────────
+    // ─── Byte-level handlers (postcard in/out for HTTP) ──────────────
 
-    /// Handles a handshake from raw bincode bytes.
+    /// Handles a handshake from raw wire bytes.
+    ///
+    /// The handshake is the ONLY body that carries the serializer-independent
+    /// wire preamble. The preamble is parsed by **raw byte-slicing of
+    /// `body[..3]` BEFORE** the body is deserialized (see
+    /// [`read_wire_preamble`]), so a serializer/version mismatch surfaces as a
+    /// typed [`SyncError::WireFormatMismatch`] — not a generic decode error,
+    /// and not the soft in-band `accepted: false` path. The response is framed
+    /// with the same preamble so the *client* can fail loud on the way back too.
     pub fn handle_handshake_bytes(&self, body: &[u8]) -> Result<Vec<u8>, SyncError> {
-        let request: HandshakeRequest = bincode::deserialize(body).map_err(SyncError::from)?;
+        // 1. Validate the preamble by raw byte-slice BEFORE any deserialize.
+        let payload = read_wire_preamble(body)?;
+        // 2. Only now is it safe to deserialize the framed body.
+        let request: HandshakeRequest = postcard::from_bytes(payload).map_err(SyncError::from)?;
         let response = self.handle_handshake(request)?;
-        bincode::serialize(&response).map_err(|e| SyncError::serialization(e.to_string()))
+        let encoded =
+            postcard::to_allocvec(&response).map_err(|e| SyncError::serialization(e.to_string()))?;
+        // 3. Frame the response with the preamble (both directions fail loud).
+        Ok(write_wire_preamble(&encoded))
     }
 
-    /// Handles a push from raw bincode bytes.
+    /// Handles a push from raw postcard bytes.
+    ///
+    /// Push bodies carry NO preamble — they are reached only after a successful
+    /// handshake pinned the wire version, so a straight postcard decode is safe.
     pub fn handle_push_bytes(&self, body: &[u8]) -> Result<Vec<u8>, SyncError> {
-        let changes: Vec<SyncChange> = bincode::deserialize(body).map_err(SyncError::from)?;
+        let changes: Vec<SyncChange> = postcard::from_bytes(body).map_err(SyncError::from)?;
         let response = self.handle_push(changes)?;
-        bincode::serialize(&response).map_err(|e| SyncError::serialization(e.to_string()))
+        postcard::to_allocvec(&response).map_err(|e| SyncError::serialization(e.to_string()))
     }
 
-    /// Handles a pull from raw bincode bytes.
+    /// Handles a pull from raw postcard bytes.
+    ///
+    /// Pull bodies carry NO preamble (same rationale as push).
     pub fn handle_pull_bytes(&self, body: &[u8]) -> Result<Vec<u8>, SyncError> {
-        let request: PullRequest = bincode::deserialize(body).map_err(SyncError::from)?;
+        let request: PullRequest = postcard::from_bytes(body).map_err(SyncError::from)?;
         let response = self.handle_pull(request)?;
-        bincode::serialize(&response).map_err(|e| SyncError::serialization(e.to_string()))
+        postcard::to_allocvec(&response).map_err(|e| SyncError::serialization(e.to_string()))
     }
 }
 

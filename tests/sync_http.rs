@@ -20,8 +20,12 @@ use pulsedb::sync::manager::SyncManager;
 use pulsedb::sync::server::SyncServer;
 use pulsedb::sync::transport::SyncTransport;
 use pulsedb::sync::transport_http::HttpSyncTransport;
+use pulsedb::sync::error::SyncError;
 use pulsedb::sync::types::{HandshakeRequest, InstanceId, PullRequest, SyncCursor};
-use pulsedb::sync::SYNC_PROTOCOL_VERSION;
+use pulsedb::sync::{
+    read_wire_preamble, write_wire_preamble, SYNC_PROTOCOL_VERSION, SYNC_WIRE_MAGIC,
+    SYNC_WIRE_PREAMBLE_LEN, WIRE_FORMAT_VERSION,
+};
 use pulsedb::{CollectiveId, Config, NewExperience, PulseDB};
 use tempfile::tempdir;
 
@@ -112,6 +116,26 @@ fn minimal_exp(cid: CollectiveId) -> NewExperience {
         embedding: Some(vec![0.1f32; 384]),
         ..Default::default()
     }
+}
+
+/// Builds a bare in-process `SyncServer` (no HTTP) for byte-level handler tests
+/// that need the typed `SyncError` back rather than an HTTP status code.
+fn in_process_server() -> (Arc<SyncServer>, tempfile::TempDir) {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(PulseDB::open(dir.path().join("server.db"), Config::default()).unwrap());
+    let server = Arc::new(SyncServer::new(db, SyncConfig::default()));
+    (server, dir)
+}
+
+/// A valid postcard-encoded handshake request body (no preamble), used as the
+/// payload under test for preamble-framing cases.
+fn handshake_body_bytes() -> Vec<u8> {
+    let request = HandshakeRequest {
+        instance_id: InstanceId::new(),
+        protocol_version: SYNC_PROTOCOL_VERSION,
+        capabilities: vec!["push".into()],
+    };
+    postcard::to_allocvec(&request).unwrap()
 }
 
 // ============================================================================
@@ -283,4 +307,184 @@ async fn test_http_push_to_server() {
         server.db.get_experience(exp_id).unwrap().is_some(),
         "Experience should be pushed to server"
     );
+}
+
+// ============================================================================
+// Wire-format preamble tests (VS-4.0.3 / C5 — serializer-independent fail-loud)
+// ============================================================================
+
+/// (a) Preamble round-trip: a correctly-framed handshake body decodes cleanly,
+/// and the server's response is itself preamble-framed (both directions).
+#[tokio::test]
+async fn test_wire_preamble_roundtrip_both_directions() {
+    let (server, _dir) = in_process_server();
+
+    // Client side: frame a valid postcard body with the preamble.
+    let framed_request = write_wire_preamble(&handshake_body_bytes());
+    assert_eq!(&framed_request[..2], &SYNC_WIRE_MAGIC, "magic leads the frame");
+    assert_eq!(
+        framed_request[2], WIRE_FORMAT_VERSION,
+        "version byte follows magic"
+    );
+
+    // Server accepts the framed request and returns a framed response.
+    let framed_response = server
+        .handle_handshake_bytes(&framed_request)
+        .expect("valid framed handshake must succeed");
+
+    // The RESPONSE also carries the preamble (the other direction).
+    let payload = read_wire_preamble(&framed_response)
+        .expect("server response must carry a valid preamble");
+    let response: pulsedb::sync::types::HandshakeResponse =
+        postcard::from_bytes(payload).expect("response body decodes after preamble strip");
+    assert!(response.accepted, "matched-version handshake is accepted");
+    assert_eq!(response.protocol_version, SYNC_PROTOCOL_VERSION);
+}
+
+/// (b) Bad-magic body → typed `WireFormatMismatch`, NOT `Serialization`.
+/// This proves the preamble is parsed (raw byte-slice of `body[..3]`) BEFORE
+/// any deserialize: a postcard-garbage leading body never reaches the decoder.
+#[tokio::test]
+async fn test_wire_preamble_bad_magic_is_typed_not_serialization() {
+    let (server, _dir) = in_process_server();
+
+    // A body with WRONG magic but otherwise a plausible postcard payload.
+    let mut bad = handshake_body_bytes();
+    let mut framed = vec![0x00, 0x01, WIRE_FORMAT_VERSION]; // wrong magic bytes
+    framed.append(&mut bad);
+
+    let err = server
+        .handle_handshake_bytes(&framed)
+        .expect_err("bad magic must fail");
+
+    assert!(
+        err.is_wire_format_mismatch(),
+        "bad magic must be the typed WireFormatMismatch, got: {err:?}"
+    );
+    assert!(
+        matches!(err, SyncError::WireFormatMismatch { got: None, .. }),
+        "bad magic carries got: None (no trustworthy version), got: {err:?}"
+    );
+    // The whole point: it is NOT a generic Serialization error.
+    assert!(
+        !matches!(err, SyncError::Serialization(_)),
+        "bad magic must NOT collapse to a generic Serialization error"
+    );
+}
+
+/// (c) Wrong `wire_format_version` (valid magic) → typed `WireFormatMismatch`.
+#[tokio::test]
+async fn test_wire_preamble_wrong_version_is_typed() {
+    let (server, _dir) = in_process_server();
+
+    let mut body = handshake_body_bytes();
+    let mut framed = Vec::new();
+    framed.extend_from_slice(&SYNC_WIRE_MAGIC); // valid magic
+    framed.push(WIRE_FORMAT_VERSION.wrapping_sub(1)); // wrong version (e.g. v2)
+    framed.append(&mut body);
+
+    let err = server
+        .handle_handshake_bytes(&framed)
+        .expect_err("wrong wire version must fail");
+
+    assert!(err.is_wire_format_mismatch(), "wrong version is typed, got: {err:?}");
+    assert!(
+        matches!(
+            err,
+            SyncError::WireFormatMismatch {
+                expected,
+                got: Some(g)
+            } if expected == WIRE_FORMAT_VERSION && g == WIRE_FORMAT_VERSION.wrapping_sub(1)
+        ),
+        "wrong version reports expected + observed bytes, got: {err:?}"
+    );
+}
+
+/// (d) Mixed-version fail-loud: a v2/bincode-era-style body (no preamble at all)
+/// fed to the v3 server fails loud with a typed error — no panic, no silent
+/// accept. A pre-4.0 peer's raw postcard/bincode body has no `0xFE 0xED` magic.
+#[tokio::test]
+async fn test_mixed_version_no_preamble_body_fails_loud() {
+    let (server, _dir) = in_process_server();
+
+    // A pre-preamble peer sends a raw (unframed) serialized handshake body.
+    let raw_no_preamble = handshake_body_bytes();
+
+    let err = server
+        .handle_handshake_bytes(&raw_no_preamble)
+        .expect_err("a no-preamble body must fail loud against the v3 server");
+
+    assert!(
+        err.is_wire_format_mismatch(),
+        "no-preamble body fails loud as WireFormatMismatch (not silent accept / not panic), got: {err:?}"
+    );
+
+    // A too-short body (fewer than the 3 preamble bytes) is also bad-magic.
+    let truncated = vec![SYNC_WIRE_MAGIC[0]]; // 1 byte, < SYNC_WIRE_PREAMBLE_LEN
+    assert!(truncated.len() < SYNC_WIRE_PREAMBLE_LEN);
+    let err2 = server
+        .handle_handshake_bytes(&truncated)
+        .expect_err("a truncated body must fail loud");
+    assert!(
+        matches!(err2, SyncError::WireFormatMismatch { got: None, .. }),
+        "truncated body is bad-magic typed error, got: {err2:?}"
+    );
+}
+
+/// (e) Keep the existing in-band `protocol_version`-mismatch path green: a
+/// correctly-framed handshake whose body advertises a different protocol
+/// version still flows through to the soft `accepted: false` response — the new
+/// preamble does NOT mask the protocol-semantics negotiation.
+#[tokio::test]
+async fn test_protocol_version_mismatch_still_soft_rejects_through_preamble() {
+    let (server, _dir) = in_process_server();
+
+    // Valid preamble + valid postcard body, but a mismatched protocol_version.
+    let request = HandshakeRequest {
+        instance_id: InstanceId::new(),
+        protocol_version: SYNC_PROTOCOL_VERSION + 99, // semantic mismatch, valid wire
+        capabilities: vec![],
+    };
+    let body = postcard::to_allocvec(&request).unwrap();
+    let framed = write_wire_preamble(&body);
+
+    let framed_response = server
+        .handle_handshake_bytes(&framed)
+        .expect("a wire-valid handshake reaches the protocol-version gate");
+
+    let payload = read_wire_preamble(&framed_response).expect("response is framed");
+    let response: pulsedb::sync::types::HandshakeResponse =
+        postcard::from_bytes(payload).unwrap();
+    assert!(
+        !response.accepted,
+        "protocol-version mismatch still yields the soft accepted:false path"
+    );
+    assert!(
+        response.reason.is_some(),
+        "soft rejection carries a reason string"
+    );
+}
+
+/// Sanity: a real cross-version HTTP exchange fails loud at the client too —
+/// a no-preamble (pre-4.0-style) request POSTed to the v3 server yields an
+/// error status, and the v3 client rejects a mangled response preamble.
+#[tokio::test]
+async fn test_http_handshake_happy_path_carries_preamble() {
+    let server = start_test_server().await;
+    let transport = HttpSyncTransport::new(&server.base_url);
+
+    let request = HandshakeRequest {
+        instance_id: InstanceId::new(),
+        protocol_version: SYNC_PROTOCOL_VERSION,
+        capabilities: vec!["push".into()],
+    };
+
+    // The transport frames the request preamble and validates the response
+    // preamble end-to-end over real HTTP; a clean round-trip proves both legs.
+    let response = transport
+        .handshake(request)
+        .await
+        .expect("framed handshake round-trips over HTTP");
+    assert!(response.accepted);
+    assert_eq!(response.protocol_version, SYNC_PROTOCOL_VERSION);
 }

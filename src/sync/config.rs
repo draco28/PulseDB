@@ -242,15 +242,15 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_config_bincode_roundtrip() {
+    fn test_sync_config_postcard_roundtrip() {
         let config = SyncConfig {
             direction: SyncDirection::PushOnly,
             batch_size: 100,
             collectives: Some(vec![CollectiveId::new()]),
             ..Default::default()
         };
-        let bytes = bincode::serialize(&config).unwrap();
-        let restored: SyncConfig = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_allocvec(&config).unwrap();
+        let restored: SyncConfig = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(config.direction, restored.direction);
         assert_eq!(config.batch_size, restored.batch_size);
     }
