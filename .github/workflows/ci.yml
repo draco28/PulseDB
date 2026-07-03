@@ -105,6 +105,28 @@ jobs:
         run: cargo test ${{ matrix.features }}
 
   # ─────────────────────────────────────────────
+  # Job 2b: migration crash-recovery gate (VS-4.0.4 / #46)
+  # Runs the kill-at-boundary fault-injection suite. Linux-only: the one
+  # subprocess crash-fidelity test uses libc::raise(SIGKILL) (POSIX). The
+  # `fault-injection` feature is OFF everywhere else, so this seam never ships.
+  # ─────────────────────────────────────────────
+  fault-injection:
+    name: Crash recovery (fault-injection)
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: fault-injection
+
+      - name: Run kill-at-boundary crash-recovery tests
+        run: cargo test --features fault-injection --test storage_migration_fault_injection
+
+  # ─────────────────────────────────────────────
   # Job 3: MSRV verification (Rust 1.89)
   # ─────────────────────────────────────────────
   test-msrv:

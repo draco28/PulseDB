@@ -242,6 +242,13 @@ fn backup_once(src: &Path, backup_path: &Path) -> Result<()> {
                 let _ = std::fs::remove_file(backup_path);
                 return Err(PulseDBError::Io(error));
             }
+            // VS-4.0.4 (#46) crash boundary: pre-txn, sidecar bytes are copied but
+            // NOT yet fsync-durable — the exact window #53c hardens. Compiled out
+            // unless the `fault-injection` feature is on.
+            #[cfg(feature = "fault-injection")]
+            crate::fault_injection::maybe_inject(
+                crate::fault_injection::Boundary::MidBackupPreFsync,
+            );
             // #53c: fsync the sidecar's own bytes before we consider it genuine —
             // a crash after the copy but before this flush would otherwise leave a
             // truncated backup the AlreadyExists branch preserves as valid.
@@ -578,6 +585,15 @@ impl RedbStorage {
                 // redb v2 -> v3 in place via the aliased redb 2.6; drop the 2.6
                 // handle (release its lock) before the redb-4.1 reopen.
                 upgrade_redb_v2_to_v3(path)?;
+
+                // VS-4.0.4 (#46) crash boundary: pre-txn, AFTER the destructive
+                // in-place redb v2→v3 upgrade but BEFORE the redb-4.1 reopen.
+                // Recovery relies on the `.pre-substrate.bak` claimed above.
+                // Compiled out unless the `fault-injection` feature is on.
+                #[cfg(feature = "fault-injection")]
+                crate::fault_injection::maybe_inject(
+                    crate::fault_injection::Boundary::PostRedbUpgrade,
+                );
 
                 // Reopen under redb 4.1 — now a v3 file, so `create` succeeds.
                 let db = Self::create_database(path, config)?;
@@ -1019,6 +1035,16 @@ impl RedbStorage {
                 // clean rollback. Raw, hand-encoded bytes (NEVER serde).
                 if needs_marker_write {
                     let marker = encode_substrate_marker(CURRENT_SUBSTRATE_FORMAT);
+                    // VS-4.0.4 (#46) crash boundary: write-txn, after the whole
+                    // re-encode succeeded but BEFORE the commit-point marker is
+                    // written. A crash here rolls the txn back → old marker + old-
+                    // codec data (clean rollback). `maybe_inject` takes no args, so
+                    // it never borrows `write_txn` (which `meta_table` holds mutably
+                    // here). Compiled out unless the `fault-injection` feature is on.
+                    #[cfg(feature = "fault-injection")]
+                    crate::fault_injection::maybe_inject(
+                        crate::fault_injection::Boundary::PreMarker,
+                    );
                     meta_table.insert(SUBSTRATE_FORMAT_KEY, marker.as_slice())?;
                     debug!(
                         marker = CURRENT_SUBSTRATE_FORMAT,
@@ -1593,6 +1619,12 @@ impl RedbStorage {
         // here. This is refactor-neutral: it observes, it does not alter, the pass.
         let mut visited_labels: Vec<&'static str> = Vec::with_capacity(SERDE_BLOB_TABLES.len());
 
+        // VS-4.0.4 (#46) crash boundary: write-txn, BEFORE any table is re-encoded.
+        // A crash here rolls the whole txn back (nothing re-encoded, marker
+        // unchanged). Compiled out unless the `fault-injection` feature is on.
+        #[cfg(feature = "fault-injection")]
+        crate::fault_injection::maybe_inject(crate::fault_injection::Boundary::PreReencode);
+
         // --- METADATA_TABLE["db_metadata"] only (per-key; mixed table) ---
         // instance_id / wal_sequence / substrate_format are RAW bytes — NEVER decode.
         visited_labels.push("db_metadata");
@@ -1692,6 +1724,15 @@ impl RedbStorage {
                 table.insert(&key, re.as_slice())?;
             }
         }
+
+        // VS-4.0.4 (#46) crash boundary: write-txn, PARTWAY through the registry
+        // re-encode loop — the EXPERIENCES pass just committed ≥1 row to the txn
+        // (uncommitted), the RELATIONS pass has not started. A crash here rolls the
+        // WHOLE txn back (no partial re-encode survives — atomicity, not resume).
+        // At this top-level point no table handle borrows `write_txn`. Compiled out
+        // unless the `fault-injection` feature is on.
+        #[cfg(feature = "fault-injection")]
+        crate::fault_injection::maybe_inject(crate::fault_injection::Boundary::MidReencode);
 
         // --- RELATIONS_TABLE: ExperienceRelation ---
         visited_labels.push("relation");

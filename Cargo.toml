@@ -21,6 +21,9 @@ builtin-embeddings = ["ort", "tokenizers", "ndarray", "dirs", "ureq"]
 sync = ["tokio/time", "tokio/sync", "tokio/macros"]
 sync-http = ["sync", "reqwest"]
 sync-websocket = ["sync", "tokio-tungstenite"]
+# VS-4.0.4 (#46): compiled-out migration crash-injection seam. OFF by default;
+# enabled only for the `storage_migration_fault_injection` crash-recovery test.
+fault-injection = ["dep:libc"]
 
 [dependencies]
 # Storage - redb is a pure Rust embedded KV store with ACID transactions
@@ -53,6 +56,10 @@ thiserror = "1.0"
 
 # Observability - tracing provides structured logging with spans
 tracing = "0.1"
+
+# Optional: only for the `fault-injection` feature's subprocess SIGKILL crash
+# test (`libc::raise(SIGKILL)`). Never pulled in default/release builds.
+libc = { version = "0.2", optional = true }
 
 # Vector index - HNSW approximate nearest neighbor search (pure Rust, ADR-005)
 hnsw_rs = "0.3"
