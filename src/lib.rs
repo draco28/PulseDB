@@ -127,6 +127,15 @@ pub mod sync;
 /// Vector index module for HNSW-based approximate nearest neighbor search.
 pub mod vector;
 
+/// Test-only migration fault-injection seam (VS-4.0.4 / #46).
+///
+/// Compiled ONLY under `--features fault-injection`; never present in default or
+/// release builds. Lets crash-recovery tests arm a simulated crash at a specific
+/// on-open migration boundary. Changes no migration behavior.
+#[cfg(feature = "fault-injection")]
+#[cfg_attr(docsrs, doc(cfg(feature = "fault-injection")))]
+pub mod fault_injection;
+
 // ============================================================================
 // Public API re-exports
 // ============================================================================
