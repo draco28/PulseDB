@@ -215,6 +215,18 @@ fn pre_substrate_backup_path(path: &Path) -> PathBuf {
 /// removed so a later open does not treat it as a valid sidecar.
 ///
 /// Idempotent: a second call against an already-claimed path is a no-op `Ok(())`.
+///
+/// #53c — durability. The sidecar is the rollback point 4.05's kill-at-boundary
+/// crash tests trust, so it must survive a crash of the migrating process AFTER
+/// the copy but BEFORE the OS flushes its page cache. Without an explicit
+/// `sync_all()`, such a crash leaves a truncated/empty sidecar that the
+/// `AlreadyExists` preserve branch below would later treat as genuine (never
+/// re-copying it), silently discarding the pristine pre-migration bytes. So the
+/// copy is followed by `sync_all()` on the sidecar file AND an `fsync` of the
+/// parent directory (which durably records the new directory entry) before
+/// returning `Ok(())`. The directory fsync is best-effort — on the rare
+/// filesystem/OS where opening a directory for `sync_all` is unsupported, the
+/// file `sync_all` still guarantees the sidecar's own bytes are durable.
 fn backup_once(src: &Path, backup_path: &Path) -> Result<()> {
     match std::fs::OpenOptions::new()
         .write(true)
@@ -229,6 +241,24 @@ fn backup_once(src: &Path, backup_path: &Path) -> Result<()> {
                 drop(backup_file);
                 let _ = std::fs::remove_file(backup_path);
                 return Err(PulseDBError::Io(error));
+            }
+            // #53c: fsync the sidecar's own bytes before we consider it genuine —
+            // a crash after the copy but before this flush would otherwise leave a
+            // truncated backup the AlreadyExists branch preserves as valid.
+            if let Err(error) = backup_file.sync_all() {
+                drop(backup_file);
+                let _ = std::fs::remove_file(backup_path);
+                return Err(PulseDBError::Io(error));
+            }
+            drop(backup_file);
+            // #53c: fsync the parent directory so the new sidecar's directory entry
+            // is itself durable (a crash could otherwise lose the entry even though
+            // the file bytes were flushed). Best-effort: unsupported dir-fsync is
+            // not fatal — the sidecar bytes are already durable above.
+            if let Some(parent) = backup_path.parent() {
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
             }
             Ok(())
         }
@@ -515,6 +545,29 @@ impl RedbStorage {
                         // Still v2 — we own the migration.
                     }
                     Err(other) => return Err(other),
+                }
+
+                // #53a — PREFLIGHT BEFORE DESTRUCTION. Run the headroom preflight
+                // INSIDE the migration lock, AFTER the post-lock re-check, and
+                // IMMEDIATELY BEFORE `backup_once` + the destructive
+                // `upgrade_redb_v2_to_v3`. So a too-large redb-v2 store fails closed
+                // with ZERO file mutation and NO `.pre-substrate.bak` written; the
+                // lock still serializes concurrent migrators; and a peer that
+                // already upgraded is let through by the re-check above (not
+                // fail-closed here). The FR-035 read-only carve-out already ran
+                // above the arm (a read-only too-large open returned `ReadOnly`, not
+                // `SubstrateMigrationTooLarge`), so this arm is writable-only.
+                //
+                // The store is still redb-v2 here (not openable under redb 4.1), so
+                // the copy-through split is unmeasurable — pass `copy_through_bytes =
+                // 0`, the conservative over-estimate (whole store treated as
+                // re-encodable → biased fail-closed = the safe side). The
+                // copy_through_excluded refinement (#54) that lets embedding-heavy
+                // stores open runs later in `open_existing`, once the file is v3.
+                {
+                    let store_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                    let available = fs2::available_space(path).unwrap_or(u64::MAX);
+                    Self::resolve_migration_headroom(store_size, 0, available, config)?;
                 }
 
                 // Back up the pristine {redb-v2, bincode} file (the rollback point)
@@ -833,6 +886,20 @@ impl RedbStorage {
                 )));
             }
             SubstrateFormat::Absent | SubstrateFormat::Older(_) => {
+                // #53b — marker-1 `{redb-v3, bincode}` (and Absent bincode-era) codec
+                // leg: NO `.pre-substrate.bak` is taken here, and that is CORRECT by
+                // design, not an omission. A `SubstrateFormat::Older(1)` store is
+                // already redb-v3, so it SKIPPED the redb-v2 `SubstrateUpgradeRequired`
+                // arm of `create_or_migrate` entirely and took no substrate backup.
+                // The bincode→postcard re-encode below is a SINGLE redb write txn
+                // whose marker bump to CURRENT (= 2) is the atomic commit point (see
+                // "MARKER = COMMIT POINT" further down): redb's MVCC ABORTS the whole
+                // txn — leaving NO partial visible state — if the process dies
+                // mid-re-encode, so the pristine pre-codec bytes remain the on-disk
+                // state and are fully recoverable on the next open. A sidecar backup
+                // here would add NO crash-recovery value redb's own single-atomic-txn
+                // MVCC does not already provide — only a dead-weight fsync/cleanup
+                // burden. Hence: DOCUMENT the no-backup posture, do NOT add a backup.
                 if config.read_only {
                     return Err(PulseDBError::ReadOnly);
                 }
@@ -847,14 +914,28 @@ impl RedbStorage {
         // typed `SubstrateMigrationTooLarge` and ZERO destructive writes (design
         // §6.3 / §6.4(3)). The common path (store below the conservative floor, or
         // a declared memory budget) is the realized single-txn primary path.
+        //
+        // #53a/#54: this preflight is idempotent + cheap and is NOT a double-fault
+        // surface — a redb-v2 store already ran the conservative (copy_through = 0)
+        // preflight in `create_or_migrate`'s redb-v2 arm before any mutation; by the
+        // time it reaches here it is redb-v3 and re-evaluates with the MEASURED
+        // copy-through set. A `{redb-v3, bincode}` marker-1/Absent store (which never
+        // took the redb-v2 arm) is preflighted for the first time HERE, with the
+        // copy_through_excluded footprint — so an embedding-heavy store whose
+        // store_size is dominated by copy-through bytes now OPENS instead of wrongly
+        // failing closed.
         if needs_marker_write && !config.read_only {
             let store_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            // #54a: measure the FULL §2a copy-through set (embeddings + 5 multimaps +
+            // raw metadata keys) of the now-redb-v3 store so the memory axis keys on
+            // the copy_through_excluded re-encodable footprint, not raw store_size.
+            let copy_through = Self::copy_through_bytes(&db).unwrap_or(0);
             // Unified headroom preflight (work-1.05 / audit C3): disk THEN memory,
             // BEFORE any destructive write. If free space can't be determined, don't
             // block on the disk axis (u64::MAX) — the memory axis + backup_once still
             // guard; the disk check is a best-effort early failure for the common case.
             let available = fs2::available_space(&path).unwrap_or(u64::MAX);
-            Self::resolve_migration_headroom(store_size, available, config)?;
+            Self::resolve_migration_headroom(store_size, copy_through, available, config)?;
             // Progress signal (work-1.05 / C3): the first-open migration is exempt
             // from NFR-001 (<100ms); make the multi-minute pass non-silent. Per-phase
             // `info!` lines (reshape / re-encode, below) report progress thereafter.
@@ -1171,56 +1252,232 @@ impl RedbStorage {
     /// budget (config-first) or fail closed (design §6.3 / audit C1).
     const SINGLE_TXN_STORE_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
 
-    /// 1.02 conservative peak-RSS coefficient: `peak ≈ store_size × 0.10`.
+    /// The effective single-txn store-size floor. In production this is exactly
+    /// [`Self::SINGLE_TXN_STORE_FLOOR_BYTES`] (1 GiB). Under `cfg(test)` ONLY, an
+    /// optional thread-local override lets the integration tests drive the
+    /// fail-closed-before-mutation boundary with a small physical fixture instead of
+    /// a real >1 GiB file (there is no other injection seam at the open path). The
+    /// override changes NOTHING in a non-test build — the function inlines to the
+    /// const — so the hardened boundary's production behavior is unaffected.
+    #[inline]
+    fn single_txn_floor_bytes() -> u64 {
+        #[cfg(test)]
+        {
+            if let Some(v) = tests::TEST_FLOOR_OVERRIDE.with(|c| c.get()) {
+                return v;
+            }
+        }
+        Self::SINGLE_TXN_STORE_FLOOR_BYTES
+    }
+
+    /// 1.02 conservative peak-RSS coefficient: `peak ≈ re_encodable_footprint × 0.10`.
     /// (Measured 0.06–0.10 flat across 10k→500k; 0.10 is the conservative envelope.)
-    const PEAK_RSS_NUMERATOR: u64 = 10; // peak ≈ store_size * 10 / 100
+    ///
+    /// #54: the coefficient is now applied to the **re-encodable footprint**
+    /// ([`Self::re_encodable_footprint`]), NOT the raw `store_size` — the §2a
+    /// copy-through set (embeddings + the 5 multimap indexes + the raw metadata
+    /// keys) is byte-identical passthrough and never buffered, so it does not
+    /// contribute to the re-encode peak.
+    const PEAK_RSS_NUMERATOR: u64 = 10; // peak ≈ footprint * 10 / 100
     const PEAK_RSS_DENOMINATOR: u64 = 100;
+
+    /// #54b — DISTINCTLY-NAMED peak safety margin (NOT the bare `SAFETY_MARGIN`
+    /// string, which already denotes the declared-budget margin at
+    /// `DECLARED_MEM_SAFETY_*`). Applied to the coefficient result to INFLATE the
+    /// projected peak, biasing it toward OVER-estimating (fail-closed = safe) and
+    /// never under-estimating (OOM = unsafe). `3 / 2` = 1.5× accounts for:
+    ///   - redb page/leaf overhead + table fragmentation,
+    ///   - old + new value coexistence within the single write txn (both the
+    ///     legacy-decoded and postcard-re-encoded copies of a blob are live
+    ///     simultaneously before the old row is overwritten),
+    ///   - allocation amplification (Vec growth / serializer scratch).
+    ///
+    /// The inflation is saturating and rounds UP: when the footprint or overhead
+    /// is uncertain, the projected peak is biased high so a genuinely too-large
+    /// re-encode still fails closed rather than being allowed to OOM.
+    const PEAK_SAFETY_MARGIN_NUMERATOR: u64 = 3;
+    const PEAK_SAFETY_MARGIN_DENOMINATOR: u64 = 2;
 
     /// Safety margin applied to a *declared* available-memory budget before it is
     /// allowed to authorize a single-txn migration of an above-floor store.
     const DECLARED_MEM_SAFETY_NUMERATOR: u64 = 1; // projected_peak < declared * (1/2)
     const DECLARED_MEM_SAFETY_DENOMINATOR: u64 = 2;
 
+    /// #54a — the RE-ENCODABLE footprint: the bytes the codec pass actually
+    /// decodes + re-encodes, which is `store_size` minus the FULL §2a copy-through
+    /// set (`copy_through_bytes` = EMBEDDINGS raw LE f32 + the 5 multimap index
+    /// tables + the raw `METADATA_TABLE` keys). The copy-through set is
+    /// byte-identical passthrough (never decoded/re-encoded), so it is excluded
+    /// from the re-encode peak. Excluding embeddings ALONE would still over-project
+    /// a heavily-indexed store and could wrongly fail it closed — the exclusion
+    /// set is the whole copy-through matrix, not embeddings alone. Saturating:
+    /// a `copy_through_bytes` over-estimate (should never exceed `store_size`)
+    /// floors the footprint at 0 rather than underflowing.
+    fn re_encodable_footprint(store_size: u64, copy_through_bytes: u64) -> u64 {
+        // copy_through_excluded: subtract the full copy-through matrix, saturating.
+        store_size.saturating_sub(copy_through_bytes)
+    }
+
+    /// #54a — measures the on-disk byte size of the FULL §2a copy-through set of a
+    /// live (redb-v3) store: the EMBEDDINGS table (raw LE f32) + the 5 multimap
+    /// index tables + the raw `METADATA_TABLE` keys (`instance_id` / `wal_sequence`
+    /// / `substrate_format`). These bytes are byte-identical passthrough — never
+    /// decoded or re-encoded by the codec pass — so they are excluded from the
+    /// re-encode peak (`copy_through_excluded`). The measure sums key+value lengths
+    /// via a read txn; it is a logical-byte lower bound on the physical copy-through
+    /// footprint, which biases the resulting `re_encodable_footprint` slightly HIGH
+    /// (over-estimate → fail-closed = safe). Only callable once the file is redb-v3
+    /// (post redb-format upgrade); the redb-v2 arm of `create_or_migrate` cannot
+    /// open tables under redb 4.1 and conservatively passes `copy_through_bytes = 0`.
+    fn copy_through_bytes(db: &Database) -> Result<u64> {
+        // `iter()` on a multimap lives on ReadableMultimapTable (not the plain
+        // ReadableTable imported at module scope) — bring it in locally.
+        use ::redb::ReadableMultimapTable;
+        let read_txn = db.begin_read().map_err(StorageError::from)?;
+        let mut total: u64 = 0;
+
+        // EMBEDDINGS: raw LE f32, the size-dominant copy-through table.
+        if let Ok(table) = read_txn.open_table(EMBEDDINGS_TABLE) {
+            for entry in table.iter().map_err(StorageError::from)? {
+                let (k, v) = entry.map_err(StorageError::from)?;
+                total = total
+                    .saturating_add(k.value().len() as u64)
+                    .saturating_add(v.value().len() as u64);
+            }
+        }
+
+        // The 5 multimap index tables — raw id references, copy-through.
+        macro_rules! sum_multimap {
+            ($tbl:expr) => {
+                if let Ok(mm) = read_txn.open_multimap_table($tbl) {
+                    for group in mm.iter().map_err(StorageError::from)? {
+                        let (k, values) = group.map_err(StorageError::from)?;
+                        total = total.saturating_add(k.value().len() as u64);
+                        for v in values {
+                            let v = v.map_err(StorageError::from)?;
+                            total = total.saturating_add(v.value().len() as u64);
+                        }
+                    }
+                }
+            };
+        }
+        sum_multimap!(EXPERIENCES_BY_COLLECTIVE_TABLE);
+        sum_multimap!(EXPERIENCES_BY_TYPE_TABLE);
+        sum_multimap!(RELATIONS_BY_SOURCE_TABLE);
+        sum_multimap!(RELATIONS_BY_TARGET_TABLE);
+        sum_multimap!(INSIGHTS_BY_COLLECTIVE_TABLE);
+
+        // Raw METADATA_TABLE keys (instance_id / wal_sequence / substrate_format) —
+        // NEVER decoded (the "db_metadata" serde blob is re-encodable and excluded).
+        if let Ok(meta) = read_txn.open_table(METADATA_TABLE) {
+            for raw_key in [INSTANCE_ID_KEY, WAL_SEQUENCE_KEY, SUBSTRATE_FORMAT_KEY] {
+                if let Some(v) = meta.get(raw_key).map_err(StorageError::from)? {
+                    total = total
+                        .saturating_add(raw_key.len() as u64)
+                        .saturating_add(v.value().len() as u64);
+                }
+            }
+        }
+
+        Ok(total)
+    }
+
     /// The realized shape of the codec re-encode pass.
     ///
-    /// 1.05 (the headroom preflight) can call [`Self::resolve_codec_txn_shape`] to
-    /// learn this + the `projected_peak` without re-deriving the rule.
-    fn projected_peak_rss(store_size: u64) -> u64 {
-        store_size
+    /// #54: the projected peak is derived from the copy_through_excluded
+    /// re-encodable footprint (not raw `store_size`), then INFLATED by the
+    /// `PEAK_SAFETY_MARGIN_*` constant so it is biased to over-estimate. 1.05 (the
+    /// headroom preflight) can call [`Self::resolve_codec_txn_shape`] to learn this
+    /// + the `projected_peak` without re-deriving the rule.
+    fn projected_peak_rss(re_encodable_footprint: u64) -> u64 {
+        // copy_through_excluded footprint × coefficient, then × safety margin —
+        // saturating and rounding UP (bias to fail-closed, never OOM).
+        re_encodable_footprint
             .saturating_mul(Self::PEAK_RSS_NUMERATOR)
             / Self::PEAK_RSS_DENOMINATOR
+    }
+
+    /// #54b — the peak with the safety margin applied: `projected_peak_rss × 1.5`,
+    /// saturating. This is the value the floor decision compares against a declared
+    /// budget. Rounds UP (over-estimate → fail-closed is the safe error).
+    fn projected_peak_with_margin(re_encodable_footprint: u64) -> u64 {
+        Self::projected_peak_rss(re_encodable_footprint)
+            .saturating_mul(Self::PEAK_SAFETY_MARGIN_NUMERATOR)
+            .saturating_add(Self::PEAK_SAFETY_MARGIN_DENOMINATOR - 1) // round up
+            / Self::PEAK_SAFETY_MARGIN_DENOMINATOR
     }
 
     /// Config-first transaction-shape decision for the codec re-encode pass
     /// (design §6.3 — the baked-in 1.02 deliverable).
     ///
+    /// #54: the memory decision is keyed on the copy_through_excluded, safety-
+    /// margined projected peak (derived from [`Self::re_encodable_footprint`]),
+    /// NOT raw `store_size`. `copy_through_bytes` is the byte size of the FULL §2a
+    /// copy-through set (EMBEDDINGS + the 5 multimap indexes + the raw metadata
+    /// keys). An embedding-heavy store whose `store_size` is dominated by that
+    /// copy-through set has a small re-encodable footprint → small projected peak
+    /// → now OPENS instead of wrongly failing closed. Conversely a re-encodable-
+    /// dominated store (near-zero copy-through) keeps a footprint ≈ `store_size`,
+    /// so the margined peak stays conservative and a genuinely too-large re-encode
+    /// still fails closed rather than being allowed to OOM.
+    ///
     /// Returns `Ok(())` if a **single transaction** is safe (the realized primary
-    /// path — `store_size <= FLOOR`, or a declared memory budget covers the
-    /// projected peak with margin). Returns `Err(SubstrateMigrationTooLarge)` —
-    /// the **fail-closed-above-floor valve** (work-1.04 §6.4(3)) — if the store is
-    /// above the floor and no declared budget authorizes it: a typed, actionable
-    /// error with **zero destructive writes** (1.05's preflight surfaces the same;
-    /// the offline `pulsedb migrate` tool, VS-4.0.4, is the large-store escape).
+    /// path — `store_size <= FLOOR`, or the margined projected peak fits the
+    /// floor-implied peak budget, or a declared memory budget covers it). Returns
+    /// `Err(SubstrateMigrationTooLarge)` — the **fail-closed valve** (work-1.04
+    /// §6.4(3)) — otherwise: a typed, actionable error with **zero destructive
+    /// writes** (1.05's preflight surfaces the same; the offline `pulsedb migrate`
+    /// tool is the large-store escape).
     ///
     /// **Config-first, NOT host-memory auto-detect** (a cgroup-limited container
     /// over-reports host RAM → would wrongly pick single-txn → OOM). The embedder
     /// *declares* `migration_available_memory_bytes` to opt into a higher ceiling.
-    fn resolve_codec_txn_shape(store_size: u64, config: &Config) -> Result<()> {
-        let projected_peak = Self::projected_peak_rss(store_size);
+    fn resolve_codec_txn_shape(store_size: u64, copy_through_bytes: u64, config: &Config) -> Result<()> {
+        // copy_through_excluded footprint → margined projected peak (bias to
+        // over-estimate; fail-closed is the safe error, OOM is not).
+        let footprint = Self::re_encodable_footprint(store_size, copy_through_bytes);
+        let projected_peak = Self::projected_peak_with_margin(footprint);
 
-        // Common path: below the conservative absolute floor → single-txn is safe.
-        if store_size <= Self::SINGLE_TXN_STORE_FLOOR_BYTES {
+        // The effective floor (const in production; a small test-only override lets
+        // the integration tests drive the boundary without a real >1 GiB file).
+        let floor = Self::single_txn_floor_bytes();
+
+        // The floor-implied peak budget: the margined peak a floor-sized re-encode
+        // would project. A store whose margined peak fits under this budget is
+        // single-txn-safe regardless of raw store_size — this is what lets an
+        // embedding-heavy (copy-through-dominated) store OPEN.
+        let floor_peak_budget = Self::projected_peak_with_margin(floor);
+
+        // Common path: below the conservative absolute store-size floor → single-txn.
+        if store_size <= floor {
             debug!(
                 store_size,
+                footprint,
                 projected_peak,
-                floor = Self::SINGLE_TXN_STORE_FLOOR_BYTES,
+                floor,
                 "codec migration: single-txn (store below the conservative floor)"
             );
             return Ok(());
         }
 
-        // Above the floor: only a *declared* budget (config-first) can authorize a
-        // single-txn migration. projected_peak < declared * SAFETY_MARGIN.
+        // #54a: above the raw floor, but the copy_through_excluded margined peak
+        // still fits the floor-implied peak budget → single-txn-safe. This is the
+        // embedding-heavy carve-in: the re-encode buffers only the footprint, not
+        // the (dominant) copy-through bytes.
+        if projected_peak <= floor_peak_budget {
+            debug!(
+                store_size,
+                footprint,
+                projected_peak,
+                floor_peak_budget,
+                "codec migration: single-txn (copy-through-excluded peak fits floor budget)"
+            );
+            return Ok(());
+        }
+
+        // Above the floor with a re-encodable footprint too large for the floor
+        // budget: only a *declared* budget (config-first) can authorize single-txn.
+        // projected_peak < declared * SAFETY_MARGIN.
         if let Some(declared) = config.migration_available_memory_bytes {
             let allowed = declared
                 .saturating_mul(Self::DECLARED_MEM_SAFETY_NUMERATOR)
@@ -1228,6 +1485,7 @@ impl RedbStorage {
             if projected_peak < allowed {
                 debug!(
                     store_size,
+                    footprint,
                     projected_peak,
                     declared,
                     "codec migration: single-txn (declared memory budget covers projected peak)"
@@ -1236,13 +1494,14 @@ impl RedbStorage {
             }
         }
 
-        // Fail closed above the floor with a typed, actionable error and ZERO
-        // destructive writes (work-1.04 §6.4(3) scope-relief valve; a correct
-        // phased durable-resume path is deferred — VS-4.0.4 / #46).
+        // Fail closed with a typed, actionable error and ZERO destructive writes
+        // (work-1.04 §6.4(3) scope-relief valve; a correct phased durable-resume
+        // path is deferred — VS-4.0.4 / #46).
         warn!(
             store_size,
+            footprint,
             projected_peak,
-            floor = Self::SINGLE_TXN_STORE_FLOOR_BYTES,
+            floor,
             declared = ?config.migration_available_memory_bytes,
             "codec migration: store above single-txn floor with no covering memory budget; \
              failing closed (no destructive write)"
@@ -1250,7 +1509,7 @@ impl RedbStorage {
         Err(PulseDBError::Storage(StorageError::substrate_migration_too_large(
             store_size,
             projected_peak,
-            Self::SINGLE_TXN_STORE_FLOOR_BYTES,
+            floor,
         )))
     }
 
@@ -1280,8 +1539,20 @@ impl RedbStorage {
     /// passes `fs2::available_space(path)`. The memory axis reuses
     /// [`Self::resolve_codec_txn_shape`] (1.02 coefficient + config-first floor /
     /// declared-memory opt-in — never raw host auto-detect).
-    fn resolve_migration_headroom(store_size: u64, available: u64, config: &Config) -> Result<()> {
+    ///
+    /// #54c: the DISK axis stays keyed on full `store_size` — the backup + migrated
+    /// file both hold the full store (embeddings don't shrink), so disk footprint is
+    /// ~2× store_size regardless of what is re-encoded. Only the MEMORY axis uses the
+    /// copy_through_excluded footprint (via `copy_through_bytes`).
+    fn resolve_migration_headroom(
+        store_size: u64,
+        copy_through_bytes: u64,
+        available: u64,
+        config: &Config,
+    ) -> Result<()> {
         // Disk axis first (cheaper guard against a half-migration that exhausts disk).
+        // Keyed on FULL store_size — the copy-through set stays on disk in both the
+        // backup and the migrated file (embeddings don't shrink).
         let required = Self::required_migration_disk_bytes(store_size);
         if available < required {
             warn!(
@@ -1294,8 +1565,9 @@ impl RedbStorage {
                 StorageError::substrate_migration_insufficient_disk(store_size, required, available),
             ));
         }
-        // Memory axis: reuse 1.04's config-first single-txn-vs-fail-closed decision.
-        Self::resolve_codec_txn_shape(store_size, config)
+        // Memory axis: reuse 1.04's config-first single-txn-vs-fail-closed decision,
+        // keyed on the copy_through_excluded re-encodable footprint.
+        Self::resolve_codec_txn_shape(store_size, copy_through_bytes, config)
     }
 
     /// Re-encodes every serde-blob table from legacy bincode to postcard, in the
@@ -3021,6 +3293,32 @@ mod tests {
         COLLECTIVE_GOLDEN, EXPERIENCE_GOLDEN, EXPERIENCE_V2_GOLDEN, INSIGHT_GOLDEN, RELATION_GOLDEN,
         WATCH_EVENT_GOLDEN,
     };
+    use std::cell::Cell;
+
+    thread_local! {
+        /// #53a/#54 test seam: an optional override for the single-txn store-size
+        /// floor, consulted ONLY by [`super::RedbStorage::single_txn_floor_bytes`]
+        /// under `cfg(test)`. Lets an integration test drive the
+        /// fail-closed-before-mutation boundary with a small physical fixture (no
+        /// real >1 GiB file). `None` ⇒ the production 1 GiB const. A guard restores
+        /// `None` on drop so tests don't leak the override across the shared runner.
+        pub(super) static TEST_FLOOR_OVERRIDE: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    /// RAII guard: sets the test floor override for its lifetime, restoring the
+    /// prior value on drop (so a panicking test can't poison sibling tests).
+    struct FloorOverrideGuard(Option<u64>);
+    impl FloorOverrideGuard {
+        fn set(floor: u64) -> Self {
+            let prev = TEST_FLOOR_OVERRIDE.with(|c| c.replace(Some(floor)));
+            FloorOverrideGuard(prev)
+        }
+    }
+    impl Drop for FloorOverrideGuard {
+        fn drop(&mut self) {
+            TEST_FLOOR_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
 
     // ====================================================================
     // Frozen oracle byte constants for 1.04 (audit C2)
@@ -5675,9 +5973,11 @@ mod tests {
         // The common path: a store below the 1 GiB conservative floor always takes
         // the single-txn path regardless of declared memory.
         let cfg = default_config();
-        assert!(RedbStorage::resolve_codec_txn_shape(10 * 1024 * 1024, &cfg).is_ok());
+        // copy_through = 0 (re-encodable-dominated) — the strictest case for the floor.
+        assert!(RedbStorage::resolve_codec_txn_shape(10 * 1024 * 1024, 0, &cfg).is_ok());
         assert!(RedbStorage::resolve_codec_txn_shape(
             RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES,
+            0,
             &cfg
         )
         .is_ok());
@@ -5689,7 +5989,9 @@ mod tests {
         // typed SubstrateMigrationTooLarge — zero destructive writes (§6.4(3)).
         let cfg = default_config();
         let store_size = 4 * RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES; // 4 GiB
-        let err = RedbStorage::resolve_codec_txn_shape(store_size, &cfg).unwrap_err();
+        // copy_through = 0 → footprint == store_size (re-encodable-dominated, the
+        // strictest / most-conservative peak for this store size).
+        let err = RedbStorage::resolve_codec_txn_shape(store_size, 0, &cfg).unwrap_err();
         match err {
             PulseDBError::Storage(StorageError::SubstrateMigrationTooLarge {
                 store_size: s,
@@ -5697,8 +5999,16 @@ mod tests {
                 budget,
             }) => {
                 assert_eq!(s, store_size);
-                // projected_peak ≈ 0.10 × store_size.
-                assert_eq!(projected_peak, store_size / 10);
+                // #54b: projected_peak is now the copy_through_excluded footprint ×
+                // coefficient × PEAK_SAFETY_MARGIN (1.5). With copy_through = 0 the
+                // footprint is the whole store, so peak == margined(store_size).
+                assert_eq!(
+                    projected_peak,
+                    RedbStorage::projected_peak_with_margin(store_size)
+                );
+                // Margined peak strictly exceeds the bare coefficient peak (bias to
+                // over-estimate → fail-closed).
+                assert!(projected_peak > store_size / 10);
                 assert_eq!(budget, RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES);
             }
             other => panic!("expected SubstrateMigrationTooLarge, got: {other}"),
@@ -5710,13 +6020,15 @@ mod tests {
         // Config-first opt-in: a declared budget covering the projected peak (with
         // the 0.5 safety margin) authorizes single-txn for an above-floor store.
         let store_size = 4 * RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES; // 4 GiB
-        let projected_peak = store_size / 10; // ~400 MiB
+        // #54b: the peak the memory axis compares is now the margined footprint peak
+        // (copy_through = 0 → footprint == store_size).
+        let projected_peak = RedbStorage::projected_peak_with_margin(store_size);
 
-        // Budget over 2× projected_peak clears the margin (peak < budget/2).
+        // Budget over 2× projected_peak clears the declared-mem margin (peak < budget/2).
         let mut cfg = default_config();
         cfg.migration_available_memory_bytes = Some(projected_peak * 2 + 2);
         assert!(
-            RedbStorage::resolve_codec_txn_shape(store_size, &cfg).is_ok(),
+            RedbStorage::resolve_codec_txn_shape(store_size, 0, &cfg).is_ok(),
             "a declared budget covering 2× projected peak must allow single-txn"
         );
 
@@ -5724,7 +6036,7 @@ mod tests {
         let mut cfg_small = default_config();
         cfg_small.migration_available_memory_bytes = Some(projected_peak); // peak !< peak/2
         assert!(matches!(
-            RedbStorage::resolve_codec_txn_shape(store_size, &cfg_small),
+            RedbStorage::resolve_codec_txn_shape(store_size, 0, &cfg_small),
             Err(PulseDBError::Storage(StorageError::SubstrateMigrationTooLarge { .. }))
         ));
     }
@@ -5762,7 +6074,7 @@ mod tests {
         let required = RedbStorage::required_migration_disk_bytes(store_size);
         let available = required - 1; // one byte short
         let err =
-            RedbStorage::resolve_migration_headroom(store_size, available, &cfg).unwrap_err();
+            RedbStorage::resolve_migration_headroom(store_size, 0, available, &cfg).unwrap_err();
         match err {
             PulseDBError::Storage(StorageError::SubstrateMigrationInsufficientDisk {
                 store_size: s,
@@ -5785,7 +6097,7 @@ mod tests {
         let store_size = 100 * 1024 * 1024; // 100 MiB
         let available = RedbStorage::required_migration_disk_bytes(store_size); // exactly enough
         assert!(
-            RedbStorage::resolve_migration_headroom(store_size, available, &cfg).is_ok(),
+            RedbStorage::resolve_migration_headroom(store_size, 0, available, &cfg).is_ok(),
             "sufficient disk + below-floor store must pass the unified preflight"
         );
     }
@@ -5801,7 +6113,7 @@ mod tests {
         let required = RedbStorage::required_migration_disk_bytes(store_size);
         let available = required / 2; // insufficient disk
         let err =
-            RedbStorage::resolve_migration_headroom(store_size, available, &cfg).unwrap_err();
+            RedbStorage::resolve_migration_headroom(store_size, 0, available, &cfg).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -5821,8 +6133,10 @@ mod tests {
         let store_size = 4 * RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES; // 4 GiB, above floor
         // Plenty of disk: far more than required.
         let available = RedbStorage::required_migration_disk_bytes(store_size) * 2;
+        // copy_through = 0 → footprint == store_size → margined peak exceeds the floor
+        // budget → still fails on the memory axis (re-encodable-dominated worst case).
         let err =
-            RedbStorage::resolve_migration_headroom(store_size, available, &cfg).unwrap_err();
+            RedbStorage::resolve_migration_headroom(store_size, 0, available, &cfg).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -5837,14 +6151,245 @@ mod tests {
         // Both axes satisfied for an above-floor store: a declared memory budget
         // covering the projected peak AND sufficient disk → Ok.
         let store_size = 4 * RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES; // 4 GiB
-        let projected_peak = store_size / 10;
+        // #54b: budget must cover the MARGINED footprint peak (copy_through = 0).
+        let projected_peak = RedbStorage::projected_peak_with_margin(store_size);
         let mut cfg = default_config();
         cfg.migration_available_memory_bytes = Some(projected_peak * 2 + 2); // clears the margin
         let available = RedbStorage::required_migration_disk_bytes(store_size);
         assert!(
-            RedbStorage::resolve_migration_headroom(store_size, available, &cfg).is_ok(),
+            RedbStorage::resolve_migration_headroom(store_size, 0, available, &cfg).is_ok(),
             "declared memory + sufficient disk must pass the unified preflight above the floor"
         );
+    }
+
+    // ====================================================================
+    // #54 — copy-through-excluded, safety-margined projected-peak floor.
+    // TWO-SIDED: an embedding-heavy (copy-through-dominated) store must now OPEN,
+    // AND a serde-blob-heavy (re-encodable-dominated) store must stay conservatively
+    // sized (NOT under-projected into OOM). The margin biases every uncertain call
+    // toward over-estimating the peak — fail-closed is the safe error, OOM is not.
+    // ====================================================================
+
+    #[test]
+    fn test_re_encodable_footprint_excludes_full_copy_through_set() {
+        // #54a: the footprint is store_size MINUS the full §2a copy-through set
+        // (embeddings + 5 multimaps + raw metadata keys), saturating.
+        let store_size = 10 * 1024 * 1024;
+        let copy_through = 9 * 1024 * 1024; // copy-through dominates
+        assert_eq!(
+            RedbStorage::re_encodable_footprint(store_size, copy_through),
+            1024 * 1024,
+            "footprint must exclude the whole copy-through set"
+        );
+        // Saturating: copy_through > store_size floors at 0 (never underflows).
+        assert_eq!(
+            RedbStorage::re_encodable_footprint(store_size, store_size + 1),
+            0
+        );
+    }
+
+    #[test]
+    fn test_peak_safety_margin_biases_projected_peak_up() {
+        // #54b: the margined peak strictly exceeds the bare coefficient peak, so the
+        // formula over-estimates (fail-closed side) rather than under-estimating.
+        let footprint = 4 * RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES;
+        let bare = RedbStorage::projected_peak_rss(footprint);
+        let margined = RedbStorage::projected_peak_with_margin(footprint);
+        assert!(
+            margined > bare,
+            "PEAK_SAFETY_MARGIN must inflate the peak (margined {margined} > bare {bare})"
+        );
+        // 1.5×, rounding UP (bias to over-estimate → fail-closed is the safe side).
+        assert_eq!(margined, bare.saturating_mul(3).div_ceil(2));
+    }
+
+    #[test]
+    fn test_embedding_heavy_store_now_opens() {
+        // #54c lower-bound falsifier: a copy-through-DOMINATED store (its store_size
+        // is above the floor, but almost all of it is embeddings + indexes + raw
+        // metadata keys, i.e. copy-through) has a tiny re-encodable footprint → its
+        // margined peak fits the floor-implied budget → it now OPENS (single-txn OK),
+        // where keying the floor on raw store_size would have WRONGLY failed it closed.
+        let cfg = default_config(); // NO declared memory budget — must pass on its own
+        let store_size = 8 * RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES; // 8 GiB total
+        // 99.99% copy-through (embedding-heavy): footprint is a sliver.
+        let copy_through = store_size - (store_size / 10_000);
+
+        // Sanity: keying on raw store_size (copy_through = 0) WOULD fail closed —
+        // this is the bug the change fixes.
+        assert!(
+            RedbStorage::resolve_codec_txn_shape(store_size, 0, &cfg).is_err(),
+            "raw-store_size keying would wrongly fail this store closed (the bug)"
+        );
+        // With the copy-through-excluded footprint it OPENS.
+        assert!(
+            RedbStorage::resolve_codec_txn_shape(store_size, copy_through, &cfg).is_ok(),
+            "copy-through-dominated store must now open (copy_through_excluded peak fits the floor budget)"
+        );
+    }
+
+    #[test]
+    fn test_projected_peak_serde_blob_heavy_not_under_projected() {
+        // #54c UPPER-guard falsifier (the C5 no-under-projection guard): a
+        // re-encodable-DOMINATED store (near-zero copy-through — many small serde
+        // blobs, almost no embeddings/indexes) must be sized CONSERVATIVELY and NOT
+        // under-projected. Its projected peak must remain ≥ coefficient × footprint
+        // WITH the safety margin applied, so an above-budget re-encode still fails
+        // closed rather than being allowed to OOM.
+        let store_size = 4 * RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES; // 4 GiB
+        let copy_through = store_size / 1000; // near-zero copy-through
+        let footprint = RedbStorage::re_encodable_footprint(store_size, copy_through);
+
+        // The projected peak the decision uses must be the MARGINED peak (over the
+        // bare coefficient peak) — the formula does not under-count re-encode cost.
+        let margined = RedbStorage::projected_peak_with_margin(footprint);
+        assert!(
+            margined >= RedbStorage::projected_peak_rss(footprint),
+            "serde-blob-heavy peak must keep the safety margin (never under-projected)"
+        );
+        assert!(
+            margined > footprint / 10,
+            "margined peak must exceed the bare 0.10× footprint (conservative sizing)"
+        );
+
+        // And with no declared budget it STILL fails closed above the floor — it is
+        // NOT allowed to slip through into an OOM.
+        let cfg = default_config();
+        let err = RedbStorage::resolve_codec_txn_shape(store_size, copy_through, &cfg).unwrap_err();
+        match err {
+            PulseDBError::Storage(StorageError::SubstrateMigrationTooLarge {
+                projected_peak, ..
+            }) => {
+                assert_eq!(
+                    projected_peak, margined,
+                    "the surfaced peak must be the margined (conservative) peak"
+                );
+            }
+            other => panic!("re-encodable-dominated store must fail closed, got: {other}"),
+        }
+
+        // A too-small declared budget must NOT authorize it (no under-projection
+        // lets a genuinely memory-heavy re-encode proceed and OOM).
+        let mut cfg_small = default_config();
+        cfg_small.migration_available_memory_bytes = Some(margined); // peak !< peak/2
+        assert!(
+            RedbStorage::resolve_codec_txn_shape(store_size, copy_through, &cfg_small).is_err(),
+            "a budget below 2× the margined peak must still fail closed"
+        );
+    }
+
+    // ====================================================================
+    // #53a — preflight BEFORE destruction (fail-closed with ZERO mutation).
+    // The falsifier proves the rejected open leaves the store's whole-file bytes
+    // AND mtime pristine — not merely that an error returned (C10). Dep-free:
+    // std::fs whole-file byte read + mtime, no sha2/blake3.
+    // ====================================================================
+
+    #[test]
+    fn test_too_large_fails_closed_before_mutation_store_bytes_unchanged() {
+        // #53a + C10: a too-large redb-v2 store fails closed INSIDE the migration
+        // lock, AFTER the post-lock re-check, BEFORE backup_once — so NO
+        // `.pre-substrate.bak` is written AND the store file's whole-file bytes +
+        // mtime are byte-identical before vs after the rejected open.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("too_large_v2.db");
+        seed_redb_v2_store(&path, None);
+
+        // Drive the boundary with a tiny physical fixture: force the single-txn floor
+        // to 0 so ANY store is "above the floor" and (with no declared budget and
+        // copy_through = 0 in the redb-v2 arm) fails closed.
+        let _floor = FloorOverrideGuard::set(0);
+
+        // Snapshot whole-file bytes + mtime BEFORE the rejected open.
+        let bytes_before = std::fs::read(&path).unwrap();
+        let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let backup_path = pre_substrate_backup_path(&path);
+        assert!(!backup_path.exists(), "no backup before the open attempt");
+
+        // A writable open must fail closed with the typed too-large error.
+        let err = RedbStorage::open(&path, &default_config()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PulseDBError::Storage(StorageError::SubstrateMigrationTooLarge { .. })
+            ),
+            "too-large redb-v2 store must fail closed with SubstrateMigrationTooLarge, got: {err}"
+        );
+
+        // ZERO mutation: no backup sidecar was written...
+        assert!(
+            !backup_path.exists(),
+            "fail-closed must happen BEFORE backup_once — NO .pre-substrate.bak"
+        );
+        // ...and the store file's whole-file bytes + mtime are UNCHANGED (a stronger
+        // falsifier than a hash digest, and dep-free).
+        let bytes_after = std::fs::read(&path).unwrap();
+        let mtime_after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            bytes_before, bytes_after,
+            "rejected open must leave the store's whole-file bytes UNCHANGED (content_unchanged)"
+        );
+        assert_eq!(
+            mtime_before, mtime_after,
+            "rejected open must leave the store file's mtime UNCHANGED"
+        );
+
+        // The file is still genuinely redb-v2 (the destructive upgrade never ran).
+        let still_v2 = RedbStorage::create_database(&path, &default_config());
+        assert!(
+            matches!(
+                still_v2,
+                Err(PulseDBError::Storage(StorageError::SubstrateUpgradeRequired { .. }))
+            ),
+            "fail-closed open must NOT have upgraded the file"
+        );
+    }
+
+    #[test]
+    fn test_read_only_open_too_large_returns_readonly() {
+        // #53a carve-out (FR-035/C6): a READ-ONLY open of a too-large redb-v2 store
+        // returns ReadOnly, NOT SubstrateMigrationTooLarge — the read-only carve-out
+        // precedes the too-large preflight. (Name must not collide with the existing
+        // test_read_only_open_of_redb_v2_store_* tests.)
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("too_large_ro_v2.db");
+        seed_redb_v2_store(&path, None);
+
+        // Even with the floor forced to 0 (every store "too large"), read-only wins.
+        let _floor = FloorOverrideGuard::set(0);
+
+        let err = RedbStorage::open(&path, &Config::read_only()).unwrap_err();
+        assert!(
+            matches!(err, PulseDBError::ReadOnly),
+            "read-only open of a too-large redb-v2 store must return ReadOnly (carve-out precedes preflight), got: {err}"
+        );
+        assert!(
+            !pre_substrate_backup_path(&path).exists(),
+            "read-only refusal writes nothing (no backup)"
+        );
+    }
+
+    #[test]
+    fn test_backup_once_fsyncs_sidecar_and_content_unchanged() {
+        // #53c: backup_once durably copies the source to the sidecar (fsync'd) so the
+        // rollback point survives a crash; the sidecar is a byte-identical copy.
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("source.db");
+        let sidecar = dir.path().join("source.db.pre-substrate.bak");
+        let payload = vec![0xABu8; 64 * 1024];
+        std::fs::write(&src, &payload).unwrap();
+
+        backup_once(&src, &sidecar).expect("backup_once succeeds and fsyncs");
+        assert!(sidecar.exists(), "sidecar must exist after backup_once");
+        assert_eq!(
+            std::fs::read(&sidecar).unwrap(),
+            payload,
+            "the fsync'd sidecar must be a byte-identical copy of the source"
+        );
+
+        // Idempotent: a second call preserves the genuine sidecar (AlreadyExists).
+        backup_once(&src, &sidecar).expect("second backup_once is a no-op Ok");
+        assert_eq!(std::fs::read(&sidecar).unwrap(), payload);
     }
 
     // ====================================================================
@@ -5953,32 +6498,11 @@ mod tests {
             }
         }
 
-        fn sample_relation() -> ExperienceRelation {
-            ExperienceRelation {
-                id: RelationId::from_bytes([0x55; 16]),
-                source_id: ExperienceId::from_bytes([0x21; 16]),
-                target_id: ExperienceId::from_bytes([0x22; 16]),
-                relation_type: RelationType::Supports,
-                strength: 0.75,
-                metadata: Some("{\"note\":\"disjoint\"}".into()),
-                created_at: Timestamp::from_millis(1_700_000_000_000),
-            }
-        }
-
-        fn sample_insight() -> DerivedInsight {
-            DerivedInsight {
-                id: InsightId::from_bytes([0x66; 16]),
-                collective_id: CollectiveId::from_bytes([0x11; 16]),
-                content: "disjoint insight".into(),
-                embedding: vec![0.1, 0.2, 0.3],
-                source_experience_ids: vec![ExperienceId::from_bytes([0x21; 16])],
-                insight_type: InsightType::Pattern,
-                confidence: 0.9,
-                domain: vec!["rust".into()],
-                created_at: Timestamp::from_millis(1_700_000_000_000),
-                updated_at: Timestamp::from_millis(1_700_000_000_500),
-            }
-        }
+        // (4.04 sanctioned cleanup: the previously-present `sample_relation()` and
+        // `sample_insight()` test helpers were UNUSED under --all-features — both
+        // emitted `never used` warnings and neither was referenced — so they are
+        // removed here. The 5 golden-bearing shapes anchor via the `*_GOLDEN` bytes;
+        // relation/insight disjointness is covered by the golden-anchored path.)
 
         /// The core disjointness predicate: `legacy_bincode::decode::<T>` MUST
         /// REJECT (return `Err`) the postcard encoding of `value`. A `true`
