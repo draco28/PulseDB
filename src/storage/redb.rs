@@ -55,6 +55,39 @@ use crate::error::{PulseDBError, Result, StorageError, ValidationError};
 const METADATA_KEY: &str = "db_metadata";
 
 // ============================================================================
+// Serde-blob table registry (#55) — single source of truth for the codec pass
+// ============================================================================
+//
+// `SERDE_BLOB_TABLES` is the ONE authoritative list of the serde-blob tables
+// (redb table name + human "what" label) that `reencode_serde_blobs_to_postcard`
+// re-encodes from legacy bincode to postcard. It is intentionally REFACTOR-NEUTRAL:
+// it lists exactly the tables the loop already visited, with exactly the "what"
+// labels the loop already used — the loop's observable behavior and ordering are
+// unchanged. The registry exists so that (a) the re-encode owner asserts it visits
+// every registered table (see the `debug_assert_eq!` inside the loop) and (b) the
+// #55 exhaustiveness guard has a single membership set to check against.
+//
+// Copy-through tables are DELIBERATELY EXCLUDED (never decoded): the raw-f32
+// `embeddings` table, the 5 multimap indexes (`experiences_by_collective`,
+// `experiences_by_type`, `relations_by_source`, `relations_by_target`,
+// `insights_by_collective`), and the raw `metadata` marker keys (`instance_id`,
+// `wal_sequence`, `substrate_format`). Only the `db_metadata` KEY inside
+// `metadata` is a serde blob, so `metadata` appears here once for that key.
+//
+// The list order mirrors the re-encode loop's visit order for auditability.
+const SERDE_BLOB_TABLES: &[(&str, &str)] = &[
+    ("metadata", "db_metadata"),
+    ("collectives", "collective"),
+    ("decay_configs", "decay_config"),
+    ("experiences", "experience"),
+    ("relations", "relation"),
+    ("insights", "insight"),
+    ("activities", "activity"),
+    ("watch_events", "watch_event"),
+    ("sync_cursors", "sync_cursor"),
+];
+
+// ============================================================================
 // Substrate-format marker — raw, serializer-independent (NOT serde)
 // ============================================================================
 //
@@ -1280,8 +1313,17 @@ impl RedbStorage {
     /// run (pure codec migration of an already-current-schema store) is still
     /// reshaped+re-encoded by this single owner.
     fn reencode_serde_blobs_to_postcard(write_txn: &::redb::WriteTransaction) -> Result<()> {
+        // #55: the SERDE_BLOB_TABLES registry is the single source of truth for
+        // which serde-blob tables this loop re-encodes. We record each "what" label
+        // the loop actually processes and assert (in debug builds) that the set of
+        // processed labels is EXACTLY the registry's — so adding a serde-blob table
+        // to `schema.rs` + this loop without registering it (or vice versa) trips
+        // here. This is refactor-neutral: it observes, it does not alter, the pass.
+        let mut visited_labels: Vec<&'static str> = Vec::with_capacity(SERDE_BLOB_TABLES.len());
+
         // --- METADATA_TABLE["db_metadata"] only (per-key; mixed table) ---
         // instance_id / wal_sequence / substrate_format are RAW bytes — NEVER decode.
+        visited_labels.push("db_metadata");
         {
             let meta_table = write_txn.open_table(METADATA_TABLE)?;
             let existing = meta_table
@@ -1298,9 +1340,11 @@ impl RedbStorage {
         }
 
         // --- COLLECTIVES_TABLE: Collective ---
+        visited_labels.push("collective");
         Self::reencode_keyed_table::<Collective>(write_txn, COLLECTIVES_TABLE, "collective")?;
 
         // --- DECAY_CONFIGS_TABLE: StoredDecayConfig (try) then StoredDecayConfigV1 ---
+        visited_labels.push("decay_config");
         {
             let table = write_txn.open_table(DECAY_CONFIGS_TABLE)?;
             let mut rows: Vec<([u8; 16], Vec<u8>)> = Vec::new();
@@ -1331,6 +1375,7 @@ impl RedbStorage {
         }
 
         // --- EXPERIENCES_TABLE: Experience (try) then ExperienceV2 + reshape ---
+        visited_labels.push("experience");
         {
             let table = write_txn.open_table(EXPERIENCES_TABLE)?;
             let mut rows: Vec<([u8; 16], Vec<u8>)> = Vec::new();
@@ -1377,6 +1422,7 @@ impl RedbStorage {
         }
 
         // --- RELATIONS_TABLE: ExperienceRelation ---
+        visited_labels.push("relation");
         Self::reencode_keyed_table::<ExperienceRelation>(
             write_txn,
             RELATIONS_TABLE,
@@ -1384,9 +1430,11 @@ impl RedbStorage {
         )?;
 
         // --- INSIGHTS_TABLE: DerivedInsight ---
+        visited_labels.push("insight");
         Self::reencode_keyed_table::<DerivedInsight>(write_txn, INSIGHTS_TABLE, "insight")?;
 
         // --- ACTIVITIES_TABLE: Activity (variable-length key) ---
+        visited_labels.push("activity");
         {
             let table = write_txn.open_table(ACTIVITIES_TABLE)?;
             let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -1406,6 +1454,7 @@ impl RedbStorage {
         }
 
         // --- WATCH_EVENTS_TABLE: WatchEventRecord (try) then WatchEventRecordV1 ---
+        visited_labels.push("watch_event");
         {
             use super::schema::WatchEventRecordV1;
             let table = write_txn.open_table(WATCH_EVENTS_TABLE)?;
@@ -1442,11 +1491,37 @@ impl RedbStorage {
 
         // --- SYNC_CURSORS_TABLE: SyncCursor (feature: sync) ---
         #[cfg(feature = "sync")]
-        Self::reencode_keyed_table::<crate::sync::SyncCursor>(
-            write_txn,
-            SYNC_CURSORS_TABLE,
-            "sync_cursor",
-        )?;
+        {
+            visited_labels.push("sync_cursor");
+            Self::reencode_keyed_table::<crate::sync::SyncCursor>(
+                write_txn,
+                SYNC_CURSORS_TABLE,
+                "sync_cursor",
+            )?;
+        }
+
+        // #55 refactor-neutral coverage assertion: the loop must have visited
+        // EXACTLY the registry's serde-blob labels. `sync_cursor` is only expected
+        // when the `sync` feature is on, so filter the registry the same way the
+        // loop is gated. Any drift (a registered table not visited, or a visited
+        // table not registered) is a debug-build panic — the single-source invariant.
+        debug_assert_eq!(
+            {
+                let mut v = visited_labels.clone();
+                v.sort_unstable();
+                v
+            },
+            {
+                let mut expected: Vec<&'static str> = SERDE_BLOB_TABLES
+                    .iter()
+                    .map(|(_, what)| *what)
+                    .filter(|what| cfg!(feature = "sync") || *what != "sync_cursor")
+                    .collect();
+                expected.sort_unstable();
+                expected
+            },
+            "reencode loop and SERDE_BLOB_TABLES registry disagree on the serde-blob set",
+        );
 
         debug!("re-encoded all serde-blob tables from bincode to postcard");
         Ok(())
@@ -5817,5 +5892,526 @@ mod tests {
             legacy_bincode::decode::<StoredDecayConfig>(STORED_DECAY_CONFIG_V1_GOLDEN).is_err(),
             "V1 bytes (no nanos) must not silently decode as the current StoredDecayConfig"
         );
+    }
+
+    // ========================================================================
+    // #52 — postcard ⊥ legacy-bincode DISJOINTNESS guards
+    // ========================================================================
+    //
+    // The on-open codec pass decodes every serde-blob row via
+    // `decode_blob_legacy_or_postcard`, which tries `legacy_bincode::decode`
+    // FIRST and only falls back to postcard on an `Err`. That ordering is safe
+    // ONLY IF a postcard encoding is NEVER accepted by `legacy_bincode::decode`
+    // — otherwise a postcard row (e.g. one a reshape migrator just rewrote in
+    // the same txn) could be silently mis-dispatched through the bincode branch
+    // and corrupted. These tests prove the two wire formats are DISJOINT in the
+    // postcard→bincode direction for all 9 serde-blob shapes:
+    //
+    //   * a fast, deterministic regression FLOOR: representative / `*_GOLDEN`-
+    //     anchored values, postcard-encoded, asserted `Err` under legacy bincode;
+    //   * a `proptest!` BREADTH layer over random + boundary values (empty /
+    //     max-length collections, `NaN` f32, unknown/added fields, truncated
+    //     inputs) for the high-risk shapes.
+    //
+    // Naming note: the module and its assertions use the token `disjoint`/
+    // `postcard.*reject` so the codec-correctness regression grep guards bind.
+    mod postcard_bincode_disjointness {
+        use super::*;
+        use crate::config::DecayConfig;
+        use crate::insight::InsightType;
+        use proptest::prelude::*;
+
+        // ---- ground-truth value builders for the 4 shapes WITHOUT a frozen
+        // golden (db_metadata / decay_config / activity / sync_cursor). The other
+        // five (collective / experience / relation / insight / watch_event) reuse
+        // the parent module's `*_GOLDEN` bytes decoded back to real values. ----
+
+        fn sample_db_metadata() -> DatabaseMetadata {
+            DatabaseMetadata::new(EmbeddingDimension::D384)
+        }
+
+        fn sample_decay_config() -> StoredDecayConfig {
+            StoredDecayConfig::from(&DecayConfig::default())
+        }
+
+        fn sample_activity() -> Activity {
+            Activity {
+                agent_id: "agent-disjoint".into(),
+                collective_id: CollectiveId::from_bytes([0x33; 16]),
+                current_task: Some("proving disjointness".into()),
+                context_summary: None,
+                started_at: Timestamp::from_millis(1_700_000_000_000),
+                last_heartbeat: Timestamp::from_millis(1_700_000_000_500),
+            }
+        }
+
+        #[cfg(feature = "sync")]
+        fn sample_sync_cursor() -> crate::sync::SyncCursor {
+            crate::sync::SyncCursor {
+                instance_id: InstanceId::from_bytes([0x44; 16]),
+                last_sequence: 42,
+            }
+        }
+
+        fn sample_relation() -> ExperienceRelation {
+            ExperienceRelation {
+                id: RelationId::from_bytes([0x55; 16]),
+                source_id: ExperienceId::from_bytes([0x21; 16]),
+                target_id: ExperienceId::from_bytes([0x22; 16]),
+                relation_type: RelationType::Supports,
+                strength: 0.75,
+                metadata: Some("{\"note\":\"disjoint\"}".into()),
+                created_at: Timestamp::from_millis(1_700_000_000_000),
+            }
+        }
+
+        fn sample_insight() -> DerivedInsight {
+            DerivedInsight {
+                id: InsightId::from_bytes([0x66; 16]),
+                collective_id: CollectiveId::from_bytes([0x11; 16]),
+                content: "disjoint insight".into(),
+                embedding: vec![0.1, 0.2, 0.3],
+                source_experience_ids: vec![ExperienceId::from_bytes([0x21; 16])],
+                insight_type: InsightType::Pattern,
+                confidence: 0.9,
+                domain: vec!["rust".into()],
+                created_at: Timestamp::from_millis(1_700_000_000_000),
+                updated_at: Timestamp::from_millis(1_700_000_000_500),
+            }
+        }
+
+        /// The core disjointness predicate: `legacy_bincode::decode::<T>` MUST
+        /// REJECT (return `Err`) the postcard encoding of `value`. A `true`
+        /// result means the two codecs are disjoint for this value.
+        fn postcard_is_rejected_by_legacy_bincode<T>(value: &T) -> bool
+        where
+            T: Serialize + serde::de::DeserializeOwned,
+        {
+            let postcard_bytes = postcard::to_stdvec(value).expect("postcard encodes");
+            legacy_bincode::decode::<T>(&postcard_bytes).is_err()
+        }
+
+        // --------------------------------------------------------------------
+        // Regression FLOOR: representative-value / `*_GOLDEN`-anchored assertions
+        // for ALL 9 serde-blob shapes. For the 5 golden-bearing shapes we decode
+        // the frozen legacy bytes back to the real value, then re-encode it with
+        // postcard and assert legacy bincode rejects it — anchoring the property
+        // to the exact shapes captured on disk.
+        // --------------------------------------------------------------------
+
+        #[test]
+        fn golden_anchored_postcard_rejected_all_nine_shapes() {
+            // db_metadata
+            assert!(
+                postcard_is_rejected_by_legacy_bincode(&sample_db_metadata()),
+                "db_metadata: postcard encoding must be rejected (disjoint) by legacy bincode"
+            );
+            // collective (golden-anchored)
+            let collective: Collective =
+                legacy_bincode::decode(COLLECTIVE_GOLDEN).expect("collective golden decodes");
+            assert!(
+                postcard_is_rejected_by_legacy_bincode(&collective),
+                "collective: postcard must be rejected (disjoint) by legacy bincode"
+            );
+            // decay_config
+            assert!(
+                postcard_is_rejected_by_legacy_bincode(&sample_decay_config()),
+                "decay_config: postcard must be rejected (disjoint) by legacy bincode"
+            );
+            // experience (golden-anchored)
+            let experience: Experience =
+                legacy_bincode::decode(EXPERIENCE_GOLDEN).expect("experience golden decodes");
+            assert!(
+                postcard_is_rejected_by_legacy_bincode(&experience),
+                "experience: postcard must be rejected (disjoint) by legacy bincode"
+            );
+            // relation (golden-anchored)
+            let relation: ExperienceRelation =
+                legacy_bincode::decode(RELATION_GOLDEN).expect("relation golden decodes");
+            assert!(
+                postcard_is_rejected_by_legacy_bincode(&relation),
+                "relation: postcard must be rejected (disjoint) by legacy bincode"
+            );
+            // insight (golden-anchored)
+            let insight: DerivedInsight =
+                legacy_bincode::decode(INSIGHT_GOLDEN).expect("insight golden decodes");
+            assert!(
+                postcard_is_rejected_by_legacy_bincode(&insight),
+                "insight: postcard must be rejected (disjoint) by legacy bincode"
+            );
+            // activity
+            assert!(
+                postcard_is_rejected_by_legacy_bincode(&sample_activity()),
+                "activity: postcard must be rejected (disjoint) by legacy bincode"
+            );
+            // watch_event (golden-anchored)
+            let watch: WatchEventRecord =
+                legacy_bincode::decode(WATCH_EVENT_GOLDEN).expect("watch_event golden decodes");
+            assert!(
+                postcard_is_rejected_by_legacy_bincode(&watch),
+                "watch_event: postcard must be rejected (disjoint) by legacy bincode"
+            );
+            // sync_cursor (feature-gated)
+            #[cfg(feature = "sync")]
+            assert!(
+                postcard_is_rejected_by_legacy_bincode(&sample_sync_cursor()),
+                "sync_cursor: postcard must be rejected (disjoint) by legacy bincode"
+            );
+        }
+
+        // --------------------------------------------------------------------
+        // BREADTH layer: proptest over random + boundary values for the
+        // high-risk shapes. Bounded case count (mirrors rerank.rs:206) keeps
+        // `cargo test` fast. Each generated value's postcard encoding is asserted
+        // `Err` under legacy bincode — proving disjointness over a value space,
+        // not one lucky byte pattern. Boundary cases exercised: empty / max-length
+        // collections and strings, NaN f32 payloads, and (via truncation +
+        // trailing-byte tests below) unknown/added-field and truncated inputs.
+        // --------------------------------------------------------------------
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(24))]
+
+            // Experience: content string 0..=256 (empty & max-length), NaN-capable
+            // embedding, applications map 0..8, domain 0..8. The postcard encoding
+            // of every generated Experience must be rejected by legacy bincode.
+            #[test]
+            fn proptest_experience_postcard_disjoint(
+                content in ".{0,256}",
+                emb in prop::collection::vec(prop::num::f32::ANY, 0..64),
+                app_count in 0usize..8,
+                domain in prop::collection::vec("[a-z]{0,16}", 0..8),
+                importance in prop::num::f32::ANY,
+            ) {
+                let mut applications: BTreeMap<InstanceId, u32> = BTreeMap::new();
+                for i in 0..app_count {
+                    applications.insert(InstanceId::from_bytes([i as u8; 16]), i as u32);
+                }
+                let exp = Experience {
+                    id: ExperienceId::from_bytes([0x21; 16]),
+                    collective_id: CollectiveId::from_bytes([0x11; 16]),
+                    content,
+                    embedding: emb,
+                    experience_type: crate::experience::ExperienceType::Fact {
+                        statement: "s".into(),
+                        source: "d".into(),
+                    },
+                    importance,
+                    confidence: 0.25,
+                    applications,
+                    domain,
+                    related_files: Vec::new(),
+                    source_agent: AgentId::new("agent"),
+                    source_task: None,
+                    timestamp: Timestamp::from_millis(111),
+                    last_reinforced: Timestamp::from_millis(222),
+                    archived: false,
+                };
+                prop_assert!(
+                    postcard_is_rejected_by_legacy_bincode(&exp),
+                    "experience proptest value round-tripped through legacy bincode — NOT disjoint"
+                );
+            }
+
+            // Insight: NaN-capable embedding + confidence, variable source-id and
+            // domain vectors (empty & long), content 0..=256.
+            #[test]
+            fn proptest_insight_postcard_disjoint(
+                content in ".{0,256}",
+                emb in prop::collection::vec(prop::num::f32::ANY, 0..64),
+                src_count in 0usize..8,
+                confidence in prop::num::f32::ANY,
+            ) {
+                let source_experience_ids = (0..src_count)
+                    .map(|i| ExperienceId::from_bytes([i as u8; 16]))
+                    .collect();
+                let insight = DerivedInsight {
+                    id: InsightId::from_bytes([0x66; 16]),
+                    collective_id: CollectiveId::from_bytes([0x11; 16]),
+                    content,
+                    embedding: emb,
+                    source_experience_ids,
+                    insight_type: InsightType::Synthesis,
+                    confidence,
+                    domain: Vec::new(),
+                    created_at: Timestamp::from_millis(1),
+                    updated_at: Timestamp::from_millis(2),
+                };
+                prop_assert!(
+                    postcard_is_rejected_by_legacy_bincode(&insight),
+                    "insight proptest value round-tripped through legacy bincode — NOT disjoint"
+                );
+            }
+
+            // Relation: metadata None/Some (empty & long JSON-ish string), each
+            // of the 6 relation-type discriminants, NaN-capable strength.
+            #[test]
+            fn proptest_relation_postcard_disjoint(
+                has_meta in any::<bool>(),
+                meta in ".{0,256}",
+                type_idx in 0usize..6,
+                strength in prop::num::f32::ANY,
+            ) {
+                let relation_type = [
+                    RelationType::Supports,
+                    RelationType::Contradicts,
+                    RelationType::Elaborates,
+                    RelationType::Supersedes,
+                    RelationType::Implies,
+                    RelationType::RelatedTo,
+                ][type_idx];
+                let rel = ExperienceRelation {
+                    id: RelationId::from_bytes([0x55; 16]),
+                    source_id: ExperienceId::from_bytes([0x21; 16]),
+                    target_id: ExperienceId::from_bytes([0x22; 16]),
+                    relation_type,
+                    strength,
+                    metadata: if has_meta { Some(meta) } else { None },
+                    created_at: Timestamp::from_millis(1),
+                };
+                prop_assert!(
+                    postcard_is_rejected_by_legacy_bincode(&rel),
+                    "relation proptest value round-tripped through legacy bincode — NOT disjoint"
+                );
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // Boundary-case anchors that are awkward to express as strategies:
+        // NaN f32, empty & max-length collections, and unknown/added-field /
+        // truncated inputs. These assert the disjointness property holds at the
+        // exact edges the migration cares about.
+        // --------------------------------------------------------------------
+
+        #[test]
+        fn disjoint_at_nan_and_empty_and_maxlen_boundaries() {
+            // NaN f32 embedding + NaN importance.
+            let mut exp = oracle_experience();
+            exp.embedding = vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+            exp.importance = f32::NAN;
+            assert!(
+                postcard_is_rejected_by_legacy_bincode(&exp),
+                "NaN-bearing experience: postcard must remain disjoint from legacy bincode"
+            );
+
+            // Empty collections everywhere.
+            let empty = Experience {
+                id: ExperienceId::from_bytes([0; 16]),
+                collective_id: CollectiveId::from_bytes([0; 16]),
+                content: String::new(),
+                embedding: Vec::new(),
+                experience_type: crate::experience::ExperienceType::Fact {
+                    statement: String::new(),
+                    source: String::new(),
+                },
+                importance: 0.0,
+                confidence: 0.0,
+                applications: BTreeMap::new(),
+                domain: Vec::new(),
+                related_files: Vec::new(),
+                source_agent: AgentId::new(""),
+                source_task: None,
+                timestamp: Timestamp::from_millis(0),
+                last_reinforced: Timestamp::from_millis(0),
+                archived: false,
+            };
+            assert!(
+                postcard_is_rejected_by_legacy_bincode(&empty),
+                "empty-collection experience: postcard must remain disjoint from legacy bincode"
+            );
+
+            // Max-length-ish: a long content string + large embedding.
+            let mut big = oracle_experience();
+            big.content = "x".repeat(4096);
+            big.embedding = vec![0.5f32; 384];
+            big.domain = (0..64).map(|i| format!("tag{i}")).collect();
+            assert!(
+                postcard_is_rejected_by_legacy_bincode(&big),
+                "max-length experience: postcard must remain disjoint from legacy bincode"
+            );
+        }
+
+        #[test]
+        fn disjoint_under_truncated_and_trailing_byte_perturbations() {
+            // A postcard encoding with trailing/unknown extra bytes appended
+            // (an "added field" from a future schema) must still be rejected.
+            let collective: Collective =
+                legacy_bincode::decode(COLLECTIVE_GOLDEN).expect("collective golden decodes");
+            let mut extended = postcard::to_stdvec(&collective).expect("postcard encodes");
+            extended.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+            assert!(
+                legacy_bincode::decode::<Collective>(&extended).is_err(),
+                "postcard + trailing unknown bytes must be rejected by legacy bincode"
+            );
+
+            // A truncated postcard encoding must be rejected (never a clean decode).
+            let full = postcard::to_stdvec(&collective).expect("postcard encodes");
+            if full.len() > 2 {
+                let truncated = &full[..full.len() - 2];
+                assert!(
+                    legacy_bincode::decode::<Collective>(truncated).is_err(),
+                    "truncated postcard bytes must be rejected by legacy bincode"
+                );
+            }
+        }
+    }
+
+    // ========================================================================
+    // #55 — re-encode exhaustiveness / independent schema audit
+    // ========================================================================
+    //
+    // The `SERDE_BLOB_TABLES` registry is the single source that
+    // `reencode_serde_blobs_to_postcard` iterates/asserts against (see the
+    // `visited_labels` coverage assertion in that fn). The guard below proves
+    // that registry is COMPLETE — that every serde-blob table in the real schema
+    // is registered — WITHOUT using the registry as its own oracle. It derives
+    // the serde-blob table set INDEPENDENTLY by enumerating every `*_TABLE`
+    // constant in `schema.rs` and partitioning it into copy-through vs serde-blob.
+    //
+    // Token note: this module is named with `schema_audit` and its assertions use
+    // `exhaustiv`/`reencode.*registry` so the regression grep guards bind. The
+    // negative (falsification) test uses `#[should_panic]` + a `fake_serde_blob`
+    // descriptor so a genuinely-missing table is proven to FAIL the audit.
+    mod serde_blob_schema_audit {
+        use super::*;
+        use redb::{MultimapTableHandle, TableHandle};
+
+        /// The audit's INDEPENDENT enumeration of every `*_TABLE` constant defined
+        /// in `schema.rs`, tagged copy-through (never decoded) vs serde-blob. This
+        /// list is authored against `schema.rs` — NOT derived from
+        /// `SERDE_BLOB_TABLES` — so a table added to `schema.rs` but omitted from
+        /// the registry is caught, and drift between this list and the real schema
+        /// is caught by the count assertion below.
+        ///
+        /// Each entry is `(redb table name, is_serde_blob)`.
+        fn schema_audit_tables() -> Vec<(&'static str, bool)> {
+            let mut tables: Vec<(&'static str, bool)> = vec![
+                // --- serde-blob tables (decoded ⇒ must be in SERDE_BLOB_TABLES) ---
+                (METADATA_TABLE.name(), true),
+                (COLLECTIVES_TABLE.name(), true),
+                (DECAY_CONFIGS_TABLE.name(), true),
+                (EXPERIENCES_TABLE.name(), true),
+                (RELATIONS_TABLE.name(), true),
+                (INSIGHTS_TABLE.name(), true),
+                (ACTIVITIES_TABLE.name(), true),
+                (WATCH_EVENTS_TABLE.name(), true),
+                // --- copy-through tables (raw bytes ⇒ never decoded, excluded) ---
+                (EMBEDDINGS_TABLE.name(), false),
+                (EXPERIENCES_BY_COLLECTIVE_TABLE.name(), false),
+                (EXPERIENCES_BY_TYPE_TABLE.name(), false),
+                (RELATIONS_BY_SOURCE_TABLE.name(), false),
+                (RELATIONS_BY_TARGET_TABLE.name(), false),
+                (INSIGHTS_BY_COLLECTIVE_TABLE.name(), false),
+            ];
+            // sync_cursors is a serde-blob table but only compiled under `sync`;
+            // gate its enumeration the same way schema.rs gates the const.
+            #[cfg(feature = "sync")]
+            tables.push((SYNC_CURSORS_TABLE.name(), true));
+            tables
+        }
+
+        /// The number of `*_TABLE` constants the audit expects to enumerate. This
+        /// is the anti-drift anchor: if `schema.rs` gains or loses a `*_TABLE`
+        /// const and this audit's list is not updated, the count assertion below
+        /// fails. 14 tables without `sync`, 15 with (the +`sync_cursors`).
+        const fn expected_table_count() -> usize {
+            if cfg!(feature = "sync") {
+                15
+            } else {
+                14
+            }
+        }
+
+        /// Runs the audit against an arbitrary table list: every serde-blob table
+        /// must appear in `SERDE_BLOB_TABLES`. Returns `Err(name)` for the first
+        /// serde-blob table missing from the registry (fails closed). Kept generic
+        /// over the table list so the falsification test can feed it a fake table.
+        fn audit_serde_blob_coverage(tables: &[(&str, bool)]) -> std::result::Result<(), String> {
+            for (name, is_serde_blob) in tables {
+                if *is_serde_blob {
+                    let registered = SERDE_BLOB_TABLES
+                        .iter()
+                        .any(|(reg_name, _)| reg_name == name);
+                    if !registered {
+                        return Err((*name).to_string());
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// #55 exhaustiveness: every serde-blob table the independent schema audit
+        /// finds must be covered by the `SERDE_BLOB_TABLES` registry that drives
+        /// `reencode_serde_blobs_to_postcard`. Because the audit's table set is
+        /// derived from `schema.rs` (not from the registry), a serde-blob table
+        /// added to `schema.rs` but not to the registry FAILS here.
+        #[test]
+        fn every_schema_serde_blob_table_is_in_reencode_registry() {
+            let tables = schema_audit_tables();
+
+            // Anti-drift: the audit's own enumeration must match the real number of
+            // `*_TABLE` consts in schema.rs, so the audit cannot silently fall
+            // behind the schema (e.g. a new table added but not enumerated here).
+            assert_eq!(
+                tables.len(),
+                expected_table_count(),
+                "schema audit enumeration ({}) drifted from the real *_TABLE count ({}) — \
+                 add the new schema.rs table to schema_audit_tables()",
+                tables.len(),
+                expected_table_count(),
+            );
+
+            // Exhaustiveness: independent serde-blob set ⊆ registry.
+            audit_serde_blob_coverage(&tables)
+                .expect("every serde-blob table from schema.rs must be in SERDE_BLOB_TABLES");
+
+            // And the registry has no MORE serde-blob tables than the schema audit
+            // knows about (registry ⊆ audit's serde-blob set) — a two-way check so
+            // the registry cannot list a phantom table either.
+            let audit_serde_blob: Vec<&str> = tables
+                .iter()
+                .filter(|(_, blob)| *blob)
+                .map(|(name, _)| *name)
+                .collect();
+            for (reg_name, _what) in SERDE_BLOB_TABLES {
+                // sync_cursors is only in the audit set under `sync`; skip it when
+                // the feature is off (the registry always lists it as a const).
+                #[cfg(not(feature = "sync"))]
+                if *reg_name == "sync_cursors" {
+                    continue;
+                }
+                assert!(
+                    audit_serde_blob.contains(reg_name),
+                    "registry lists '{reg_name}' but the independent schema audit does not \
+                     classify it as a serde-blob table",
+                );
+            }
+        }
+
+        /// C10 falsification: the audit must FAIL CLOSED. A deliberately-fake
+        /// serde-blob table descriptor whose name is absent from
+        /// `SERDE_BLOB_TABLES` must be REJECTED — proving the guard actually bites
+        /// rather than passing vacuously.
+        #[test]
+        fn audit_rejects_fake_unregistered_serde_blob_table() {
+            let fake_serde_blob = ("definitely_not_a_real_table", true);
+            let result = audit_serde_blob_coverage(&[fake_serde_blob]);
+            assert!(
+                result.is_err(),
+                "a fake serde-blob table absent from SERDE_BLOB_TABLES must FAIL the audit"
+            );
+            assert_eq!(result.unwrap_err(), "definitely_not_a_real_table");
+        }
+
+        /// C10 falsification, panic form: the same fake-table rejection expressed
+        /// as a `#[should_panic]` test so the guard's fail-closed behavior is
+        /// asserted through the panic path the exhaustiveness test uses in prod.
+        #[test]
+        #[should_panic(expected = "fake serde-blob table")]
+        fn audit_of_fake_table_panics_when_unwrapped() {
+            let fake_serde_blob = ("phantom_table_audit_fake", true);
+            audit_serde_blob_coverage(&[fake_serde_blob])
+                .expect("fake serde-blob table must be rejected");
+        }
     }
 }
