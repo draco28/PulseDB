@@ -198,8 +198,8 @@ impl SyncServer {
         // 2. Only now is it safe to deserialize the framed body.
         let request: HandshakeRequest = postcard::from_bytes(payload).map_err(SyncError::from)?;
         let response = self.handle_handshake(request)?;
-        let encoded =
-            postcard::to_allocvec(&response).map_err(|e| SyncError::serialization(e.to_string()))?;
+        let encoded = postcard::to_allocvec(&response)
+            .map_err(|e| SyncError::serialization(e.to_string()))?;
         // 3. Frame the response with the preamble (both directions fail loud).
         Ok(write_wire_preamble(&encoded))
     }

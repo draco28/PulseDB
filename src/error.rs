@@ -353,7 +353,11 @@ impl StorageError {
     }
 
     /// Creates a substrate-migration-too-large error (single-txn ceiling exceeded).
-    pub fn substrate_migration_too_large(store_size: u64, projected_peak: u64, budget: u64) -> Self {
+    pub fn substrate_migration_too_large(
+        store_size: u64,
+        projected_peak: u64,
+        budget: u64,
+    ) -> Self {
         Self::SubstrateMigrationTooLarge {
             store_size,
             projected_peak,

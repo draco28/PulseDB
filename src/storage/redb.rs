@@ -34,6 +34,7 @@ use crate::insight::DerivedInsight;
 use crate::relation::{ExperienceRelation, RelationType};
 use crate::types::{CollectiveId, ExperienceId, InsightId, InstanceId, RelationId, Timestamp};
 
+use super::legacy_bincode;
 #[cfg(feature = "sync")]
 use super::schema::SYNC_CURSORS_TABLE;
 use super::schema::{
@@ -46,7 +47,6 @@ use super::schema::{
     RELATIONS_BY_TARGET_TABLE, RELATIONS_TABLE, SCHEMA_VERSION, SUBSTRATE_FORMAT_KEY,
     SUBSTRATE_MAGIC, SUBSTRATE_MARKER_LEN, WAL_SEQUENCE_KEY, WATCH_EVENTS_TABLE,
 };
-use super::legacy_bincode;
 use super::StorageEngine;
 use crate::config::{Config, EmbeddingDimension, RecallWeights};
 use crate::error::{PulseDBError, Result, StorageError, ValidationError};
@@ -234,9 +234,8 @@ fn backup_once(src: &Path, backup_path: &Path) -> Result<()> {
         .open(backup_path)
     {
         Ok(mut backup_file) => {
-            let copy_result = std::fs::File::open(src).and_then(|mut source| {
-                std::io::copy(&mut source, &mut backup_file).map(|_| ())
-            });
+            let copy_result = std::fs::File::open(src)
+                .and_then(|mut source| std::io::copy(&mut source, &mut backup_file).map(|_| ()));
             if let Err(error) = copy_result {
                 drop(backup_file);
                 let _ = std::fs::remove_file(backup_path);
@@ -515,7 +514,9 @@ impl RedbStorage {
     fn create_or_migrate(path: &Path, config: &Config) -> Result<Database> {
         match Self::create_database(path, config) {
             Ok(db) => Ok(db),
-            Err(PulseDBError::Storage(StorageError::SubstrateUpgradeRequired { found, .. })) => {
+            Err(PulseDBError::Storage(StorageError::SubstrateUpgradeRequired {
+                found, ..
+            })) => {
                 // FR-035 / audit C6: a read-only open of an un-migrated (redb-v2)
                 // store returns ReadOnly BEFORE any write — no lock, no backup, no
                 // upgrade. A read-only open performs ZERO writes.
@@ -660,7 +661,10 @@ impl RedbStorage {
             .open_table(METADATA_TABLE)
             .map_err(|e| StorageError::corrupted(format!("Cannot open metadata table: {}", e)))?;
 
-        match meta_table.get(SUBSTRATE_FORMAT_KEY).map_err(StorageError::from)? {
+        match meta_table
+            .get(SUBSTRATE_FORMAT_KEY)
+            .map_err(StorageError::from)?
+        {
             None => Ok(SubstrateFormat::Absent),
             Some(entry) => {
                 let version = decode_substrate_marker(entry.value())?;
@@ -896,10 +900,9 @@ impl RedbStorage {
         let substrate_marker = Self::read_substrate_marker(&db)?;
         let needs_marker_write = match substrate_marker {
             SubstrateFormat::Newer(found) => {
-                return Err(PulseDBError::Storage(StorageError::substrate_format_too_new(
-                    found,
-                    CURRENT_SUBSTRATE_FORMAT,
-                )));
+                return Err(PulseDBError::Storage(
+                    StorageError::substrate_format_too_new(found, CURRENT_SUBSTRATE_FORMAT),
+                ));
             }
             SubstrateFormat::Absent | SubstrateFormat::Older(_) => {
                 // #53b — marker-1 `{redb-v3, bincode}` (and Absent bincode-era) codec
@@ -1418,9 +1421,7 @@ impl RedbStorage {
     fn projected_peak_rss(re_encodable_footprint: u64) -> u64 {
         // copy_through_excluded footprint × coefficient, then × safety margin —
         // saturating and rounding UP (bias to fail-closed, never OOM).
-        re_encodable_footprint
-            .saturating_mul(Self::PEAK_RSS_NUMERATOR)
-            / Self::PEAK_RSS_DENOMINATOR
+        re_encodable_footprint.saturating_mul(Self::PEAK_RSS_NUMERATOR) / Self::PEAK_RSS_DENOMINATOR
     }
 
     /// #54b — the peak with the safety margin applied: `projected_peak_rss × 1.5`,
@@ -1460,7 +1461,11 @@ impl RedbStorage {
     /// **Config-first, NOT host-memory auto-detect** (a cgroup-limited container
     /// over-reports host RAM → would wrongly pick single-txn → OOM). The embedder
     /// *declares* `migration_available_memory_bytes` to opt into a higher ceiling.
-    fn resolve_codec_txn_shape(store_size: u64, copy_through_bytes: u64, config: &Config) -> Result<()> {
+    fn resolve_codec_txn_shape(
+        store_size: u64,
+        copy_through_bytes: u64,
+        config: &Config,
+    ) -> Result<()> {
         // copy_through_excluded footprint → margined projected peak (bias to
         // over-estimate; fail-closed is the safe error, OOM is not).
         let footprint = Self::re_encodable_footprint(store_size, copy_through_bytes);
@@ -1507,8 +1512,7 @@ impl RedbStorage {
         // budget: only a *declared* budget (config-first) can authorize single-txn.
         // projected_peak < declared * SAFETY_MARGIN.
         if let Some(declared) = config.migration_available_memory_bytes {
-            let allowed = declared
-                .saturating_mul(Self::DECLARED_MEM_SAFETY_NUMERATOR)
+            let allowed = declared.saturating_mul(Self::DECLARED_MEM_SAFETY_NUMERATOR)
                 / Self::DECLARED_MEM_SAFETY_DENOMINATOR;
             if projected_peak < allowed {
                 debug!(
@@ -1535,11 +1539,9 @@ impl RedbStorage {
             "codec migration: store above single-txn floor with no covering memory budget; \
              failing closed (no destructive write)"
         );
-        Err(PulseDBError::Storage(StorageError::substrate_migration_too_large(
-            store_size,
-            projected_peak,
-            floor,
-        )))
+        Err(PulseDBError::Storage(
+            StorageError::substrate_migration_too_large(store_size, projected_peak, floor),
+        ))
     }
 
     /// Conservative free-disk estimate the codec migration needs (audit C3 / work-1.05).
@@ -1552,9 +1554,7 @@ impl RedbStorage {
     /// throughout (never overflows).
     fn required_migration_disk_bytes(store_size: u64) -> u64 {
         // backup (~1×) + migrated (~1×) + ~10% txn-growth margin
-        store_size
-            .saturating_mul(2)
-            .saturating_add(store_size / 10)
+        store_size.saturating_mul(2).saturating_add(store_size / 10)
     }
 
     /// Unified migration headroom preflight (audit C3 / work-1.05) — checks the
@@ -1591,7 +1591,9 @@ impl RedbStorage {
                 "codec migration: insufficient free disk; failing closed (no destructive write)"
             );
             return Err(PulseDBError::Storage(
-                StorageError::substrate_migration_insufficient_disk(store_size, required, available),
+                StorageError::substrate_migration_insufficient_disk(
+                    store_size, required, available,
+                ),
             ));
         }
         // Memory axis: reuse 1.04's config-first single-txn-vs-fail-closed decision,
@@ -1633,12 +1635,11 @@ impl RedbStorage {
         visited_labels.push("db_metadata");
         {
             let meta_table = write_txn.open_table(METADATA_TABLE)?;
-            let existing = meta_table
-                .get(METADATA_KEY)?
-                .map(|v| v.value().to_vec());
+            let existing = meta_table.get(METADATA_KEY)?.map(|v| v.value().to_vec());
             drop(meta_table);
             if let Some(bytes) = existing {
-                let meta: DatabaseMetadata = Self::decode_blob_legacy_or_postcard(&bytes, "db_metadata")?;
+                let meta: DatabaseMetadata =
+                    Self::decode_blob_legacy_or_postcard(&bytes, "db_metadata")?;
                 let re = postcard::to_stdvec(&meta)
                     .map_err(|e| StorageError::serialization(e.to_string()))?;
                 let mut meta_table = write_txn.open_table(METADATA_TABLE)?;
@@ -1739,11 +1740,7 @@ impl RedbStorage {
 
         // --- RELATIONS_TABLE: ExperienceRelation ---
         visited_labels.push("relation");
-        Self::reencode_keyed_table::<ExperienceRelation>(
-            write_txn,
-            RELATIONS_TABLE,
-            "relation",
-        )?;
+        Self::reencode_keyed_table::<ExperienceRelation>(write_txn, RELATIONS_TABLE, "relation")?;
 
         // --- INSIGHTS_TABLE: DerivedInsight ---
         visited_labels.push("insight");
@@ -1761,8 +1758,7 @@ impl RedbStorage {
             drop(table);
             let mut table = write_txn.open_table(ACTIVITIES_TABLE)?;
             for (key, bytes) in rows {
-                let activity: Activity =
-                    Self::decode_blob_legacy_or_postcard(&bytes, "activity")?;
+                let activity: Activity = Self::decode_blob_legacy_or_postcard(&bytes, "activity")?;
                 let re = postcard::to_stdvec(&activity)
                     .map_err(|e| StorageError::serialization(e.to_string()))?;
                 table.insert(key.as_slice(), re.as_slice())?;
@@ -2515,8 +2511,8 @@ impl StorageEngine for RedbStorage {
     // =========================================================================
 
     fn save_relation(&self, relation: &ExperienceRelation) -> Result<()> {
-        let bytes =
-            postcard::to_stdvec(relation).map_err(|e| StorageError::serialization(e.to_string()))?;
+        let bytes = postcard::to_stdvec(relation)
+            .map_err(|e| StorageError::serialization(e.to_string()))?;
 
         let write_txn = self.db.begin_write().map_err(StorageError::from)?;
         {
@@ -2898,8 +2894,8 @@ impl StorageEngine for RedbStorage {
 
     fn save_activity(&self, activity: &Activity) -> Result<()> {
         let key = encode_activity_key(activity.collective_id.as_bytes(), &activity.agent_id);
-        let bytes =
-            postcard::to_stdvec(activity).map_err(|e| StorageError::serialization(e.to_string()))?;
+        let bytes = postcard::to_stdvec(activity)
+            .map_err(|e| StorageError::serialization(e.to_string()))?;
 
         let write_txn = self.db.begin_write().map_err(StorageError::from)?;
         {
@@ -3334,8 +3330,8 @@ mod tests {
     // the live serializer, so `src/storage/redb.rs` is free of bare-crate serde
     // calls (AC-3) while still seeding genuine legacy on-disk values.
     use crate::storage::legacy_bincode::tests::{
-        COLLECTIVE_GOLDEN, EXPERIENCE_GOLDEN, EXPERIENCE_V2_GOLDEN, INSIGHT_GOLDEN, RELATION_GOLDEN,
-        WATCH_EVENT_GOLDEN,
+        COLLECTIVE_GOLDEN, EXPERIENCE_GOLDEN, EXPERIENCE_V2_GOLDEN, INSIGHT_GOLDEN,
+        RELATION_GOLDEN, WATCH_EVENT_GOLDEN,
     };
     use std::cell::Cell;
 
@@ -5059,7 +5055,8 @@ mod tests {
 
             // Frozen oracle schema-v3 metadata bytes (audit C2; no live serializer).
             let metadata_bytes = META_V3_D384_GOLDEN.to_vec();
-            meta.insert(METADATA_KEY, metadata_bytes.as_slice()).unwrap();
+            meta.insert(METADATA_KEY, metadata_bytes.as_slice())
+                .unwrap();
 
             let instance_id = InstanceId::new();
             meta.insert(INSTANCE_ID_KEY, instance_id.as_bytes().as_slice())
@@ -5160,7 +5157,9 @@ mod tests {
         assert!(
             matches!(
                 still_v2,
-                Err(PulseDBError::Storage(StorageError::SubstrateUpgradeRequired { .. }))
+                Err(PulseDBError::Storage(
+                    StorageError::SubstrateUpgradeRequired { .. }
+                ))
             ),
             "read-only open must NOT have upgraded the file"
         );
@@ -5356,7 +5355,8 @@ mod tests {
             // metadata table: db_metadata (bincode) + instance_id (raw 16 bytes),
             // NO substrate_format key (Absent ⇒ legacy v2).
             let mut meta = write_txn.open_table(V2_METADATA_TABLE).unwrap();
-            meta.insert(METADATA_KEY, metadata_bytes.as_slice()).unwrap();
+            meta.insert(METADATA_KEY, metadata_bytes.as_slice())
+                .unwrap();
             meta.insert(INSTANCE_ID_KEY, instance_id.as_bytes().as_slice())
                 .unwrap();
 
@@ -5419,7 +5419,11 @@ mod tests {
         assert_eq!(got.importance, want.importance, "importance");
         assert_eq!(got.confidence, want.confidence, "confidence");
         assert_eq!(got.applications, want.applications, "applications BTreeMap");
-        assert_eq!(got.applications(), want.applications(), "applications() total");
+        assert_eq!(
+            got.applications(),
+            want.applications(),
+            "applications() total"
+        );
         assert_eq!(got.domain, want.domain, "domain");
         assert_eq!(got.related_files, want.related_files, "related_files");
         assert_eq!(got.source_agent, want.source_agent, "source_agent");
@@ -5570,7 +5574,9 @@ mod tests {
             vec![experience.id],
             "by-collective functional query must yield exactly the seeded experience"
         );
-        let recent = storage.get_recent_experience_ids(collective.id, 10).unwrap();
+        let recent = storage
+            .get_recent_experience_ids(collective.id, 10)
+            .unwrap();
         assert_eq!(
             recent,
             vec![(experience.id, experience.timestamp)],
@@ -5590,7 +5596,10 @@ mod tests {
         let (_c, _e, _emb) = seed_representative_redb_v2_store(&path);
 
         let backup_path = pre_substrate_backup_path(&path);
-        assert!(!backup_path.exists(), "no backup before the read-only attempt");
+        assert!(
+            !backup_path.exists(),
+            "no backup before the read-only attempt"
+        );
         let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
 
         let err = RedbStorage::open(&path, &Config::read_only()).unwrap_err();
@@ -5613,7 +5622,9 @@ mod tests {
         assert!(
             matches!(
                 still_v2,
-                Err(PulseDBError::Storage(StorageError::SubstrateUpgradeRequired { .. }))
+                Err(PulseDBError::Storage(
+                    StorageError::SubstrateUpgradeRequired { .. }
+                ))
             ),
             "read-only open must NOT have upgraded the file (still genuinely v2)"
         );
@@ -5727,10 +5738,7 @@ mod tests {
 
         let err = RedbStorage::open(&path, &default_config()).unwrap_err();
         assert!(
-            matches!(
-                err,
-                PulseDBError::Storage(StorageError::DatabaseLocked)
-            ),
+            matches!(err, PulseDBError::Storage(StorageError::DatabaseLocked)),
             "an old-version lock holder must yield the typed DatabaseLocked, got: {err}"
         );
 
@@ -5785,7 +5793,9 @@ mod tests {
             meta.insert(METADATA_KEY, META_V3_D384_GOLDEN).unwrap();
             meta.insert(
                 INSTANCE_ID_KEY,
-                InstanceId::from_bytes(*b"OLDERFIXTUREINST").as_bytes().as_slice(),
+                InstanceId::from_bytes(*b"OLDERFIXTUREINST")
+                    .as_bytes()
+                    .as_slice(),
             )
             .unwrap();
             // wal_sequence: raw 8-byte BE (copy-through; NEVER decoded).
@@ -5846,9 +5856,15 @@ mod tests {
                 .unwrap();
             let _ = write_txn.open_table(DECAY_CONFIGS_TABLE).unwrap();
             let _ = write_txn.open_table(ACTIVITIES_TABLE).unwrap();
-            let _ = write_txn.open_multimap_table(RELATIONS_BY_SOURCE_TABLE).unwrap();
-            let _ = write_txn.open_multimap_table(RELATIONS_BY_TARGET_TABLE).unwrap();
-            let _ = write_txn.open_multimap_table(INSIGHTS_BY_COLLECTIVE_TABLE).unwrap();
+            let _ = write_txn
+                .open_multimap_table(RELATIONS_BY_SOURCE_TABLE)
+                .unwrap();
+            let _ = write_txn
+                .open_multimap_table(RELATIONS_BY_TARGET_TABLE)
+                .unwrap();
+            let _ = write_txn
+                .open_multimap_table(INSIGHTS_BY_COLLECTIVE_TABLE)
+                .unwrap();
         }
         write_txn.commit().unwrap();
         drop(db);
@@ -5956,7 +5972,9 @@ mod tests {
             // instance_id raw 16 bytes copied through untouched.
             assert_eq!(
                 meta.get(INSTANCE_ID_KEY).unwrap().unwrap().value(),
-                InstanceId::from_bytes(*b"OLDERFIXTUREINST").as_bytes().as_slice(),
+                InstanceId::from_bytes(*b"OLDERFIXTUREINST")
+                    .as_bytes()
+                    .as_slice(),
                 "instance_id raw bytes copied through (never decoded)"
             );
         }
@@ -6033,8 +6051,8 @@ mod tests {
         // typed SubstrateMigrationTooLarge — zero destructive writes (§6.4(3)).
         let cfg = default_config();
         let store_size = 4 * RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES; // 4 GiB
-        // copy_through = 0 → footprint == store_size (re-encodable-dominated, the
-        // strictest / most-conservative peak for this store size).
+                                                                        // copy_through = 0 → footprint == store_size (re-encodable-dominated, the
+                                                                        // strictest / most-conservative peak for this store size).
         let err = RedbStorage::resolve_codec_txn_shape(store_size, 0, &cfg).unwrap_err();
         match err {
             PulseDBError::Storage(StorageError::SubstrateMigrationTooLarge {
@@ -6064,8 +6082,8 @@ mod tests {
         // Config-first opt-in: a declared budget covering the projected peak (with
         // the 0.5 safety margin) authorizes single-txn for an above-floor store.
         let store_size = 4 * RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES; // 4 GiB
-        // #54b: the peak the memory axis compares is now the margined footprint peak
-        // (copy_through = 0 → footprint == store_size).
+                                                                        // #54b: the peak the memory axis compares is now the margined footprint peak
+                                                                        // (copy_through = 0 → footprint == store_size).
         let projected_peak = RedbStorage::projected_peak_with_margin(store_size);
 
         // Budget over 2× projected_peak clears the declared-mem margin (peak < budget/2).
@@ -6081,7 +6099,9 @@ mod tests {
         cfg_small.migration_available_memory_bytes = Some(projected_peak); // peak !< peak/2
         assert!(matches!(
             RedbStorage::resolve_codec_txn_shape(store_size, 0, &cfg_small),
-            Err(PulseDBError::Storage(StorageError::SubstrateMigrationTooLarge { .. }))
+            Err(PulseDBError::Storage(
+                StorageError::SubstrateMigrationTooLarge { .. }
+            ))
         ));
     }
 
@@ -6175,7 +6195,7 @@ mod tests {
         // is fine) and reuses 1.04's resolve_codec_txn_shape rather than re-deriving.
         let cfg = default_config(); // no declared memory budget
         let store_size = 4 * RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES; // 4 GiB, above floor
-        // Plenty of disk: far more than required.
+                                                                        // Plenty of disk: far more than required.
         let available = RedbStorage::required_migration_disk_bytes(store_size) * 2;
         // copy_through = 0 → footprint == store_size → margined peak exceeds the floor
         // budget → still fails on the memory axis (re-encodable-dominated worst case).
@@ -6195,7 +6215,7 @@ mod tests {
         // Both axes satisfied for an above-floor store: a declared memory budget
         // covering the projected peak AND sufficient disk → Ok.
         let store_size = 4 * RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES; // 4 GiB
-        // #54b: budget must cover the MARGINED footprint peak (copy_through = 0).
+                                                                        // #54b: budget must cover the MARGINED footprint peak (copy_through = 0).
         let projected_peak = RedbStorage::projected_peak_with_margin(store_size);
         let mut cfg = default_config();
         cfg.migration_available_memory_bytes = Some(projected_peak * 2 + 2); // clears the margin
@@ -6256,7 +6276,7 @@ mod tests {
         // where keying the floor on raw store_size would have WRONGLY failed it closed.
         let cfg = default_config(); // NO declared memory budget — must pass on its own
         let store_size = 8 * RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES; // 8 GiB total
-        // 99.99% copy-through (embedding-heavy): footprint is a sliver.
+                                                                        // 99.99% copy-through (embedding-heavy): footprint is a sliver.
         let copy_through = store_size - (store_size / 10_000);
 
         // Sanity: keying on raw store_size (copy_through = 0) WOULD fail closed —
@@ -6302,7 +6322,8 @@ mod tests {
         let err = RedbStorage::resolve_codec_txn_shape(store_size, copy_through, &cfg).unwrap_err();
         match err {
             PulseDBError::Storage(StorageError::SubstrateMigrationTooLarge {
-                projected_peak, ..
+                projected_peak,
+                ..
             }) => {
                 assert_eq!(
                     projected_peak, margined,
@@ -6383,7 +6404,9 @@ mod tests {
         assert!(
             matches!(
                 still_v2,
-                Err(PulseDBError::Storage(StorageError::SubstrateUpgradeRequired { .. }))
+                Err(PulseDBError::Storage(
+                    StorageError::SubstrateUpgradeRequired { .. }
+                ))
             ),
             "fail-closed open must NOT have upgraded the file"
         );
@@ -6452,7 +6475,10 @@ mod tests {
         assert_eq!(stored.freq_weight, 0.25);
         assert_eq!(stored.floor, 0.1);
         assert!(stored.auto_archive_below_floor);
-        assert_eq!(stored.default_recall_weights, Some(RecallWeights::new(0.6, 0.4)));
+        assert_eq!(
+            stored.default_recall_weights,
+            Some(RecallWeights::new(0.6, 0.4))
+        );
 
         // Round-trips through the public DecayConfig conversion.
         let cfg: DecayConfig = stored.into();

@@ -210,7 +210,10 @@ mod tests {
         assert!(!SyncError::serialization("x").is_wire_format_mismatch());
 
         // Distinct from protocol-semantics ProtocolVersion.
-        assert!(matches!(bad_magic, SyncError::WireFormatMismatch { got: None, .. }));
+        assert!(matches!(
+            bad_magic,
+            SyncError::WireFormatMismatch { got: None, .. }
+        ));
         assert!(matches!(
             wrong_ver,
             SyncError::WireFormatMismatch {

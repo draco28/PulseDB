@@ -54,7 +54,7 @@
 
 #![cfg(feature = "fault-injection")]
 
-use pulsedb::fault_injection::{disarm, ArmGuard, Action, Boundary};
+use pulsedb::fault_injection::{disarm, Action, ArmGuard, Boundary};
 use pulsedb::{Config, ExperienceId, PulseDB};
 use redb::{ReadableDatabase, TableDefinition};
 use serde_json::Value;
@@ -144,8 +144,9 @@ fn crash_open(store: &Path, boundary: Boundary) {
     // injection at THIS boundary — not from some other migration failure. A bare
     // `is_err()` check would accept any panic and let a real bug (or a no-op
     // injection that happened to panic elsewhere) masquerade as a fired boundary.
-    let payload =
-        result.err().unwrap_or_else(|| panic!("injection at {boundary:?} did not fire — migrating open returned Ok"));
+    let payload = result.err().unwrap_or_else(|| {
+        panic!("injection at {boundary:?} did not fire — migrating open returned Ok")
+    });
     let msg = payload
         .downcast_ref::<String>()
         .map(|s| s.as_str())
@@ -173,7 +174,11 @@ fn assert_clean_rerun_value_identical(store: &Path, manifest: &Value) {
     );
     let db = PulseDB::open(store, Config::default())
         .unwrap_or_else(|e| panic!("clean re-run migrate+open failed: {e:?}"));
-    assert_eq!(db.metadata().schema_version, 3, "re-run must reach schema v3");
+    assert_eq!(
+        db.metadata().schema_version,
+        3,
+        "re-run must reach schema v3"
+    );
     // marker is now CURRENT ({redb-v3, postcard}) — the migration completed.
     // (re-open must be dropped before reading the marker via a 2nd redb handle)
     let colls = db.list_collectives().unwrap();
@@ -195,7 +200,10 @@ fn assert_clean_rerun_value_identical(store: &Path, manifest: &Value) {
         "re-run experience content must be value-identical to the manifest"
     );
     drop(db);
-    assert!(marker_is_current(store), "after a clean re-run the marker must be CURRENT");
+    assert!(
+        marker_is_current(store),
+        "after a clean re-run the marker must be CURRENT"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -229,22 +237,38 @@ fn write_txn_boundary_rolls_back(fixture: &str, manifest_name: &str, boundary: B
 
 #[test]
 fn prereencode_crash_rolls_back_v0_4_0() {
-    write_txn_boundary_rolls_back("real-v0.4.0.redb", "real-v0.4.0.manifest.json", Boundary::PreReencode);
+    write_txn_boundary_rolls_back(
+        "real-v0.4.0.redb",
+        "real-v0.4.0.manifest.json",
+        Boundary::PreReencode,
+    );
 }
 
 #[test]
 fn midreencode_crash_rolls_back_v0_4_0() {
-    write_txn_boundary_rolls_back("real-v0.4.0.redb", "real-v0.4.0.manifest.json", Boundary::MidReencode);
+    write_txn_boundary_rolls_back(
+        "real-v0.4.0.redb",
+        "real-v0.4.0.manifest.json",
+        Boundary::MidReencode,
+    );
 }
 
 #[test]
 fn premarker_crash_rolls_back_v0_4_0() {
-    write_txn_boundary_rolls_back("real-v0.4.0.redb", "real-v0.4.0.manifest.json", Boundary::PreMarker);
+    write_txn_boundary_rolls_back(
+        "real-v0.4.0.redb",
+        "real-v0.4.0.manifest.json",
+        Boundary::PreMarker,
+    );
 }
 
 #[test]
 fn premarker_crash_rolls_back_v0_5_1() {
-    write_txn_boundary_rolls_back("real-v0.5.1.redb", "real-v0.5.1.manifest.json", Boundary::PreMarker);
+    write_txn_boundary_rolls_back(
+        "real-v0.5.1.redb",
+        "real-v0.5.1.manifest.json",
+        Boundary::PreMarker,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -265,9 +289,15 @@ fn post_redb_upgrade_crash_leaves_pristine_sidecar_v0_4_0() {
     // `.pre-substrate.bak` operator rollback artifact exists and is byte-identical
     // to the original fixture. (Automatic recovery below is re-migration of the
     // already-v3 store, not a restore-from-sidecar — no such consumer exists.)
-    assert!(!marker_is_current(&store), "post-upgrade crash: marker must not be CURRENT");
+    assert!(
+        !marker_is_current(&store),
+        "post-upgrade crash: marker must not be CURRENT"
+    );
     let bak = pre_substrate_bak(&store);
-    assert!(bak.exists(), "PostRedbUpgrade must leave a `.pre-substrate.bak` rollback point");
+    assert!(
+        bak.exists(),
+        "PostRedbUpgrade must leave a `.pre-substrate.bak` rollback point"
+    );
     let bak_bytes = std::fs::read(&bak).unwrap();
     assert_eq!(
         bak_bytes, original,
@@ -330,11 +360,17 @@ fn marker1_redb_v3_bincode_needs_no_sidecar_53b() {
     // bincode, Absent-marker} rung (functionally marker-1: already redb-v3, still
     // bincode, needs the codec migration, classifies to needs_marker_write=true).
     crash_open(&store, Boundary::PreReencode);
-    assert!(!marker_is_current(&store), "stage-1: {{redb-v3, bincode}} store must not be at CURRENT marker");
+    assert!(
+        !marker_is_current(&store),
+        "stage-1: {{redb-v3, bincode}} store must not be at CURRENT marker"
+    );
     // Remove stage-1's sidecar so we can prove stage 2 creates NONE.
     let bak = pre_substrate_bak(&store);
     let _ = std::fs::remove_file(&bak);
-    assert!(!bak.exists(), "sidecar removed to set up the #53b no-sidecar assertion");
+    assert!(
+        !bak.exists(),
+        "sidecar removed to set up the #53b no-sidecar assertion"
+    );
 
     // Stage 2 (#53b): crash the ALREADY-redb-v3 store at MidReencode. Because the
     // file is already redb-v3, create_or_migrate NEVER takes the destructive arm →
@@ -346,7 +382,10 @@ fn marker1_redb_v3_bincode_needs_no_sidecar_53b() {
         !bak.exists(),
         "#53b: a crash migrating an already-redb-v3 {{redb-v3, bincode}} store must create NO `.pre-substrate.bak` (single-atomic-txn rollback, no sidecar needed)"
     );
-    assert!(!marker_is_current(&store), "stage-2: marker must still not be CURRENT after the rolled-back txn");
+    assert!(
+        !marker_is_current(&store),
+        "stage-2: marker must still not be CURRENT after the rolled-back txn"
+    );
 
     // Stage 3: a clean re-run migrates the {redb-v3, bincode} store value-identically.
     assert_clean_rerun_value_identical(&store, &manifest);
@@ -383,7 +422,12 @@ fn sigkill_at_premarker_reopens_pristine_and_survives_locks_v0_4_0() {
     // Re-exec THIS test binary to run only the child entry, pointed at the store.
     let exe = std::env::current_exe().unwrap();
     let status = std::process::Command::new(exe)
-        .args(["--exact", "zzz_sigkill_child_entry", "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            "zzz_sigkill_child_entry",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env("FI_SIGKILL_STORE", &store)
         .status()
         .expect("spawn SIGKILL child");

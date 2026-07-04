@@ -15,12 +15,12 @@ use axum::Router;
 use tokio::net::TcpListener;
 
 use pulsedb::sync::config::{SyncConfig, SyncDirection};
+use pulsedb::sync::error::SyncError;
 use pulsedb::sync::guard::SyncApplyGuard;
 use pulsedb::sync::manager::SyncManager;
 use pulsedb::sync::server::SyncServer;
 use pulsedb::sync::transport::SyncTransport;
 use pulsedb::sync::transport_http::HttpSyncTransport;
-use pulsedb::sync::error::SyncError;
 use pulsedb::sync::types::{HandshakeRequest, InstanceId, PullRequest, SyncCursor};
 use pulsedb::sync::{
     read_wire_preamble, write_wire_preamble, SYNC_PROTOCOL_VERSION, SYNC_WIRE_MAGIC,
@@ -321,7 +321,11 @@ async fn test_wire_preamble_roundtrip_both_directions() {
 
     // Client side: frame a valid postcard body with the preamble.
     let framed_request = write_wire_preamble(&handshake_body_bytes());
-    assert_eq!(&framed_request[..2], &SYNC_WIRE_MAGIC, "magic leads the frame");
+    assert_eq!(
+        &framed_request[..2],
+        &SYNC_WIRE_MAGIC,
+        "magic leads the frame"
+    );
     assert_eq!(
         framed_request[2], WIRE_FORMAT_VERSION,
         "version byte follows magic"
@@ -333,8 +337,8 @@ async fn test_wire_preamble_roundtrip_both_directions() {
         .expect("valid framed handshake must succeed");
 
     // The RESPONSE also carries the preamble (the other direction).
-    let payload = read_wire_preamble(&framed_response)
-        .expect("server response must carry a valid preamble");
+    let payload =
+        read_wire_preamble(&framed_response).expect("server response must carry a valid preamble");
     let response: pulsedb::sync::types::HandshakeResponse =
         postcard::from_bytes(payload).expect("response body decodes after preamble strip");
     assert!(response.accepted, "matched-version handshake is accepted");
@@ -387,7 +391,10 @@ async fn test_wire_preamble_wrong_version_is_typed() {
         .handle_handshake_bytes(&framed)
         .expect_err("wrong wire version must fail");
 
-    assert!(err.is_wire_format_mismatch(), "wrong version is typed, got: {err:?}");
+    assert!(
+        err.is_wire_format_mismatch(),
+        "wrong version is typed, got: {err:?}"
+    );
     assert!(
         matches!(
             err,
@@ -453,8 +460,7 @@ async fn test_protocol_version_mismatch_still_soft_rejects_through_preamble() {
         .expect("a wire-valid handshake reaches the protocol-version gate");
 
     let payload = read_wire_preamble(&framed_response).expect("response is framed");
-    let response: pulsedb::sync::types::HandshakeResponse =
-        postcard::from_bytes(payload).unwrap();
+    let response: pulsedb::sync::types::HandshakeResponse = postcard::from_bytes(payload).unwrap();
     assert!(
         !response.accepted,
         "protocol-version mismatch still yields the soft accepted:false path"

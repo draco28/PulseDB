@@ -56,9 +56,7 @@
 //! `redb = "4.1"` dev-dependency — the same technique 4.01's generator used. The
 //! guarantee is identical; the inspector is named `raw_table_bytes` per the AC.
 
-use pulsedb::{
-    CollectiveId, Config, ExperienceId, InsightId, PulseDB, RelationId,
-};
+use pulsedb::{CollectiveId, Config, ExperienceId, InsightId, PulseDB, RelationId};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -96,7 +94,14 @@ fn hex(bytes: &[u8]) -> String {
 fn uuid_str(b: &[u8]) -> String {
     let h = hex(b);
     if h.len() == 32 {
-        format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+        format!(
+            "{}-{}-{}-{}-{}",
+            &h[0..8],
+            &h[8..12],
+            &h[12..16],
+            &h[16..20],
+            &h[20..32]
+        )
     } else {
         h
     }
@@ -127,7 +132,10 @@ fn assert_fields_eq(label: &str, manifest: &Value, readback: &Value, keys: &[&st
     for k in keys {
         let m = manifest.get(*k).unwrap_or(&Value::Null);
         let r = readback.get(*k).unwrap_or(&Value::Null);
-        assert_eq!(m, r, "{label}: field `{k}` differs (manifest={m}, migrated={r})");
+        assert_eq!(
+            m, r,
+            "{label}: field `{k}` differs (manifest={m}, migrated={r})"
+        );
     }
 }
 
@@ -171,16 +179,46 @@ struct Fixture {
 // Fields identical across the migration for every fixture (excludes the
 // reshape-derived `applications` / `last_reinforced` + serde-skipped `embedding`).
 const EXP_STABLE: &[&str] = &[
-    "id", "collective_id", "content", "experience_type", "importance", "confidence",
-    "domain", "related_files", "source_agent", "source_task", "timestamp", "archived",
+    "id",
+    "collective_id",
+    "content",
+    "experience_type",
+    "importance",
+    "confidence",
+    "domain",
+    "related_files",
+    "source_agent",
+    "source_task",
+    "timestamp",
+    "archived",
 ];
-const COLL_STABLE: &[&str] =
-    &["id", "name", "owner_id", "embedding_dimension", "created_at", "updated_at"];
-const REL_STABLE: &[&str] =
-    &["id", "source_id", "target_id", "relation_type", "strength", "metadata", "created_at"];
+const COLL_STABLE: &[&str] = &[
+    "id",
+    "name",
+    "owner_id",
+    "embedding_dimension",
+    "created_at",
+    "updated_at",
+];
+const REL_STABLE: &[&str] = &[
+    "id",
+    "source_id",
+    "target_id",
+    "relation_type",
+    "strength",
+    "metadata",
+    "created_at",
+];
 const INS_STABLE: &[&str] = &[
-    "id", "collective_id", "content", "insight_type", "confidence", "domain",
-    "source_experience_ids", "created_at", "updated_at",
+    "id",
+    "collective_id",
+    "content",
+    "insight_type",
+    "confidence",
+    "domain",
+    "source_experience_ids",
+    "created_at",
+    "updated_at",
 ];
 
 fn verify_fixture(fx: &Fixture) {
@@ -199,7 +237,12 @@ fn verify_fixture(fx: &Fixture) {
     let (_tmp, store) = copy_fixture(fx.redb);
     let db = PulseDB::open(&store, Config::default())
         .unwrap_or_else(|e| panic!("{}: migrate+open failed: {e:?}", fx.redb));
-    assert_eq!(db.metadata().schema_version, 3, "{}: expected schema v3 post-migration", fx.redb);
+    assert_eq!(
+        db.metadata().schema_version,
+        3,
+        "{}: expected schema v3 post-migration",
+        fx.redb
+    );
 
     let storage = db.storage_for_test();
 
@@ -325,7 +368,13 @@ fn verify_fixture(fx: &Fixture) {
             .list_experiences(cid, 10_000, 0)
             .unwrap()
             .iter()
-            .map(|e| serde_json::to_value(e.id).unwrap().as_str().unwrap().to_string())
+            .map(|e| {
+                serde_json::to_value(e.id)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
             .collect();
         for want in expected_ids {
             assert!(
@@ -350,7 +399,13 @@ fn verify_fixture(fx: &Fixture) {
         .search_similar(cid, &query, k)
         .unwrap()
         .iter()
-        .map(|r| serde_json::to_value(r.experience.id).unwrap().as_str().unwrap().to_string())
+        .map(|r| {
+            serde_json::to_value(r.experience.id)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
         .collect();
     let want_ids: Vec<String> = es["top_k"]
         .as_array()
@@ -381,8 +436,12 @@ fn verify_fixture(fx: &Fixture) {
     }
 
     // ---- RAW metadata keys: substrate_format marker + instance_id semantics.
-    let marker = raw_table_bytes(&store, "substrate_format")
-        .unwrap_or_else(|| panic!("{}: substrate_format marker missing post-migration", fx.redb));
+    let marker = raw_table_bytes(&store, "substrate_format").unwrap_or_else(|| {
+        panic!(
+            "{}: substrate_format marker missing post-migration",
+            fx.redb
+        )
+    });
     assert_eq!(
         marker,
         SUBSTRATE_MARKER.to_vec(),
@@ -409,9 +468,17 @@ fn verify_fixture(fx: &Fixture) {
                 fx.redb
             );
             let got = instance_id.unwrap_or_else(|| {
-                panic!("{}: instance_id should be MINTED during v2→v3 migration", fx.redb)
+                panic!(
+                    "{}: instance_id should be MINTED during v2→v3 migration",
+                    fx.redb
+                )
             });
-            assert_eq!(got.len(), 16, "{}: minted instance_id must be a 16-byte uuid", fx.redb);
+            assert_eq!(
+                got.len(),
+                16,
+                "{}: minted instance_id must be a 16-byte uuid",
+                fx.redb
+            );
         }
     }
 }
@@ -474,7 +541,10 @@ fn truncated_fixture_fails_explicitly() {
     // A truncated store must fail LOUDLY (Err or panic), never open silently.
     let (_tmp, store) = copy_fixture("real-v0.4.0.redb");
     {
-        let f = std::fs::OpenOptions::new().write(true).open(&store).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&store)
+            .unwrap();
         f.set_len(8192).unwrap(); // brutal truncation → corrupt redb file
     }
     let outcome = std::panic::catch_unwind(|| PulseDB::open(&store, Config::default()));

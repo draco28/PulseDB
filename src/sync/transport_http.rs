@@ -145,8 +145,8 @@ impl SyncTransport for HttpSyncTransport {
         // both directions. Encode the body, frame it with the preamble, then
         // on the response validate the preamble by raw byte-slice BEFORE
         // deserializing — so a cross-version server fails loud here too.
-        let encoded = postcard::to_allocvec(&request)
-            .map_err(|e| SyncError::serialization(e.to_string()))?;
+        let encoded =
+            postcard::to_allocvec(&request).map_err(|e| SyncError::serialization(e.to_string()))?;
         let framed = write_wire_preamble(&encoded);
         let response_bytes = self.post_raw("/sync/handshake", framed).await?;
         let payload = read_wire_preamble(&response_bytes)?;

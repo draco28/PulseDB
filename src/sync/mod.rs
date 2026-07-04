@@ -153,7 +153,10 @@ pub fn read_wire_preamble(framed: &[u8]) -> Result<&[u8], error::SyncError> {
     }
     let got = framed[SYNC_WIRE_MAGIC.len()];
     if got != WIRE_FORMAT_VERSION {
-        return Err(error::SyncError::wire_format_version(WIRE_FORMAT_VERSION, got));
+        return Err(error::SyncError::wire_format_version(
+            WIRE_FORMAT_VERSION,
+            got,
+        ));
     }
     Ok(&framed[SYNC_WIRE_PREAMBLE_LEN..])
 }
