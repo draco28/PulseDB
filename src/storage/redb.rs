@@ -317,6 +317,25 @@ impl MigrationLock {
     }
 }
 
+/// Classifies a raw OS I/O error as database-file lock contention. On Windows a
+/// concurrent opener contending for the file (e.g. during the one-time pre-v3
+/// backup copy, while another process still holds the redb file lock) surfaces as
+/// `ERROR_SHARING_VIOLATION` (32) or `ERROR_LOCK_VIOLATION` (33) rather than
+/// redb's typed `DatabaseAlreadyOpen`. Mapping these to the typed, retryable
+/// [`StorageError::DatabaseLocked`] keeps the concurrency contract (audit C2)
+/// cross-platform. NOTE: Unix errno 32/33 are `EPIPE`/`EDOM` (unrelated), so this
+/// classification is Windows-only; the non-Windows stub always returns `false`.
+#[cfg(windows)]
+fn is_lock_contention_io_error(error: &std::io::Error) -> bool {
+    // ERROR_SHARING_VIOLATION = 32, ERROR_LOCK_VIOLATION = 33.
+    matches!(error.raw_os_error(), Some(32) | Some(33))
+}
+
+#[cfg(not(windows))]
+fn is_lock_contention_io_error(_error: &std::io::Error) -> bool {
+    false
+}
+
 /// Runs the one-time redb file-format upgrade (v2 → v3) in place via the aliased
 /// redb 2.6 dependency, then drops the 2.6 handle to release its lock.
 ///
@@ -864,6 +883,15 @@ impl RedbStorage {
                     if let Err(error) = copy_result {
                         drop(backup_file);
                         let _ = std::fs::remove_file(&backup_path);
+                        // A concurrent opener still holding the redb file lock
+                        // surfaces on Windows as a raw lock/sharing violation on this
+                        // copy; classify it as the typed, retryable DatabaseLocked
+                        // (audit C2) — matching the redb DatabaseAlreadyOpen path —
+                        // rather than leaking a generic Io error the caller's
+                        // contention-retry loop cannot recognize.
+                        if is_lock_contention_io_error(&error) {
+                            return Err(PulseDBError::Storage(StorageError::DatabaseLocked));
+                        }
                         return Err(PulseDBError::Io(error));
                     }
                 }
@@ -6879,7 +6907,10 @@ mod tests {
         ///
         /// Each entry is `(redb table name, is_serde_blob)`.
         fn schema_audit_tables() -> Vec<(&'static str, bool)> {
-            let tables: Vec<(&'static str, bool)> = vec![
+            // `mut` is used only under `sync` (the `sync_cursors` push below); the
+            // default-feature build leaves it unmutated, so silence unused_mut there.
+            #[cfg_attr(not(feature = "sync"), allow(unused_mut))]
+            let mut tables: Vec<(&'static str, bool)> = vec![
                 // --- serde-blob tables (decoded ⇒ must be in SERDE_BLOB_TABLES) ---
                 (METADATA_TABLE.name(), true),
                 (COLLECTIVES_TABLE.name(), true),
