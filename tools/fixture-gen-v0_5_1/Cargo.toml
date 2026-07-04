@@ -1,0 +1,29 @@
+# Fixture generator for the REAL published pulsehive-db =0.5.1 (schema-v3) store.
+#
+# ISOLATION (audit C9): this crate lives OUTSIDE the production cargo workspace.
+# The empty [workspace] table below makes THIS Cargo.toml its own workspace root,
+# so cargo never walks up into the production root manifest — the production root
+# Cargo.toml is a single [package] with NO [workspace]/exclude and stays that way.
+# Build only via an explicit `--manifest-path` (see README) so it never joins the
+# production build/test graph.
+[package]
+name = "fixture-gen-v0_5_1"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Own workspace root — do NOT remove (isolation from the production crate).
+[workspace]
+
+[dependencies]
+# Pinned EXACTLY to the published prior release so the generator resolves the
+# real crates.io artifact (never a local path override). Default features only
+# (no `builtin-embeddings` → no ONNX/ort); embeddings are injected as raw f32
+# vectors via the External embedding provider.
+pulsehive-db = "=0.5.1"
+serde_json = "1"
+# redb is pinned to the SAME major/minor the published crate resolves transitively
+# (2.6.x), so we can re-open the frozen store read-only and dump the GENUINE
+# on-disk raw bytes of the copy-through tables (embeddings + secondary indexes)
+# as manifest ground truth (audit C4) — not a reconstruction.
+redb = "2.6"

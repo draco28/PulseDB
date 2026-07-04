@@ -196,7 +196,7 @@ pub struct Experience {
 
     /// Semantic embedding vector. Immutable after creation.
     ///
-    /// Stored separately in EMBEDDINGS_TABLE; skipped during bincode
+    /// Stored separately in EMBEDDINGS_TABLE; skipped during postcard
     /// serialization of the main experience record.
     #[serde(skip)]
     pub embedding: Vec<f32>,
@@ -348,15 +348,15 @@ mod tests {
     // ====================================================================
 
     #[test]
-    fn test_severity_bincode_roundtrip() {
+    fn test_severity_postcard_roundtrip() {
         for severity in [
             Severity::Low,
             Severity::Medium,
             Severity::High,
             Severity::Critical,
         ] {
-            let bytes = bincode::serialize(&severity).unwrap();
-            let restored: Severity = bincode::deserialize(&bytes).unwrap();
+            let bytes = postcard::to_stdvec(&severity).unwrap();
+            let restored: Severity = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(severity, restored);
         }
     }
@@ -453,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn test_experience_type_bincode_roundtrip_all_variants() {
+    fn test_experience_type_postcard_roundtrip_all_variants() {
         let variants = vec![
             ExperienceType::Difficulty {
                 description: "compile error".into(),
@@ -495,8 +495,8 @@ mod tests {
         ];
 
         for variant in variants {
-            let bytes = bincode::serialize(&variant).unwrap();
-            let restored: ExperienceType = bincode::deserialize(&bytes).unwrap();
+            let bytes = postcard::to_stdvec(&variant).unwrap();
+            let restored: ExperienceType = postcard::from_bytes(&bytes).unwrap();
             // Compare tags as a proxy (associated data is different types per variant)
             assert_eq!(variant.type_tag(), restored.type_tag());
         }
@@ -507,7 +507,7 @@ mod tests {
     // ====================================================================
 
     #[test]
-    fn test_experience_bincode_roundtrip() {
+    fn test_experience_postcard_roundtrip() {
         let timestamp = Timestamp::now();
         let exp = Experience {
             id: ExperienceId::new(),
@@ -530,8 +530,8 @@ mod tests {
             archived: false,
         };
 
-        let bytes = bincode::serialize(&exp).unwrap();
-        let restored: Experience = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_stdvec(&exp).unwrap();
+        let restored: Experience = postcard::from_bytes(&bytes).unwrap();
 
         assert_eq!(exp.id, restored.id);
         assert_eq!(exp.collective_id, restored.collective_id);
@@ -575,7 +575,7 @@ mod tests {
             archived: false,
         };
 
-        let bytes = bincode::serialize(&exp).unwrap();
+        let bytes = postcard::to_stdvec(&exp).unwrap();
         // If embedding were included, size would be > 1,536 bytes.
         // With skip, it should be much smaller.
         assert!(

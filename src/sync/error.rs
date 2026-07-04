@@ -43,6 +43,30 @@ pub enum SyncError {
         remote: u32,
     },
 
+    /// Wire-format preamble mismatch — caught by raw-byte inspection of the
+    /// 3-byte preamble *before* any deserialize, so a serializer mismatch
+    /// (e.g. a bincode-era peer vs a postcard-era peer) fails loud with a
+    /// typed error instead of yielding garbage through the decoder.
+    ///
+    /// This is distinct from [`SyncError::ProtocolVersion`]: that variant is
+    /// protocol-*semantics* (negotiated in-band after a successful decode);
+    /// this variant is wire-*format* (the bytes can't be trusted to decode at
+    /// all). Two failure shapes feed it:
+    ///
+    /// - **bad magic** (`got == None`): the leading bytes are not a PulseDB
+    ///   sync preamble at all (truncated body, a non-PulseDB POST, or a
+    ///   pre-4.0 no-preamble peer's body) — reported with `got: None`.
+    /// - **wrong version** (`got == Some(v)`): a valid magic but a
+    ///   `wire_format_version` byte this peer does not speak.
+    #[error("Sync wire-format mismatch: expected wire format v{expected}, got {}", match got { Some(g) => format!("v{g}"), None => "bad/absent magic".to_string() })]
+    WireFormatMismatch {
+        /// The wire-format version this peer speaks.
+        expected: u8,
+        /// The wire-format version observed in the preamble, or `None` when the
+        /// magic bytes were absent/wrong (so no trustworthy version was read).
+        got: Option<u8>,
+    },
+
     /// Received an invalid or unrecognized payload.
     #[error("Invalid sync payload: {0}")]
     InvalidPayload(String),
@@ -80,6 +104,28 @@ impl SyncError {
         Self::InvalidPayload(msg.into())
     }
 
+    /// Creates a wire-format mismatch for a **bad / absent magic** preamble.
+    ///
+    /// Used when the leading bytes are not a recognizable PulseDB sync
+    /// preamble (truncated body, wrong magic, or a pre-preamble peer's body).
+    pub fn wire_format_bad_magic(expected: u8) -> Self {
+        Self::WireFormatMismatch {
+            expected,
+            got: None,
+        }
+    }
+
+    /// Creates a wire-format mismatch for a **wrong wire-format version**.
+    ///
+    /// Used when the magic is valid but the `wire_format_version` byte names a
+    /// version this peer does not speak.
+    pub fn wire_format_version(expected: u8, got: u8) -> Self {
+        Self::WireFormatMismatch {
+            expected,
+            got: Some(got),
+        }
+    }
+
     /// Returns true if this is a transport error.
     pub fn is_transport(&self) -> bool {
         matches!(self, Self::Transport(_))
@@ -99,10 +145,17 @@ impl SyncError {
     pub fn is_shutdown(&self) -> bool {
         matches!(self, Self::Shutdown)
     }
+
+    /// Returns true if this is a wire-format mismatch (bad magic OR wrong
+    /// wire-format version) — the typed fail-loud signal for cross-version
+    /// sync, distinct from a generic [`SyncError::Serialization`].
+    pub fn is_wire_format_mismatch(&self) -> bool {
+        matches!(self, Self::WireFormatMismatch { .. })
+    }
 }
 
-impl From<bincode::Error> for SyncError {
-    fn from(err: bincode::Error) -> Self {
+impl From<postcard::Error> for SyncError {
+    fn from(err: postcard::Error) -> Self {
         SyncError::Serialization(err.to_string())
     }
 }
@@ -138,11 +191,35 @@ mod tests {
     }
 
     #[test]
-    fn test_bincode_error_conversion() {
-        // Deserializing truncated bytes triggers a bincode error
-        let bad_bytes = vec![0u8; 1]; // too short for a (u64, u64)
-        let bincode_err = bincode::deserialize::<(u64, u64)>(&bad_bytes).unwrap_err();
-        let sync_err: SyncError = bincode_err.into();
+    fn test_postcard_error_conversion() {
+        // Deserializing truncated bytes triggers a postcard error.
+        let bad_bytes = vec![0u8; 0]; // too short for a (u64, u64)
+        let postcard_err = postcard::from_bytes::<(u64, u64)>(&bad_bytes).unwrap_err();
+        let sync_err: SyncError = postcard_err.into();
         assert!(matches!(sync_err, SyncError::Serialization(_)));
+    }
+
+    #[test]
+    fn test_wire_format_mismatch_typed_and_distinct() {
+        let bad_magic = SyncError::wire_format_bad_magic(3);
+        let wrong_ver = SyncError::wire_format_version(3, 2);
+
+        // Both are the typed wire-format signal, NOT a generic Serialization.
+        assert!(bad_magic.is_wire_format_mismatch());
+        assert!(wrong_ver.is_wire_format_mismatch());
+        assert!(!SyncError::serialization("x").is_wire_format_mismatch());
+
+        // Distinct from protocol-semantics ProtocolVersion.
+        assert!(matches!(
+            bad_magic,
+            SyncError::WireFormatMismatch { got: None, .. }
+        ));
+        assert!(matches!(
+            wrong_ver,
+            SyncError::WireFormatMismatch {
+                expected: 3,
+                got: Some(2)
+            }
+        ));
     }
 }

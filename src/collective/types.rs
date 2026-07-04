@@ -22,7 +22,7 @@ use crate::types::{CollectiveId, Timestamp};
 ///
 /// # Serialization
 ///
-/// Collectives are serialized with bincode for compact storage in redb.
+/// Collectives are serialized with postcard for compact storage in redb.
 /// The `Serialize`/`Deserialize` derives enable this automatically.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Collective {
@@ -118,10 +118,10 @@ mod tests {
     }
 
     #[test]
-    fn test_collective_bincode_roundtrip() {
+    fn test_collective_postcard_roundtrip() {
         let collective = Collective::new("roundtrip-test", 384);
-        let bytes = bincode::serialize(&collective).unwrap();
-        let restored: Collective = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_stdvec(&collective).unwrap();
+        let restored: Collective = postcard::from_bytes(&bytes).unwrap();
 
         assert_eq!(collective.id, restored.id);
         assert_eq!(collective.name, restored.name);
@@ -132,10 +132,10 @@ mod tests {
     }
 
     #[test]
-    fn test_collective_bincode_roundtrip_with_owner() {
+    fn test_collective_postcard_roundtrip_with_owner() {
         let collective = Collective::with_owner("owned-project", "tenant-42", 768);
-        let bytes = bincode::serialize(&collective).unwrap();
-        let restored: Collective = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_stdvec(&collective).unwrap();
+        let restored: Collective = postcard::from_bytes(&bytes).unwrap();
 
         assert_eq!(collective.id, restored.id);
         assert_eq!(collective.owner_id, restored.owner_id);

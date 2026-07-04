@@ -422,8 +422,8 @@ mod tests {
     #[test]
     fn test_collective_id_serialization() {
         let id = CollectiveId::new();
-        let bytes = bincode::serialize(&id).unwrap();
-        let restored: CollectiveId = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_stdvec(&id).unwrap();
+        let restored: CollectiveId = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(id, restored);
     }
 
@@ -437,8 +437,8 @@ mod tests {
     #[test]
     fn test_experience_id_serialization() {
         let id = ExperienceId::new();
-        let bytes = bincode::serialize(&id).unwrap();
-        let restored: ExperienceId = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_stdvec(&id).unwrap();
+        let restored: ExperienceId = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(id, restored);
     }
 
@@ -466,8 +466,8 @@ mod tests {
     #[test]
     fn test_relation_id_serialization() {
         let id = RelationId::new();
-        let bytes = bincode::serialize(&id).unwrap();
-        let restored: RelationId = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_stdvec(&id).unwrap();
+        let restored: RelationId = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(id, restored);
     }
 
@@ -495,8 +495,8 @@ mod tests {
     #[test]
     fn test_insight_id_serialization() {
         let id = InsightId::new();
-        let bytes = bincode::serialize(&id).unwrap();
-        let restored: InsightId = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_stdvec(&id).unwrap();
+        let restored: InsightId = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(id, restored);
     }
 

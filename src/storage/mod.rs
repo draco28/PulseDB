@@ -22,6 +22,7 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
+pub(crate) mod legacy_bincode;
 pub mod redb;
 pub mod schema;
 

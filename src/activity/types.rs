@@ -91,7 +91,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_activity_bincode_roundtrip() {
+    fn test_activity_postcard_roundtrip() {
         let activity = Activity {
             agent_id: "claude-opus".to_string(),
             collective_id: CollectiveId::new(),
@@ -101,8 +101,8 @@ mod tests {
             last_heartbeat: Timestamp::now(),
         };
 
-        let bytes = bincode::serialize(&activity).unwrap();
-        let restored: Activity = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_stdvec(&activity).unwrap();
+        let restored: Activity = postcard::from_bytes(&bytes).unwrap();
 
         assert_eq!(activity.agent_id, restored.agent_id);
         assert_eq!(activity.collective_id, restored.collective_id);
@@ -123,8 +123,8 @@ mod tests {
             last_heartbeat: Timestamp::from_millis(2000),
         };
 
-        let bytes = bincode::serialize(&activity).unwrap();
-        let restored: Activity = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_stdvec(&activity).unwrap();
+        let restored: Activity = postcard::from_bytes(&bytes).unwrap();
 
         assert_eq!(activity.agent_id, restored.agent_id);
         assert!(restored.current_task.is_none());

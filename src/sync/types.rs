@@ -335,10 +335,10 @@ mod tests {
     }
 
     #[test]
-    fn test_instance_id_bincode_roundtrip() {
+    fn test_instance_id_postcard_roundtrip() {
         let id = InstanceId::new();
-        let bytes = bincode::serialize(&id).unwrap();
-        let restored: InstanceId = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_allocvec(&id).unwrap();
+        let restored: InstanceId = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(id, restored);
     }
 
@@ -351,13 +351,13 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_cursor_bincode_roundtrip() {
+    fn test_sync_cursor_postcard_roundtrip() {
         let cursor = SyncCursor {
             instance_id: InstanceId::new(),
             last_sequence: 42,
         };
-        let bytes = bincode::serialize(&cursor).unwrap();
-        let restored: SyncCursor = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_allocvec(&cursor).unwrap();
+        let restored: SyncCursor = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(cursor, restored);
     }
 
@@ -403,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn test_serializable_experience_update_bincode_roundtrip() {
+    fn test_serializable_experience_update_postcard_roundtrip() {
         let update = SerializableExperienceUpdate {
             importance: Some(0.7),
             confidence: Some(0.9),
@@ -413,8 +413,8 @@ mod tests {
             applications: Some(std::collections::BTreeMap::from([(InstanceId::new(), 2)])),
             last_reinforced: Some(Timestamp::now()),
         };
-        let bytes = bincode::serialize(&update).unwrap();
-        let restored: SerializableExperienceUpdate = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_allocvec(&update).unwrap();
+        let restored: SerializableExperienceUpdate = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(update.importance, restored.importance);
         assert_eq!(update.confidence, restored.confidence);
         assert_eq!(update.domain, restored.domain);
@@ -431,34 +431,34 @@ mod tests {
     }
 
     #[test]
-    fn test_handshake_request_bincode_roundtrip() {
+    fn test_handshake_request_postcard_roundtrip() {
         let req = HandshakeRequest {
             instance_id: InstanceId::new(),
             protocol_version: crate::sync::SYNC_PROTOCOL_VERSION,
             capabilities: vec!["push".to_string(), "pull".to_string()],
         };
-        let bytes = bincode::serialize(&req).unwrap();
-        let restored: HandshakeRequest = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_allocvec(&req).unwrap();
+        let restored: HandshakeRequest = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(req.instance_id, restored.instance_id);
         assert_eq!(req.protocol_version, restored.protocol_version);
         assert_eq!(req.capabilities, restored.capabilities);
     }
 
     #[test]
-    fn test_pull_request_bincode_roundtrip() {
+    fn test_pull_request_postcard_roundtrip() {
         let req = PullRequest {
             cursor: SyncCursor::new(InstanceId::new()),
             batch_size: 500,
             collectives: Some(vec![CollectiveId::new()]),
         };
-        let bytes = bincode::serialize(&req).unwrap();
-        let restored: PullRequest = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_allocvec(&req).unwrap();
+        let restored: PullRequest = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(req.cursor, restored.cursor);
         assert_eq!(req.batch_size, restored.batch_size);
     }
 
     #[test]
-    fn test_push_response_bincode_roundtrip() {
+    fn test_push_response_postcard_roundtrip() {
         let resp = PushResponse {
             accepted: 10,
             rejected: 2,
@@ -467,8 +467,8 @@ mod tests {
                 last_sequence: 100,
             },
         };
-        let bytes = bincode::serialize(&resp).unwrap();
-        let restored: PushResponse = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_allocvec(&resp).unwrap();
+        let restored: PushResponse = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(resp.accepted, restored.accepted);
         assert_eq!(resp.rejected, restored.rejected);
         assert_eq!(resp.new_cursor, restored.new_cursor);

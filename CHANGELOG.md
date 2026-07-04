@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Storage value codec migrated from bincode to postcard** (`SUBSTRATE_FORMAT` marker 1→2). Existing stores upgrade on first writable open via a one-time codec re-encode; embeddings and secondary indexes are copied through byte-identically. See **[docs/storage-migration.md](docs/storage-migration.md)** for the migration & crash-recovery posture — the disk+memory headroom preflight, the single-transaction "re-run from scratch on crash" contract, and the large-store fail-closed behavior.
+
+### Removed
+- **Dropped the unmaintained `bincode` crate dependency** (RUSTSEC-2025-0141) and its `deny.toml` advisory ignore — storage now uses postcard plus a vendored decode-only bincode-1.3 reader (`storage::legacy_bincode`) for the one-time legacy-data migration (ADR-006, Accepted; see [docs/adr/ADR-006-serializer-replacement.md](docs/adr/ADR-006-serializer-replacement.md)). `cargo deny check --all-features` is green with no advisory ignores.
+
+> **Provisional gate:** the bincode-crate drop is **provisional until VS-4.0.4's real-v0.5.1 golden-fixture test passes** against a real prior-release on-disk store. If that fixture surfaces a vendored-decoder defect, it **blocks the sprint→main PR** — the decoder must be fixed (not the dependency re-added) before release.
+
 ## [0.5.1] - 2026-06-20
 
 > **Public-boundary hardening.** Metadata, licensing, and security-posture fixes only — no `src/`, API, or behavior changes.

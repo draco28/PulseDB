@@ -397,44 +397,44 @@ fn test_pulsedb_error_sync_variant() {
 // ============================================================================
 
 #[test]
-fn test_sync_change_bincode_roundtrip() {
+fn test_sync_change_postcard_roundtrip() {
     let cid = CollectiveId::new();
     let change = make_change(42, cid);
-    let bytes = bincode::serialize(&change).unwrap();
-    let restored: SyncChange = bincode::deserialize(&bytes).unwrap();
+    let bytes = postcard::to_stdvec(&change).unwrap();
+    let restored: SyncChange = postcard::from_bytes(&bytes).unwrap();
     assert_eq!(restored.sequence, 42);
     assert_eq!(restored.collective_id, cid);
 }
 
 #[test]
-fn test_instance_id_bincode_roundtrip() {
+fn test_instance_id_postcard_roundtrip() {
     let id = InstanceId::new();
-    let bytes = bincode::serialize(&id).unwrap();
-    let restored: InstanceId = bincode::deserialize(&bytes).unwrap();
+    let bytes = postcard::to_stdvec(&id).unwrap();
+    let restored: InstanceId = postcard::from_bytes(&bytes).unwrap();
     assert_eq!(id, restored);
 }
 
 #[test]
-fn test_sync_cursor_bincode_roundtrip() {
+fn test_sync_cursor_postcard_roundtrip() {
     let cursor = SyncCursor {
         instance_id: InstanceId::new(),
         last_sequence: 12345,
     };
-    let bytes = bincode::serialize(&cursor).unwrap();
-    let restored: SyncCursor = bincode::deserialize(&bytes).unwrap();
+    let bytes = postcard::to_stdvec(&cursor).unwrap();
+    let restored: SyncCursor = postcard::from_bytes(&bytes).unwrap();
     assert_eq!(cursor, restored);
 }
 
 #[test]
-fn test_sync_config_bincode_roundtrip() {
+fn test_sync_config_postcard_roundtrip() {
     let config = SyncConfig {
         direction: SyncDirection::PullOnly,
         batch_size: 250,
         collectives: Some(vec![CollectiveId::new()]),
         ..Default::default()
     };
-    let bytes = bincode::serialize(&config).unwrap();
-    let restored: SyncConfig = bincode::deserialize(&bytes).unwrap();
+    let bytes = postcard::to_stdvec(&config).unwrap();
+    let restored: SyncConfig = postcard::from_bytes(&bytes).unwrap();
     assert_eq!(config.direction, restored.direction);
     assert_eq!(config.batch_size, restored.batch_size);
 }
@@ -444,8 +444,9 @@ fn test_sync_config_bincode_roundtrip() {
 // ============================================================================
 
 #[test]
-fn test_protocol_version_is_two() {
-    assert_eq!(SYNC_PROTOCOL_VERSION, 2);
+fn test_protocol_version_is_three() {
+    // Bumped 2→3 in VS-4.0.3 work-1.03 (postcard wire + serializer-independent preamble).
+    assert_eq!(SYNC_PROTOCOL_VERSION, 3);
 }
 
 // ============================================================================

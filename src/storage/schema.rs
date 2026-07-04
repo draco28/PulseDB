@@ -46,6 +46,67 @@ use crate::types::{AgentId, CollectiveId, ExperienceId, TaskId, Timestamp};
 /// Version 3 reshapes `Experience` for temporal decay and G-counter applications.
 pub const SCHEMA_VERSION: u32 = 3;
 
+// ============================================================================
+// Substrate Format Marker (storage-format axis — distinct from SCHEMA_VERSION)
+// ============================================================================
+//
+// The substrate-format marker tracks the **physical storage substrate**:
+// the redb file-format generation AND the value serializer (bincode → postcard).
+// It is a SEPARATE AXIS from `SCHEMA_VERSION`, which tracks the *logical* record
+// shapes (Experience/WatchEventRecord field layout). A database is described by
+// the tuple { redb-file-format, value-codec, logical-schema }; `SCHEMA_VERSION`
+// versions only the last component, while `CURRENT_SUBSTRATE_FORMAT` versions the
+// first two. Do NOT overload `SCHEMA_VERSION` for substrate changes.
+//
+// # Bootstrapping requirement (load-bearing)
+//
+// The marker answers "are this file's values bincode-era or postcard-era?", so it
+// **cannot itself be a serde/bincode blob** — it must be readable BEFORE the
+// serializer identity is known. It is therefore stored as **raw, hand-encoded
+// bytes** under a dedicated `METADATA_TABLE` key, never through serde.
+
+/// `METADATA_TABLE` key holding the raw substrate-format marker.
+///
+/// Lives alongside `"db_metadata"` (`METADATA_KEY`) and [`INSTANCE_ID_KEY`].
+/// The value under this key is the 3-byte fixed layout
+/// `[SUBSTRATE_MAGIC[0], SUBSTRATE_MAGIC[1], substrate_format_version: u8]`,
+/// written and read as raw bytes (NEVER serde).
+pub const SUBSTRATE_FORMAT_KEY: &str = "substrate_format";
+
+/// Two-byte magic prefix for the substrate-format marker.
+///
+/// Spells `PS` (PulseDB Substrate). Validated on read; a mismatch is a
+/// corruption signal, not a legacy/Absent database.
+pub const SUBSTRATE_MAGIC: [u8; 2] = *b"PS";
+
+/// Current substrate-format version (redb file-format + value serializer axis).
+///
+/// The marker is **monotonic** over the storage-substrate axes:
+///
+/// - `0` / **absent** = `{redb-v2, bincode}` — the legacy v0.5.1 state (no marker
+///   key existed before Sprint 4.0).
+/// - `1` = `{redb-v3, bincode}` — the **VS-4.0.2 end-state**. The redb file format
+///   is upgraded v2→v3, but values stay bincode.
+/// - `2` = `{redb-v3, postcard}` — the **VS-4.0.3 end-state** (what this slice
+///   produces). `CURRENT` is `2`; the bincode→postcard codec migration is gated on
+///   `marker < 2` (an `Absent | Older` store re-encodes every serde-blob row to
+///   postcard, then the marker bumps to `2` as the commit point).
+///
+/// Bumped whenever *either* the redb file format *or* the serializer changes —
+/// independently of [`SCHEMA_VERSION`]. A fresh database is written at this value;
+/// an existing database whose marker is **absent** is treated as substrate-format
+/// `0` (the pre-4.0 `{redb-v2, bincode}` era).
+pub const CURRENT_SUBSTRATE_FORMAT: u8 = 2;
+
+/// Substrate-format version implied by an **absent** marker.
+///
+/// A pre-4.0 (bincode-era) database carries no `substrate_format` key, so its
+/// substrate format is `0` by definition.
+pub const LEGACY_SUBSTRATE_FORMAT: u8 = 0;
+
+/// Encoded length of the raw substrate-format marker: 2 magic bytes + 1 version.
+pub const SUBSTRATE_MARKER_LEN: usize = 3;
+
 /// Maximum content size in bytes (100 KB).
 pub const MAX_CONTENT_SIZE: usize = 100 * 1024;
 
@@ -675,8 +736,8 @@ mod tests {
     #[test]
     fn test_database_metadata_serialization() {
         let meta = DatabaseMetadata::new(EmbeddingDimension::D768);
-        let bytes = bincode::serialize(&meta).unwrap();
-        let restored: DatabaseMetadata = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_stdvec(&meta).unwrap();
+        let restored: DatabaseMetadata = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(meta.schema_version, restored.schema_version);
         assert_eq!(meta.embedding_dimension, restored.embedding_dimension);
     }
@@ -746,10 +807,10 @@ mod tests {
     }
 
     #[test]
-    fn test_experience_type_tag_bincode_roundtrip() {
+    fn test_experience_type_tag_postcard_roundtrip() {
         for tag in ExperienceTypeTag::all() {
-            let bytes = bincode::serialize(tag).unwrap();
-            let restored: ExperienceTypeTag = bincode::deserialize(&bytes).unwrap();
+            let bytes = postcard::to_stdvec(tag).unwrap();
+            let restored: ExperienceTypeTag = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(*tag, restored);
         }
     }

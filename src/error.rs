@@ -216,6 +216,120 @@ pub enum StorageError {
     /// Table not found in database.
     #[error("Table not found: {0}")]
     TableNotFound(String),
+
+    /// The database was written by an **older** substrate format and must be
+    /// migrated before it can be opened.
+    ///
+    /// The substrate format is the storage-substrate axis (redb file format +
+    /// value serializer), distinct from the logical `schema_version`. This is the
+    /// *typed, actionable* signal a guided migration keys off — it must never be a
+    /// raw redb `UpgradeRequired` or a bincode decode panic leaking through.
+    ///
+    /// A **writable** open of such a store migrates automatically (the migration
+    /// gate is wired in a later work item); this error is surfaced only when
+    /// migration cannot proceed (e.g. a read-only open).
+    #[error(
+        "Database substrate format {found} is older than the current format {current}; \
+         open the database writable once to migrate it (read-only opens of an \
+         un-migrated store cannot upgrade)"
+    )]
+    SubstrateUpgradeRequired {
+        /// Substrate format found in the database (0 = pre-4.0 / bincode era).
+        found: u8,
+        /// Current substrate format this build writes and reads.
+        current: u8,
+    },
+
+    /// The database was written by a **newer** PulseDB whose substrate format is
+    /// ahead of this build — a forward-incompatibility.
+    ///
+    /// This build must not touch the file: doing so risks silent corruption.
+    /// Upgrade PulseDB to a version that understands substrate format `found`.
+    #[error(
+        "Database substrate format {found} is newer than this build's format {current}; \
+         upgrade PulseDB to open this database (do not modify it with an older build)"
+    )]
+    SubstrateFormatTooNew {
+        /// Substrate format found in the database.
+        found: u8,
+        /// Current substrate format this build supports.
+        current: u8,
+    },
+
+    /// The bincode→postcard codec migration cannot run as a single transaction
+    /// because the store is larger than the safe single-txn ceiling, and no
+    /// declared available-memory budget (or a too-small one) authorizes it.
+    ///
+    /// This is the **fail-closed-above-floor** valve (VS-4.0.3 work-1.04 §6.4):
+    /// rather than risk an OOM mid-migration (which would leave the migration
+    /// unfinishable) or ship a half-correct phased path, the codec pass refuses
+    /// with **zero destructive writes**. The caller can either declare an
+    /// available-memory budget via `Config` to raise the single-txn ceiling, or
+    /// use the offline `pulsedb migrate` tool (VS-4.0.4) for very large stores.
+    ///
+    /// `store_size` is the on-disk file size at open; `projected_peak` is the
+    /// conservative peak-RSS estimate (`store_size × coefficient`); `budget` is
+    /// the single-txn ceiling that was exceeded.
+    #[error(
+        "store too large for a single-transaction codec migration: store size {store_size} bytes \
+         (projected peak ~{projected_peak} bytes) exceeds the single-txn budget of {budget} bytes; \
+         declare available memory via Config to raise the ceiling, or run the offline migration tool"
+    )]
+    SubstrateMigrationTooLarge {
+        /// On-disk redb file size at open, in bytes.
+        store_size: u64,
+        /// Conservative peak-RSS estimate for a single-txn re-encode, in bytes.
+        projected_peak: u64,
+        /// The single-txn budget (ceiling) that `projected_peak` exceeded, in bytes.
+        budget: u64,
+    },
+
+    /// The bincode→postcard codec migration cannot run because there is not enough
+    /// free disk space to hold the pristine `.pre-substrate.bak` backup plus the
+    /// migrated file plus a redb transaction-growth margin.
+    ///
+    /// This is the **disk axis** of the unified headroom preflight (VS-4.0.3
+    /// work-1.05 / audit C3), the companion of [`Self::SubstrateMigrationTooLarge`]
+    /// (the memory axis). The pristine backup taken before any destructive write
+    /// (`.pre-substrate.bak`) roughly **doubles** the on-disk footprint, and the
+    /// postcard re-encode does not shrink the size-dominant `Vec<f32>` embedding
+    /// table, so the migrated file is conservatively assumed to be ~1× the store
+    /// size. The preflight fails here with **zero destructive writes** (no
+    /// half-migration that runs the disk out mid-pass) rather than risk an
+    /// unfinishable migration. Free up disk, or run the offline `pulsedb migrate`
+    /// tool (VS-4.0.4) for very large stores.
+    ///
+    /// `store_size` is the on-disk file size at open; `required` is the conservative
+    /// free-space estimate (`backup ≈ store_size` + migrated ≈ store_size + redb
+    /// txn-growth margin); `available` is the free space observed on the store's
+    /// filesystem at open.
+    #[error(
+        "insufficient free disk space for the codec migration: store size {store_size} bytes \
+         needs ~{required} bytes free (pristine backup + migrated file + transaction margin) \
+         but only {available} bytes are available; free up disk or run the offline migration tool"
+    )]
+    SubstrateMigrationInsufficientDisk {
+        /// On-disk redb file size at open, in bytes.
+        store_size: u64,
+        /// Conservative free-space estimate the migration needs, in bytes.
+        required: u64,
+        /// Free space observed on the store's filesystem at open, in bytes.
+        available: u64,
+    },
+
+    /// The bincode→postcard codec migration was attempted by a build **without** the
+    /// `sync` feature, but the database contains `sync_cursors` rows written by a
+    /// prior sync-enabled build. Those rows can only be re-encoded by a build that
+    /// knows the `SyncCursor` type, so completing the migration here would leave them
+    /// bincode-encoded under a postcard marker — silent corruption a later sync build
+    /// would hit reading them as postcard. The migration fails closed with **no marker
+    /// bump** (the store stays re-migratable) so a `sync`-enabled build can finish it.
+    #[error(
+        "cannot migrate this database's sync state without the `sync` feature: it \
+         contains sync_cursors rows that require a sync-enabled PulseDB build to \
+         re-encode; rebuild or run PulseDB with the `sync` feature to migrate it"
+    )]
+    SubstrateMigrationRequiresSync,
 }
 
 impl StorageError {
@@ -237,6 +351,45 @@ impl StorageError {
     /// Creates a redb error with the given message.
     pub fn redb(msg: impl Into<String>) -> Self {
         Self::Redb(msg.into())
+    }
+
+    /// Creates a substrate-upgrade-required error.
+    ///
+    /// `found` is the substrate format stored in the database (0 = pre-4.0
+    /// bincode era), `current` is the format this build writes.
+    pub fn substrate_upgrade_required(found: u8, current: u8) -> Self {
+        Self::SubstrateUpgradeRequired { found, current }
+    }
+
+    /// Creates a substrate-format-too-new error (forward-incompatibility).
+    pub fn substrate_format_too_new(found: u8, current: u8) -> Self {
+        Self::SubstrateFormatTooNew { found, current }
+    }
+
+    /// Creates a substrate-migration-too-large error (single-txn ceiling exceeded).
+    pub fn substrate_migration_too_large(
+        store_size: u64,
+        projected_peak: u64,
+        budget: u64,
+    ) -> Self {
+        Self::SubstrateMigrationTooLarge {
+            store_size,
+            projected_peak,
+            budget,
+        }
+    }
+
+    /// Creates a substrate-migration-insufficient-disk error (disk-headroom axis).
+    pub fn substrate_migration_insufficient_disk(
+        store_size: u64,
+        required: u64,
+        available: u64,
+    ) -> Self {
+        Self::SubstrateMigrationInsufficientDisk {
+            store_size,
+            required,
+            available,
+        }
     }
 }
 
@@ -277,9 +430,9 @@ impl From<redb::StorageError> for StorageError {
     }
 }
 
-// Convert bincode errors to StorageError
-impl From<bincode::Error> for StorageError {
-    fn from(err: bincode::Error) -> Self {
+// Convert postcard errors to StorageError
+impl From<postcard::Error> for StorageError {
+    fn from(err: postcard::Error) -> Self {
         StorageError::Serialization(err.to_string())
     }
 }
@@ -321,8 +474,8 @@ impl From<redb::StorageError> for PulseDBError {
     }
 }
 
-impl From<bincode::Error> for PulseDBError {
-    fn from(err: bincode::Error) -> Self {
+impl From<postcard::Error> for PulseDBError {
+    fn from(err: postcard::Error) -> Self {
         PulseDBError::Storage(StorageError::from(err))
     }
 }
@@ -585,5 +738,47 @@ mod tests {
         ));
         assert!(err.is_io());
         assert!(!err.is_storage());
+    }
+
+    #[test]
+    fn test_substrate_upgrade_required_display_is_actionable() {
+        let err = StorageError::substrate_upgrade_required(0, 1);
+        assert!(matches!(
+            err,
+            StorageError::SubstrateUpgradeRequired {
+                found: 0,
+                current: 1
+            }
+        ));
+        let msg = err.to_string();
+        // Names both versions and tells the operator HOW to recover.
+        assert!(msg.contains("substrate format 0"), "msg: {msg}");
+        assert!(msg.contains("current format 1"), "msg: {msg}");
+        assert!(msg.contains("writable"), "msg: {msg}");
+    }
+
+    #[test]
+    fn test_substrate_format_too_new_display_is_actionable() {
+        let err = StorageError::substrate_format_too_new(7, 1);
+        assert!(matches!(
+            err,
+            StorageError::SubstrateFormatTooNew {
+                found: 7,
+                current: 1
+            }
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("substrate format 7"), "msg: {msg}");
+        assert!(msg.contains("format 1"), "msg: {msg}");
+        // Tells the operator to upgrade rather than touch the file.
+        assert!(msg.contains("upgrade PulseDB"), "msg: {msg}");
+    }
+
+    #[test]
+    fn test_substrate_errors_propagate_as_storage() {
+        let err: PulseDBError = StorageError::substrate_upgrade_required(0, 1).into();
+        assert!(err.is_storage());
+        let err: PulseDBError = StorageError::substrate_format_too_new(2, 1).into();
+        assert!(err.is_storage());
     }
 }

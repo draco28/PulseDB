@@ -139,7 +139,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_relation_type_bincode_roundtrip() {
+    fn test_relation_type_postcard_roundtrip() {
         let types = [
             RelationType::Supports,
             RelationType::Contradicts,
@@ -149,14 +149,14 @@ mod tests {
             RelationType::RelatedTo,
         ];
         for rt in &types {
-            let bytes = bincode::serialize(rt).unwrap();
-            let restored: RelationType = bincode::deserialize(&bytes).unwrap();
+            let bytes = postcard::to_stdvec(rt).unwrap();
+            let restored: RelationType = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(*rt, restored);
         }
     }
 
     #[test]
-    fn test_experience_relation_bincode_roundtrip() {
+    fn test_experience_relation_postcard_roundtrip() {
         let relation = ExperienceRelation {
             id: RelationId::new(),
             source_id: ExperienceId::new(),
@@ -167,8 +167,8 @@ mod tests {
             created_at: Timestamp::now(),
         };
 
-        let bytes = bincode::serialize(&relation).unwrap();
-        let restored: ExperienceRelation = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_stdvec(&relation).unwrap();
+        let restored: ExperienceRelation = postcard::from_bytes(&bytes).unwrap();
 
         assert_eq!(relation.id, restored.id);
         assert_eq!(relation.source_id, restored.source_id);

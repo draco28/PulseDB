@@ -96,6 +96,28 @@ pub struct Config {
     ///
     /// Default: false
     pub read_only: bool,
+
+    /// Declared available memory (in bytes) for the one-time storage codec
+    /// migration (bincode→postcard, VS-4.0.3).
+    ///
+    /// The migration re-encodes every serde-blob row in a single transaction by
+    /// default, which must buffer a dirty set proportional to the store size.
+    /// The conservative peak-RSS estimate is `store_size × 0.10`. Below an
+    /// absolute store-size floor (1 GiB) the single-transaction path is always
+    /// taken; above it, the migration **fails closed with zero destructive
+    /// writes** unless the embedder *declares* an available-memory budget here
+    /// large enough to cover the projected peak (with a 0.5 safety margin).
+    ///
+    /// This is **config-first** by design: host-memory auto-detection is
+    /// unreliable for an embedded library (a cgroup-limited container reports the
+    /// host's RAM and would over-estimate → OOM). The embedder, who knows their
+    /// deployment, declares the budget to opt into single-txn migration of a
+    /// large store.
+    ///
+    /// `None` (the default) ⇒ rely on the conservative store-size floor only.
+    ///
+    /// Default: `None`
+    pub migration_available_memory_bytes: Option<u64>,
 }
 
 impl Default for Config {
@@ -113,6 +135,7 @@ impl Default for Config {
             watch: WatchConfig::default(),
             decay: DecayConfig::default(),
             read_only: false,
+            migration_available_memory_bytes: None,
         }
     }
 }
@@ -861,8 +884,8 @@ mod tests {
     #[test]
     fn test_embedding_dimension_serialization() {
         let dim = EmbeddingDimension::D768;
-        let bytes = bincode::serialize(&dim).unwrap();
-        let restored: EmbeddingDimension = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_stdvec(&dim).unwrap();
+        let restored: EmbeddingDimension = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(dim, restored);
     }
 
