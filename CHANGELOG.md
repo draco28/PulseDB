@@ -7,13 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-05
+
+> **Sprint 4.0 — Storage-Format Modernization.** Adopts the redb 2.x→4.x on-disk file-format major and replaces the unmaintained `bincode` serializer with `postcard`, both behind a tested upgrade-on-open path. A database from a prior release (v0.5.1 / v0.4.0) opens under the new format and reads back identically — verified against **real prior-release on-disk stores** (NFR-020), plus a kill-at-boundary crash-recovery gate.
+
 ### Changed
-- **Storage value codec migrated from bincode to postcard** (`SUBSTRATE_FORMAT` marker 1→2). Existing stores upgrade on first writable open via a one-time codec re-encode; embeddings and secondary indexes are copied through byte-identically. See **[docs/storage-migration.md](docs/storage-migration.md)** for the migration & crash-recovery posture — the disk+memory headroom preflight, the single-transaction "re-run from scratch on crash" contract, and the large-store fail-closed behavior.
+- **On-disk storage format modernized to redb 4.x + postcard.** The redb file format is upgraded v2→v3 in place and every serde-blob value is re-encoded from bincode to postcard (`SUBSTRATE_FORMAT` marker 1→2), both on the first writable open. Embeddings, secondary indexes, and raw metadata keys are copied through byte-identically. See **[docs/storage-migration.md](docs/storage-migration.md)** for the migration & crash-recovery posture — the disk+memory headroom preflight, the single-transaction "re-run from scratch on crash" contract, and the large-store fail-closed behavior.
+
+### Added
+- **Real prior-release upgrade gate** (`tests/storage_format_upgrade.rs`): two curated real fixtures (v0.5.1 schema-v3, v0.4.0 schema-v2) migrate value- and byte-identical against a SHA-256-provenanced manifest oracle (NFR-020 / MIGRATE-020). Sampled compatibility with documented residuals (v0.3.0 / WAL-v1 uncovered).
+- **Kill-at-boundary crash-recovery suite** (`--features fault-injection`, a Linux CI gate): a compiled-out injection seam crashes the migration at all five boundaries plus one subprocess SIGKILL, asserting positive recovery (atomicity ≠ resumability).
+- **Migration headroom preflight**: disk + memory axes are validated before any destructive write; an above-floor store fails closed with a typed, actionable error rather than risking an unfinishable migration. New `Config::migration_available_memory_bytes` opts into a higher single-transaction ceiling.
+- New typed `StorageError` variants: `SubstrateUpgradeRequired`, `SubstrateFormatTooNew`, `SubstrateMigrationTooLarge`, `SubstrateMigrationInsufficientDisk`, `SubstrateMigrationRequiresSync`.
 
 ### Removed
 - **Dropped the unmaintained `bincode` crate dependency** (RUSTSEC-2025-0141) and its `deny.toml` advisory ignore — storage now uses postcard plus a vendored decode-only bincode-1.3 reader (`storage::legacy_bincode`) for the one-time legacy-data migration (ADR-006, Accepted; see [docs/adr/ADR-006-serializer-replacement.md](docs/adr/ADR-006-serializer-replacement.md)). `cargo deny check --all-features` is green with no advisory ignores.
 
-> **Provisional gate:** the bincode-crate drop is **provisional until VS-4.0.4's real-v0.5.1 golden-fixture test passes** against a real prior-release on-disk store. If that fixture surfaces a vendored-decoder defect, it **blocks the sprint→main PR** — the decoder must be fixed (not the dependency re-added) before release.
+### Breaking
+- **On-disk format upgrade required.** Databases created by v0.5.1 and earlier are redb-v2 / bincode; they upgrade automatically on the first **writable** open (a `.pre-substrate.bak` sidecar is claimed first). A read-only open of a not-yet-migrated store returns a typed error instead of migrating.
+- **New `StorageError` variants** (see Added) — exhaustive matches on `StorageError` must handle them.
+- **sync-http wire format**: a serializer-independent preamble is read before the handshake body and `SYNC_PROTOCOL_VERSION` bumps 2→3; mixed-version peers fail loud in both directions — upgrade all peers together (`sync-http` feature only).
 
 ## [0.5.1] - 2026-06-20
 
