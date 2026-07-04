@@ -610,7 +610,8 @@ impl RedbStorage {
                 {
                     let store_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
                     let available = fs2::available_space(path).unwrap_or(u64::MAX);
-                    Self::resolve_migration_headroom(store_size, 0, available, config)?;
+                    // Destructive redb-v2→v3 path: a .pre-substrate.bak IS written here.
+                    Self::resolve_migration_headroom(store_size, 0, available, config, true)?;
                 }
 
                 // Back up the pristine {redb-v2, bincode} file (the rollback point)
@@ -738,7 +739,15 @@ impl RedbStorage {
                     StorageError::corrupted(format!("Invalid legacy metadata format: {}", e)).into()
                 })
             }
-            SubstrateFormat::Current | SubstrateFormat::Newer(_) => {
+            // A store written by a NEWER PulseDB (marker > CURRENT) may encode its
+            // metadata in a format this build cannot read; refuse with the actionable
+            // forward-incompatibility error BEFORE attempting a postcard decode that
+            // would otherwise surface as a misleading Corrupted/SchemaVersionMismatch
+            // instead of the intended "upgrade PulseDB" signal.
+            SubstrateFormat::Newer(found) => {
+                Err(StorageError::substrate_format_too_new(found, CURRENT_SUBSTRATE_FORMAT).into())
+            }
+            SubstrateFormat::Current => {
                 postcard::from_bytes::<DatabaseMetadata>(metadata_bytes.value()).map_err(|e| {
                     StorageError::corrupted(format!("Invalid metadata format: {}", e)).into()
                 })
@@ -993,7 +1002,9 @@ impl RedbStorage {
             // block on the disk axis (u64::MAX) — the memory axis + backup_once still
             // guard; the disk check is a best-effort early failure for the common case.
             let available = fs2::available_space(&path).unwrap_or(u64::MAX);
-            Self::resolve_migration_headroom(store_size, copy_through, available, config)?;
+            // Codec-only leg (already redb-v3; Absent/marker-1): no .pre-substrate.bak
+            // is written here, so don't charge the backup store-size (#57 review).
+            Self::resolve_migration_headroom(store_size, copy_through, available, config, false)?;
             // Progress signal (work-1.05 / C3): the first-open migration is exempt
             // from NFR-001 (<100ms); make the multi-minute pass non-silent. Per-phase
             // `info!` lines (reshape / re-encode, below) report progress thereafter.
@@ -1617,11 +1628,20 @@ impl RedbStorage {
         copy_through_bytes: u64,
         available: u64,
         config: &Config,
+        makes_backup: bool,
     ) -> Result<()> {
         // Disk axis first (cheaper guard against a half-migration that exhausts disk).
         // Keyed on FULL store_size — the copy-through set stays on disk in both the
-        // backup and the migrated file (embeddings don't shrink).
-        let required = Self::required_migration_disk_bytes(store_size);
+        // backup and the migrated file (embeddings don't shrink). The pristine
+        // `.pre-substrate.bak` (~1×store) is only claimed on the destructive
+        // redb-v2→v3 path; the codec-only leg (already redb-v3, no backup) must NOT be
+        // charged for a backup it never writes (#57 review — double-counted backup).
+        let required = if makes_backup {
+            Self::required_migration_disk_bytes(store_size)
+        } else {
+            // migrated file (~1×) + ~10% txn-growth margin — no backup term.
+            store_size.saturating_add(store_size / 10)
+        };
         if available < required {
             warn!(
                 store_size,
@@ -1849,6 +1869,41 @@ impl RedbStorage {
                 SYNC_CURSORS_TABLE,
                 "sync_cursor",
             )?;
+        }
+
+        // #57 review: a build WITHOUT the `sync` feature cannot decode/re-encode the
+        // SyncCursor rows, yet the migration is about to bump the substrate marker to
+        // CURRENT (postcard). If this store carries sync_cursors written by a prior
+        // sync-enabled build, completing the migration would strand those rows in
+        // bincode under a postcard marker — silent corruption a later sync build hits
+        // reading them as postcard. Fail closed BEFORE the marker write (this write
+        // txn rolls back, nothing committed, store stays re-migratable) so a
+        // sync-enabled build can finish the codec migration.
+        #[cfg(not(feature = "sync"))]
+        {
+            // `SYNC_CURSORS_TABLE` (schema.rs) is itself `#[cfg(feature = "sync")]`, so
+            // declare a local probe with the SAME name + types to detect rows a prior
+            // sync-enabled build persisted. Only probe if the table already exists, so
+            // a store that never used sync is not mutated by an open-creates-it call.
+            const SYNC_CURSORS_PROBE: ::redb::TableDefinition<&[u8; 16], &[u8]> =
+                ::redb::TableDefinition::new("sync_cursors");
+            let has_sync_table = {
+                use ::redb::TableHandle;
+                write_txn
+                    .list_tables()
+                    .map_err(StorageError::from)?
+                    .any(|h| h.name() == "sync_cursors")
+            };
+            if has_sync_table {
+                let table = write_txn.open_table(SYNC_CURSORS_PROBE)?;
+                let has_sync_rows = table.iter()?.next().is_some();
+                drop(table);
+                if has_sync_rows {
+                    return Err(PulseDBError::Storage(
+                        StorageError::SubstrateMigrationRequiresSync,
+                    ));
+                }
+            }
         }
 
         // #55 refactor-neutral coverage assertion: the loop must have visited
@@ -6176,8 +6231,8 @@ mod tests {
         let store_size = 100 * 1024 * 1024; // 100 MiB, well below the memory floor
         let required = RedbStorage::required_migration_disk_bytes(store_size);
         let available = required - 1; // one byte short
-        let err =
-            RedbStorage::resolve_migration_headroom(store_size, 0, available, &cfg).unwrap_err();
+        let err = RedbStorage::resolve_migration_headroom(store_size, 0, available, &cfg, true)
+            .unwrap_err();
         match err {
             PulseDBError::Storage(StorageError::SubstrateMigrationInsufficientDisk {
                 store_size: s,
@@ -6200,7 +6255,7 @@ mod tests {
         let store_size = 100 * 1024 * 1024; // 100 MiB
         let available = RedbStorage::required_migration_disk_bytes(store_size); // exactly enough
         assert!(
-            RedbStorage::resolve_migration_headroom(store_size, 0, available, &cfg).is_ok(),
+            RedbStorage::resolve_migration_headroom(store_size, 0, available, &cfg, true).is_ok(),
             "sufficient disk + below-floor store must pass the unified preflight"
         );
     }
@@ -6215,8 +6270,8 @@ mod tests {
         let store_size = 4 * RedbStorage::SINGLE_TXN_STORE_FLOOR_BYTES; // 4 GiB, above floor
         let required = RedbStorage::required_migration_disk_bytes(store_size);
         let available = required / 2; // insufficient disk
-        let err =
-            RedbStorage::resolve_migration_headroom(store_size, 0, available, &cfg).unwrap_err();
+        let err = RedbStorage::resolve_migration_headroom(store_size, 0, available, &cfg, true)
+            .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -6238,8 +6293,8 @@ mod tests {
         let available = RedbStorage::required_migration_disk_bytes(store_size) * 2;
         // copy_through = 0 → footprint == store_size → margined peak exceeds the floor
         // budget → still fails on the memory axis (re-encodable-dominated worst case).
-        let err =
-            RedbStorage::resolve_migration_headroom(store_size, 0, available, &cfg).unwrap_err();
+        let err = RedbStorage::resolve_migration_headroom(store_size, 0, available, &cfg, true)
+            .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -6260,7 +6315,7 @@ mod tests {
         cfg.migration_available_memory_bytes = Some(projected_peak * 2 + 2); // clears the margin
         let available = RedbStorage::required_migration_disk_bytes(store_size);
         assert!(
-            RedbStorage::resolve_migration_headroom(store_size, 0, available, &cfg).is_ok(),
+            RedbStorage::resolve_migration_headroom(store_size, 0, available, &cfg, true).is_ok(),
             "declared memory + sufficient disk must pass the unified preflight above the floor"
         );
     }
@@ -6567,6 +6622,76 @@ mod tests {
     //     max-length collections, `NaN` f32, unknown/added fields, truncated
     //     inputs) for the high-risk shapes.
     //
+    // #57 review T3: the codec-only leg (no `.pre-substrate.bak`) must not be charged
+    // the backup store-size. A store that clears the no-backup requirement but not the
+    // backup-inclusive one PASSES makes_backup=false and FAILS makes_backup=true.
+    #[test]
+    fn test_codec_leg_headroom_excludes_backup_cost() {
+        let cfg = default_config();
+        let store_size: u64 = 100_000; // well below the single-txn floor (memory axis Ok)
+        let backup_required = RedbStorage::required_migration_disk_bytes(store_size); // ~2.1×
+        let no_backup_required = store_size + store_size / 10; // ~1.1×, matches the codec-leg branch
+        assert!(
+            no_backup_required < backup_required,
+            "the no-backup requirement must be strictly smaller"
+        );
+        let available = (no_backup_required + backup_required) / 2; // between the two thresholds
+                                                                    // Destructive path (writes a backup) fails closed at the disk axis:
+        assert!(
+            RedbStorage::resolve_migration_headroom(store_size, 0, available, &cfg, true).is_err(),
+            "backup path must fail with only backup-excluding disk free"
+        );
+        // Codec-only leg (no backup) succeeds with the SAME available disk:
+        assert!(
+            RedbStorage::resolve_migration_headroom(store_size, 0, available, &cfg, false).is_ok(),
+            "codec-only leg must not be charged for a backup it never writes"
+        );
+    }
+
+    // #57 review T5: a build WITHOUT the `sync` feature must NOT silently migrate a
+    // store that carries `sync_cursors` rows (a prior sync build's data) — doing so
+    // would strand those bincode rows under a postcard marker (silent corruption a
+    // later sync build hits). It must fail closed with SubstrateMigrationRequiresSync
+    // and leave the marker unchanged (the store stays re-migratable by a sync build).
+    #[cfg(not(feature = "sync"))]
+    #[test]
+    fn test_non_sync_build_refuses_migration_when_sync_cursors_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("older_with_sync_cursors.redb");
+        let _ = seed_redb_v3_bincode_older_store(&path); // {redb-v3, bincode, marker Older(1)}
+
+        // Inject a raw sync_cursors row the way a prior sync build would, without
+        // needing the `sync` feature here (probe table = same name + types).
+        {
+            const SYNC_CURSORS_PROBE: ::redb::TableDefinition<&[u8; 16], &[u8]> =
+                ::redb::TableDefinition::new("sync_cursors");
+            let db = Database::builder().create(&path).unwrap();
+            let wtx = db.begin_write().unwrap();
+            {
+                let mut t = wtx.open_table(SYNC_CURSORS_PROBE).unwrap();
+                t.insert(&[0x99u8; 16], [1u8, 2, 3].as_slice()).unwrap();
+            }
+            wtx.commit().unwrap();
+        }
+
+        let err = RedbStorage::open(&path, &default_config()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PulseDBError::Storage(StorageError::SubstrateMigrationRequiresSync)
+            ),
+            "a non-sync build must fail closed on sync_cursors rows; got: {err}"
+        );
+
+        // The refused migration's write-txn rolled back → marker still Older(1).
+        let db = Database::builder().create(&path).unwrap();
+        assert_eq!(
+            RedbStorage::read_substrate_marker(&db).unwrap(),
+            SubstrateFormat::Older(1),
+            "a refused migration must leave the substrate marker untouched"
+        );
+    }
+
     // Naming note: the module and its assertions use the token `disjoint`/
     // `postcard.*reject` so the codec-correctness regression grep guards bind.
     mod postcard_bincode_disjointness {

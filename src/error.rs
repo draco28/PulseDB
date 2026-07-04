@@ -316,6 +316,20 @@ pub enum StorageError {
         /// Free space observed on the store's filesystem at open, in bytes.
         available: u64,
     },
+
+    /// The bincode→postcard codec migration was attempted by a build **without** the
+    /// `sync` feature, but the database contains `sync_cursors` rows written by a
+    /// prior sync-enabled build. Those rows can only be re-encoded by a build that
+    /// knows the `SyncCursor` type, so completing the migration here would leave them
+    /// bincode-encoded under a postcard marker — silent corruption a later sync build
+    /// would hit reading them as postcard. The migration fails closed with **no marker
+    /// bump** (the store stays re-migratable) so a `sync`-enabled build can finish it.
+    #[error(
+        "cannot migrate this database's sync state without the `sync` feature: it \
+         contains sync_cursors rows that require a sync-enabled PulseDB build to \
+         re-encode; rebuild or run PulseDB with the `sync` feature to migrate it"
+    )]
+    SubstrateMigrationRequiresSync,
 }
 
 impl StorageError {
