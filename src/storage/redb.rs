@@ -1452,8 +1452,10 @@ impl RedbStorage {
     /// floor-implied peak budget, or a declared memory budget covers it). Returns
     /// `Err(SubstrateMigrationTooLarge)` — the **fail-closed valve** (work-1.04
     /// §6.4(3)) — otherwise: a typed, actionable error with **zero destructive
-    /// writes** (1.05's preflight surfaces the same; the offline `pulsedb migrate`
-    /// tool is the large-store escape).
+    /// writes** (1.05's preflight surfaces the same). An above-floor store must
+    /// be opened with a larger declared `migration_available_memory_bytes`; a
+    /// dedicated offline large-store migration tool is possible future work, not
+    /// yet built (no `pulsedb migrate` binary ships today).
     ///
     /// **Config-first, NOT host-memory auto-detect** (a cgroup-limited container
     /// over-reports host RAM → would wrongly pick single-txn → OOM). The embedder
@@ -1521,8 +1523,9 @@ impl RedbStorage {
         }
 
         // Fail closed with a typed, actionable error and ZERO destructive writes
-        // (work-1.04 §6.4(3) scope-relief valve; a correct phased durable-resume
-        // path is deferred — VS-4.0.4 / #46).
+        // (work-1.04 §6.4(3) scope-relief valve). A phased durable-resume path for
+        // above-floor stores was NOT built in Sprint 4.0 and remains a documented
+        // residual; the safe behavior today is fail-closed (declare more memory).
         warn!(
             store_size,
             footprint,
