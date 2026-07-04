@@ -3479,7 +3479,7 @@ mod tests {
     fn test_decode_substrate_marker_rejects_wrong_length() {
         // Too short and too long are both corruption, not Absent.
         assert!(decode_substrate_marker(&[]).is_err());
-        assert!(decode_substrate_marker(&[b'P', b'S']).is_err());
+        assert!(decode_substrate_marker(b"PS").is_err());
         assert!(decode_substrate_marker(&[b'P', b'S', 1, 0]).is_err());
     }
 
@@ -6853,7 +6853,7 @@ mod tests {
         ///
         /// Each entry is `(redb table name, is_serde_blob)`.
         fn schema_audit_tables() -> Vec<(&'static str, bool)> {
-            let mut tables: Vec<(&'static str, bool)> = vec![
+            let tables: Vec<(&'static str, bool)> = vec![
                 // --- serde-blob tables (decoded ⇒ must be in SERDE_BLOB_TABLES) ---
                 (METADATA_TABLE.name(), true),
                 (COLLECTIVES_TABLE.name(), true),
