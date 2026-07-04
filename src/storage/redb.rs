@@ -239,7 +239,10 @@ fn backup_once(src: &Path, backup_path: &Path) -> Result<()> {
             if let Err(error) = copy_result {
                 drop(backup_file);
                 let _ = std::fs::remove_file(backup_path);
-                return Err(PulseDBError::Io(error));
+                // A concurrent opener holding the redb file lock surfaces on Windows
+                // as a raw lock/sharing violation while we read `src` here; classify
+                // it as the typed, retryable DatabaseLocked (audit C2).
+                return Err(migration_io_error(error));
             }
             // VS-4.0.4 (#46) crash boundary: pre-txn, sidecar bytes are copied but
             // NOT yet fsync-durable — the exact window #53c hardens. Compiled out
@@ -254,7 +257,7 @@ fn backup_once(src: &Path, backup_path: &Path) -> Result<()> {
             if let Err(error) = backup_file.sync_all() {
                 drop(backup_file);
                 let _ = std::fs::remove_file(backup_path);
-                return Err(PulseDBError::Io(error));
+                return Err(migration_io_error(error));
             }
             drop(backup_file);
             // #53c: fsync the parent directory so the new sidecar's directory entry
@@ -272,7 +275,7 @@ fn backup_once(src: &Path, backup_path: &Path) -> Result<()> {
             debug!("backup sidecar already exists; preserving it");
             Ok(())
         }
-        Err(error) => Err(PulseDBError::Io(error)),
+        Err(error) => Err(migration_io_error(error)),
     }
 }
 
@@ -334,6 +337,19 @@ fn is_lock_contention_io_error(error: &std::io::Error) -> bool {
 #[cfg(not(windows))]
 fn is_lock_contention_io_error(_error: &std::io::Error) -> bool {
     false
+}
+
+/// Maps a `std::io::Error` from a migration file operation to a `PulseDBError`,
+/// promoting a Windows lock/sharing violation (see [`is_lock_contention_io_error`])
+/// to the typed, retryable [`StorageError::DatabaseLocked`] so the concurrency
+/// contract (audit C2) holds cross-platform, while passing every other I/O error
+/// through unchanged as [`PulseDBError::Io`].
+fn migration_io_error(error: std::io::Error) -> PulseDBError {
+    if is_lock_contention_io_error(&error) {
+        PulseDBError::Storage(StorageError::DatabaseLocked)
+    } else {
+        PulseDBError::Io(error)
+    }
 }
 
 /// Runs the one-time redb file-format upgrade (v2 → v3) in place via the aliased
@@ -883,22 +899,17 @@ impl RedbStorage {
                     if let Err(error) = copy_result {
                         drop(backup_file);
                         let _ = std::fs::remove_file(&backup_path);
-                        // A concurrent opener still holding the redb file lock
-                        // surfaces on Windows as a raw lock/sharing violation on this
-                        // copy; classify it as the typed, retryable DatabaseLocked
-                        // (audit C2) — matching the redb DatabaseAlreadyOpen path —
-                        // rather than leaking a generic Io error the caller's
-                        // contention-retry loop cannot recognize.
-                        if is_lock_contention_io_error(&error) {
-                            return Err(PulseDBError::Storage(StorageError::DatabaseLocked));
-                        }
-                        return Err(PulseDBError::Io(error));
+                        // On Windows a concurrent opener holding the redb file lock
+                        // surfaces here as a raw lock/sharing violation; promote it to
+                        // the typed, retryable DatabaseLocked (audit C2) rather than a
+                        // generic Io error the contention-retry loop cannot recognize.
+                        return Err(migration_io_error(error));
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     debug!("pre-v3 backup already exists; preserving it");
                 }
-                Err(error) => return Err(PulseDBError::Io(error)),
+                Err(error) => return Err(migration_io_error(error)),
             }
             let reopened = Self::create_database(&path, config)?;
             let reopened_metadata = Self::read_metadata(&reopened)?;
