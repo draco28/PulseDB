@@ -124,7 +124,15 @@ jobs:
           prefix-key: fault-injection
 
       - name: Run kill-at-boundary crash-recovery tests
-        run: cargo test --features fault-injection --test storage_migration_fault_injection
+        # Run SERIALLY (--test-threads=1). Crash arming is thread-local, but the
+        # migration's re-encode runs on the shared rayon pool: when tests run in
+        # parallel the pool's workers are busy, so the injection point can execute
+        # on a worker thread where the arm is invisible and the boundary silently
+        # no-ops ("injection did not fire"). Serial keeps the pool idle so the
+        # calling (armed) thread does the work. These tests also share a
+        # process-global panic hook and one re-execs the test binary — both
+        # additional reasons the suite is serial-only.
+        run: cargo test --features fault-injection --test storage_migration_fault_injection -- --test-threads=1
 
   # ─────────────────────────────────────────────
   # Job 3: MSRV verification (Rust 1.89)

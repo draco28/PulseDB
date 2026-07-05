@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Migration backup sidecar is now crash-atomic.** `backup_once` stages the pristine `.pre-substrate.bak` at a temp path and publishes it via an atomic rename after the `sync_all`, so an abrupt process death mid-copy leaves the final sidecar **absent** — a clean retry re-copies a fresh pristine backup — instead of a truncated file a later open could preserve and trust as a valid rollback point.
+- **A lock-aborted redb v2→v3 upgrade no longer leaves a stale backup sidecar.** When the destructive upgrade aborts because a legacy writer still holds the file (`DatabaseLocked`; the store is untouched), a `.pre-substrate.bak` *written by that attempt* — which may be a stale snapshot — is removed so the retry re-backs-up a fresh copy. A sidecar preserved from an earlier attempt, or one left by a torn in-place upgrade, is kept as the rollback point.
+- **Windows lock classification is scoped to redb-file operations.** The `ERROR_SHARING_VIOLATION` / `ERROR_LOCK_VIOLATION` → `DatabaseLocked` mapping now applies only to the ops that read the store file during backup; a transient sharing violation on the backup sidecar/temp itself (e.g. an antivirus/indexer touching it) surfaces as a plain I/O error rather than a spurious retryable lock.
+
+### Security
+- **Backup staging is symlink-safe.** `backup_once` unlinks any pre-existing entry at its temp staging path and creates the file with `O_EXCL`, so a symlink pre-planted there (by another local user with write access to the database's parent directory) is never followed to write through to an attacker-chosen target.
+
 ## [0.6.0] - 2026-07-05
 
 > **Sprint 4.0 — Storage-Format Modernization.** Adopts the redb 2.x→4.x on-disk file-format major and replaces the unmaintained `bincode` serializer with `postcard`, both behind a tested upgrade-on-open path. A database from a prior release (v0.5.1 / v0.4.0) opens under the new format and reads back identically — verified against **real prior-release on-disk stores** (NFR-020), plus a kill-at-boundary crash-recovery gate.
