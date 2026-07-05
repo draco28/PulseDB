@@ -51,6 +51,15 @@
 //!
 //! Residual gap (documented, not closed): v0.3.0 / WAL-v1 (pre-schema-v2) — neither
 //! fixture covers it (see the VS-4.0.4 spec + 4.01/4.02).
+//!
+//! ## SERIAL-ONLY — run with `--test-threads=1`
+//! Crash arming is thread-local, but the migration's re-encode runs on the shared
+//! rayon pool; under parallel test load the injection point can execute on a busy
+//! worker thread where the arm is invisible, so the boundary silently no-ops
+//! ("injection did not fire"). Running serially keeps the pool idle so the calling
+//! (armed) thread does the work. These tests also share a process-global panic hook
+//! and one re-execs the test binary. CI runs this suite with `--test-threads=1`
+//! (see `.github/workflows/ci.yml` → `fault-injection`); run it the same way locally.
 
 #![cfg(feature = "fault-injection")]
 
@@ -408,6 +417,37 @@ fn torn_upgrade_keeps_sidecar_via_real_wiring_v0_4_0() {
     assert!(
         bak.exists(),
         "a torn (non-lock) upgrade error must KEEP the sidecar as the rollback point"
+    );
+}
+
+#[test]
+fn preserved_sidecar_kept_on_lock_abort_via_real_wiring_v0_4_0() {
+    // PR#57-review P2: a PRE-EXISTING sidecar (a valid rollback point left by an
+    // EARLIER attempt) is PRESERVED by `backup_once` (a no-op), so a later
+    // lock-aborted upgrade must NOT delete it — only a sidecar THIS attempt created
+    // is a disposable this-attempt copy. Guards against discarding a rollback point
+    // that predates the locked retry.
+    let (_tmp, store) = copy_fixture("real-v0.4.0.redb");
+    let bak = pre_substrate_bak(&store);
+    // A valid rollback point left by a hypothetical earlier attempt.
+    std::fs::write(&bak, b"earlier-attempt-rollback-point").unwrap();
+
+    arm_upgrade_fault(UpgradeFault::Locked);
+    let err = PulseDB::open(&store, Config::default()).unwrap_err();
+    disarm_upgrade_fault();
+
+    assert!(
+        matches!(err, PulseDBError::Storage(StorageError::DatabaseLocked)),
+        "the injected lock-abort must surface as DatabaseLocked, got: {err:?}"
+    );
+    assert!(
+        bak.exists(),
+        "a PRESERVED (pre-existing) sidecar must be KEPT on a lock-abort, not deleted"
+    );
+    assert_eq!(
+        std::fs::read(&bak).unwrap(),
+        b"earlier-attempt-rollback-point",
+        "the preserved sidecar must be untouched (neither replaced nor deleted)"
     );
 }
 
