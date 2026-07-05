@@ -293,9 +293,10 @@ fn backup_once(src: &Path, backup_path: &Path) -> Result<BackupOutcome> {
         .create_new(true)
         .open(&temp_path)
         .map_err(PulseDBError::Io)?;
-    // Open the redb file `src`: THIS is the one lock-contention signal — a concurrent
-    // opener holding the redb file lock surfaces on Windows as a raw lock/sharing
-    // violation, so classify it as the typed, retryable DatabaseLocked (audit C2).
+    // Open the redb file `src`: reads of `src` are the lock-contention signal — a
+    // concurrent migrator holding the redb file lock surfaces on Windows as a raw
+    // lock/sharing violation, so classify it as the typed, retryable DatabaseLocked
+    // (audit C2).
     let mut source = match std::fs::File::open(src) {
         Ok(s) => s,
         Err(error) => {
@@ -304,14 +305,31 @@ fn backup_once(src: &Path, backup_path: &Path) -> Result<BackupOutcome> {
             return Err(migration_io_error(error));
         }
     };
-    // The copy writes to OUR temp: a failure here (short write, disk full, or a
-    // Windows sharing violation on the temp) is sidecar-space ⇒ plain `Io`, never
-    // DatabaseLocked. (A rarer mid-copy read error from `src` also lands here as
-    // `Io` — acceptable: far better than mislabeling a temp-write error as a lock.)
-    if let Err(error) = std::io::copy(&mut source, &mut temp_file) {
-        drop(temp_file);
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(PulseDBError::Io(error));
+    // Copy with a manual loop so failures are classified BY SIDE (`io::copy`
+    // conflates them): a READ error on `src` — e.g. a concurrent migrator holding a
+    // redb byte-range lock, which on Windows is `ERROR_LOCK_VIOLATION` (os error 33)
+    // — is genuine lock contention ⇒ the typed retryable DatabaseLocked (audit C2);
+    // a WRITE error to OUR temp (short write, disk full, or an AV/indexer sharing
+    // violation on the temp) is sidecar-space ⇒ plain `Io`, never a false lock.
+    {
+        use std::io::{Read, Write};
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = match source.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(error) => {
+                    drop(temp_file);
+                    let _ = std::fs::remove_file(&temp_path);
+                    return Err(migration_io_error(error)); // `src` read ⇒ lock-classify
+                }
+            };
+            if let Err(error) = temp_file.write_all(&buf[..n]) {
+                drop(temp_file);
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(PulseDBError::Io(error)); // temp write ⇒ plain `Io`
+            }
+        }
     }
     drop(source);
     // VS-4.0.4 (#46) crash boundary: pre-txn, the TEMP bytes are copied but NOT yet
