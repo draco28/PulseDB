@@ -205,78 +205,113 @@ fn pre_substrate_backup_path(path: &Path) -> PathBuf {
     backup
 }
 
-/// Atomically claim and write a backup sidecar of `src` at `backup_path`.
+/// Sibling temp path where [`backup_once`] stages the sidecar bytes before
+/// atomically renaming them onto `backup_path`. A distinct `.tmp` suffix so it
+/// never collides with the published `.pre-substrate.bak`; a crash before the
+/// rename leaves only this temp (the final sidecar path stays absent).
+fn backup_temp_path(backup_path: &Path) -> PathBuf {
+    let mut temp = backup_path.as_os_str().to_owned();
+    temp.push(".tmp");
+    PathBuf::from(temp)
+}
+
+/// Atomically publish a backup sidecar of `src` at `backup_path`.
 ///
-/// Uses the same `create_new`/O_EXCL atomic claim + partial-copy cleanup as the
-/// schema-v3 backup. The first writer to claim the path performs the copy; a
-/// concurrent migrator that lost the race sees `AlreadyExists` and leaves the
-/// genuine sidecar untouched (no TOCTOU between `exists()` and `copy()`). On a
-/// copy failure after the claim (disk full, short write), the partial backup is
-/// removed so a later open does not treat it as a valid sidecar.
+/// The sidecar is the rollback point 4.05's kill-at-boundary crash tests trust,
+/// so it must be **all-or-nothing**: a later open must see either a complete,
+/// pristine sidecar or none at all — never a truncated/partial file it would
+/// mistake for genuine. To guarantee that across an abrupt process death:
 ///
-/// Idempotent: a second call against an already-claimed path is a no-op `Ok(())`.
+/// 1. If `backup_path` already holds a published sidecar, preserve it untouched
+///    and return `Ok(())` — an idempotent no-op (even if `src` has since diverged).
+/// 2. Otherwise stage the copy at a sibling temp path ([`backup_temp_path`]),
+///    `sync_all` its bytes (#53c durability), then **atomically `rename`** it onto
+///    `backup_path`. `rename` is atomic on POSIX and Windows, so the final path
+///    transitions absent → fully-formed in one step (never partially written).
 ///
-/// #53c — durability. The sidecar is the rollback point 4.05's kill-at-boundary
-/// crash tests trust, so it must survive a crash of the migrating process AFTER
-/// the copy but BEFORE the OS flushes its page cache. Without an explicit
-/// `sync_all()`, such a crash leaves a truncated/empty sidecar that the
-/// `AlreadyExists` preserve branch below would later treat as genuine (never
-/// re-copying it), silently discarding the pristine pre-migration bytes. So the
-/// copy is followed by `sync_all()` on the sidecar file AND an `fsync` of the
-/// parent directory (which durably records the new directory entry) before
-/// returning `Ok(())`. The directory fsync is best-effort — on the rare
-/// filesystem/OS where opening a directory for `sync_all` is unsupported, the
-/// file `sync_all` still guarantees the sidecar's own bytes are durable.
+/// #5 / T7 — a crash after the temp copy but before the rename leaves only the
+/// temp; the final path stays ABSENT, so the retry re-copies a fresh pristine
+/// backup. This replaces the earlier `create_new` design, where a hard kill after
+/// the claim but before the fsync left a truncated file at the final path that the
+/// `AlreadyExists` preserve-branch later treated as a genuine sidecar, silently
+/// discarding the pristine pre-migration bytes. The temp is opened create+truncate
+/// (NOT `create_new`) so a stale temp from a prior crash is overwritten, never
+/// wedging the retry.
+///
+/// After the rename, the parent directory is fsync'd (best-effort) so the new
+/// directory entry is itself durable; an unsupported dir-fsync is not fatal — the
+/// sidecar's own bytes were already made durable before the rename.
+///
+/// `backup_once` is only ever called under the exclusive [`MigrationLock`] (see
+/// `create_or_migrate`), so the exists-check + stage + rename does not race a
+/// second migrator.
 fn backup_once(src: &Path, backup_path: &Path) -> Result<()> {
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(backup_path)
-    {
-        Ok(mut backup_file) => {
-            let copy_result = std::fs::File::open(src)
-                .and_then(|mut source| std::io::copy(&mut source, &mut backup_file).map(|_| ()));
-            if let Err(error) = copy_result {
-                drop(backup_file);
-                let _ = std::fs::remove_file(backup_path);
-                // A concurrent opener holding the redb file lock surfaces on Windows
-                // as a raw lock/sharing violation while we read `src` here; classify
-                // it as the typed, retryable DatabaseLocked (audit C2).
-                return Err(migration_io_error(error));
-            }
-            // VS-4.0.4 (#46) crash boundary: pre-txn, sidecar bytes are copied but
-            // NOT yet fsync-durable — the exact window #53c hardens. Compiled out
-            // unless the `fault-injection` feature is on.
-            #[cfg(feature = "fault-injection")]
-            crate::fault_injection::maybe_inject(
-                crate::fault_injection::Boundary::MidBackupPreFsync,
-            );
-            // #53c: fsync the sidecar's own bytes before we consider it genuine —
-            // a crash after the copy but before this flush would otherwise leave a
-            // truncated backup the AlreadyExists branch preserves as valid.
-            if let Err(error) = backup_file.sync_all() {
-                drop(backup_file);
-                let _ = std::fs::remove_file(backup_path);
-                return Err(migration_io_error(error));
-            }
-            drop(backup_file);
-            // #53c: fsync the parent directory so the new sidecar's directory entry
-            // is itself durable (a crash could otherwise lose the entry even though
-            // the file bytes were flushed). Best-effort: unsupported dir-fsync is
-            // not fatal — the sidecar bytes are already durable above.
-            if let Some(parent) = backup_path.parent() {
-                if let Ok(dir) = std::fs::File::open(parent) {
-                    let _ = dir.sync_all();
-                }
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            debug!("backup sidecar already exists; preserving it");
-            Ok(())
-        }
-        Err(error) => Err(migration_io_error(error)),
+    // (1) Idempotent preserve: a genuine sidecar already published at the final
+    // path is kept untouched (never re-copied, even if `src` has since diverged).
+    // This op touches sidecar-space (not the redb file), so a raw I/O error is
+    // never redb lock contention — pass it through as plain `Io`, NOT via
+    // `migration_io_error` (which would mislabel a Windows sharing violation on
+    // the sidecar as the retryable `DatabaseLocked`).
+    if backup_path.try_exists().map_err(PulseDBError::Io)? {
+        debug!("backup sidecar already exists; preserving it");
+        return Ok(());
     }
+
+    // (2) Stage at a sibling temp; a crash before the rename below leaves only this
+    // temp (final path absent), never a partial sidecar. create+truncate (NOT
+    // create_new) so a stale temp from a prior crash is overwritten, not wedged.
+    // Sidecar-space op ⇒ plain `Io` on failure (see the try_exists note above).
+    let temp_path = backup_temp_path(backup_path);
+    let mut temp_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temp_path)
+        .map_err(PulseDBError::Io)?;
+    let copy_result = std::fs::File::open(src)
+        .and_then(|mut source| std::io::copy(&mut source, &mut temp_file).map(|_| ()));
+    if let Err(error) = copy_result {
+        drop(temp_file);
+        let _ = std::fs::remove_file(&temp_path);
+        // This is the ONE op that reads the redb file `src`: a concurrent opener
+        // holding the redb file lock surfaces on Windows as a raw lock/sharing
+        // violation while we read `src` here, so classify it as the typed,
+        // retryable DatabaseLocked (audit C2). (`migration_io_error` is scoped to
+        // `src`-touching ops only; sidecar-space ops above/below use plain `Io`.)
+        return Err(migration_io_error(error));
+    }
+    // VS-4.0.4 (#46) crash boundary: pre-txn, the TEMP bytes are copied but NOT yet
+    // fsync'd/renamed — the exact window #53c + #5 harden. A crash here leaves the
+    // partial temp and NO final sidecar. Compiled out unless `fault-injection` is on.
+    #[cfg(feature = "fault-injection")]
+    crate::fault_injection::maybe_inject(crate::fault_injection::Boundary::MidBackupPreFsync);
+    // #53c: fsync the temp's own bytes so the sidecar we are about to publish is
+    // durable before the rename makes it visible at the final path. Sidecar-space
+    // op ⇒ plain `Io` (a failure here is never redb lock contention).
+    if let Err(error) = temp_file.sync_all() {
+        drop(temp_file);
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(PulseDBError::Io(error));
+    }
+    drop(temp_file);
+    // Atomically publish the completed sidecar: the final path goes absent →
+    // fully-formed in one step. On failure, remove the temp so it cannot wedge.
+    // Sidecar-space op ⇒ plain `Io`: the rename operands are our own temp and the
+    // (absent) sidecar path — never the redb file — so a Windows sharing violation
+    // here (e.g. an AV/indexer transiently holding the temp) must NOT be mislabeled
+    // as the retryable `DatabaseLocked`.
+    if let Err(error) = std::fs::rename(&temp_path, backup_path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(PulseDBError::Io(error));
+    }
+    // #53c: fsync the parent directory so the rename (the new directory entry) is
+    // itself durable. Best-effort — unsupported dir-fsync is not fatal.
+    if let Some(parent) = backup_path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// Deterministic sibling path for the PulseDB-owned migration lock.
@@ -364,6 +399,23 @@ fn migration_io_error(error: std::io::Error) -> PulseDBError {
 /// `DatabaseError::DatabaseAlreadyOpen`, which we map to the typed
 /// [`StorageError::DatabaseLocked`] rather than corrupting or spinning (audit C2).
 fn upgrade_redb_v2_to_v3(path: &Path) -> Result<()> {
+    // Test-only: a forced upgrade outcome lets an integration test drive
+    // `create_or_migrate`'s post-backup sidecar-cleanup branch (#4 / T7)
+    // deterministically. This fires BEFORE the redb-v2 open, so the store is
+    // untouched (matching real DatabaseLocked semantics). Compiled out unless the
+    // `fault-injection` feature is on.
+    #[cfg(feature = "fault-injection")]
+    if let Some(fault) = crate::fault_injection::take_upgrade_fault() {
+        return Err(match fault {
+            crate::fault_injection::UpgradeFault::Locked => {
+                PulseDBError::Storage(StorageError::DatabaseLocked)
+            }
+            crate::fault_injection::UpgradeFault::Torn => PulseDBError::Storage(
+                StorageError::Redb("fault-injection: torn in-place v2->v3 upgrade".into()),
+            ),
+        });
+    }
+
     // Open under redb 2.6 (the v2→v3 bridge). A lock conflict means an old-version
     // process still holds the file — fail typed, do not corrupt.
     let mut db = redb_v2::Database::open(path).map_err(|e| match e {
@@ -385,6 +437,26 @@ fn upgrade_redb_v2_to_v3(path: &Path) -> Result<()> {
     // redb-4.1 reopen. (Returning would drop it anyway; explicit for clarity.)
     drop(db);
     Ok(())
+}
+
+/// Cleans up a now-possibly-stale `.pre-substrate.bak` after the destructive redb
+/// v2→v3 upgrade aborted, given the upgrade `err`.
+///
+/// #4 / T4. The sidecar is claimed by `backup_once` *before* [`upgrade_redb_v2_to_v3`]
+/// runs. If the upgrade aborts with [`StorageError::DatabaseLocked`], the redb-v2
+/// open (not the in-place `upgrade()`) failed, so the store is provably untouched —
+/// and a legacy writer may have committed between the redb-4.1 `UpgradeRequired`
+/// probe and the backup, making the sidecar a STALE snapshot that misses the
+/// writer's latest data. Leaving it lets the next open's `AlreadyExists` branch
+/// preserve it as genuine, so remove it: the retry re-backs-up a fresh pristine
+/// copy. Every OTHER upgrade error (a torn in-place `upgrade()`) KEEPS the sidecar —
+/// there it is the rollback point for a partially-rewritten primary. Best-effort
+/// removal: a failure to unlink is non-fatal (the retry's `backup_once` would still
+/// preserve it, the pre-fix behaviour).
+fn cleanup_stale_backup_if_lock_aborted(path: &Path, err: &PulseDBError) {
+    if matches!(err, PulseDBError::Storage(StorageError::DatabaseLocked)) {
+        let _ = std::fs::remove_file(pre_substrate_backup_path(path));
+    }
 }
 
 /// Reserved legacy bucket for scalar v2 application counts.
@@ -621,7 +693,14 @@ impl RedbStorage {
 
                 // redb v2 -> v3 in place via the aliased redb 2.6; drop the 2.6
                 // handle (release its lock) before the redb-4.1 reopen.
-                upgrade_redb_v2_to_v3(path)?;
+                if let Err(err) = upgrade_redb_v2_to_v3(path) {
+                    // #4 / T4: a lock-aborted upgrade leaves the store untouched, so
+                    // the `.pre-substrate.bak` claimed above may be a stale snapshot;
+                    // remove it so the retry re-backs-up fresh. A torn upgrade (any
+                    // other error) KEEPS the sidecar as the rollback point.
+                    cleanup_stale_backup_if_lock_aborted(path, &err);
+                    return Err(err);
+                }
 
                 // VS-4.0.4 (#46) crash boundary: pre-txn, AFTER the destructive
                 // in-place redb v2→v3 upgrade but BEFORE the redb-4.1 reopen.
@@ -5853,6 +5932,100 @@ mod tests {
             "embedding intact after the contended-then-successful migrate"
         );
         Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_lock_aborted_upgrade_leaves_no_stale_pre_substrate_sidecar() {
+        // #4 / T4: if the destructive redb-v2→v3 upgrade aborts because a legacy
+        // (redb-2.x) writer still holds the file, the `.pre-substrate.bak` claimed
+        // just before it may be a STALE snapshot (it can miss the legacy writer's
+        // latest commit). Leaving it behind lets the next open's `AlreadyExists`
+        // branch preserve it as a genuine rollback point; instead the lock-aborted
+        // migrate must remove it so the retry re-backs-up a fresh pristine copy.
+        //
+        // The DatabaseAlreadyOpen→DatabaseLocked mapping fires either at the redb-4.1
+        // `create` (BEFORE the backup — no sidecar is ever written) or inside
+        // `upgrade_redb_v2_to_v3`'s redb_v2 open (AFTER the backup — where the fix's
+        // cleanup runs). The asserted invariant "no stale sidecar afterward" holds
+        // for both; only the post-backup path exercises the new cleanup branch.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("representative_v2.db");
+        let (collective, experience, _emb) = seed_representative_redb_v2_store(&path);
+        let backup_path = pre_substrate_backup_path(&path);
+
+        // Hold an old-version (redb 2.6) handle open across the contended migrate.
+        let held = redb_v2::Database::builder().open(&path).unwrap();
+
+        let err = RedbStorage::open(&path, &default_config()).unwrap_err();
+        assert!(
+            matches!(err, PulseDBError::Storage(StorageError::DatabaseLocked)),
+            "a legacy lock holder must yield the typed DatabaseLocked, got: {err}"
+        );
+        assert!(
+            !backup_path.exists(),
+            "a lock-aborted upgrade must not leave a stale `.pre-substrate.bak` behind \
+             (it must be removed so the retry re-backs-up a fresh pristine copy)"
+        );
+
+        // Release the holder: the file is uncorrupted and still migratable — a fresh
+        // open migrates and reads every entity back identically, proving the removed
+        // sidecar did not compromise recovery (the store's own bytes were untouched).
+        drop(held);
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+        assert_eq!(
+            RedbStorage::read_substrate_marker(storage.database()).unwrap(),
+            SubstrateFormat::Current
+        );
+        let got_collective = storage.get_collective(collective.id).unwrap().unwrap();
+        assert_collective_eq(&got_collective, &collective);
+        let got_experience = storage.get_experience(experience.id).unwrap().unwrap();
+        assert_experience_eq(&got_experience, &experience);
+        // The successful retry re-created a pristine `.pre-substrate.bak`.
+        assert!(
+            backup_path.exists(),
+            "the successful retry must produce a fresh `.pre-substrate.bak`"
+        );
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_cleanup_stale_backup_removes_sidecar_only_on_lock_abort() {
+        // #4 / T4 — the deterministic unit of the cleanup DECISION (the lock-holder
+        // integration test above can only reach the pre-backup lock stage on this
+        // platform, so it cannot drive this branch directly). A lock-aborted upgrade
+        // (DatabaseLocked ⟹ redb-v2 open failed ⟹ store untouched ⟹ stale sidecar)
+        // must REMOVE the sidecar; any OTHER upgrade error (a torn in-place upgrade)
+        // must KEEP it as the rollback point.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data.db");
+        let backup_path = pre_substrate_backup_path(&path);
+
+        // Lock abort ⇒ remove the (possibly stale) sidecar.
+        std::fs::write(&backup_path, b"stale-snapshot").unwrap();
+        cleanup_stale_backup_if_lock_aborted(
+            &path,
+            &PulseDBError::Storage(StorageError::DatabaseLocked),
+        );
+        assert!(
+            !backup_path.exists(),
+            "a DatabaseLocked upgrade abort must remove the stale sidecar"
+        );
+
+        // Any non-lock upgrade error (torn in-place upgrade) ⇒ KEEP the rollback point.
+        std::fs::write(&backup_path, b"pristine-rollback-point").unwrap();
+        cleanup_stale_backup_if_lock_aborted(
+            &path,
+            &PulseDBError::Storage(StorageError::Redb("torn in-place upgrade".into())),
+        );
+        assert!(
+            backup_path.exists(),
+            "a non-lock upgrade error must KEEP the sidecar as the rollback point"
+        );
+        assert_eq!(
+            std::fs::read(&backup_path).unwrap(),
+            b"pristine-rollback-point",
+            "the kept sidecar must be untouched"
+        );
     }
 
     // ====================================================================

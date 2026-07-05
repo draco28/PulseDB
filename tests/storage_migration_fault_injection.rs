@@ -54,8 +54,10 @@
 
 #![cfg(feature = "fault-injection")]
 
-use pulsedb::fault_injection::{disarm, Action, ArmGuard, Boundary};
-use pulsedb::{Config, ExperienceId, PulseDB};
+use pulsedb::fault_injection::{
+    arm_upgrade_fault, disarm, disarm_upgrade_fault, Action, ArmGuard, Boundary, UpgradeFault,
+};
+use pulsedb::{Config, ExperienceId, PulseDB, PulseDBError, StorageError};
 use redb::{ReadableDatabase, TableDefinition};
 use serde_json::Value;
 use std::panic::AssertUnwindSafe;
@@ -312,7 +314,7 @@ fn post_redb_upgrade_crash_leaves_pristine_sidecar_v0_4_0() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn mid_backup_pre_fsync_store_pristine_and_short_sidecar_not_trusted_v0_4_0() {
+fn mid_backup_pre_fsync_store_pristine_and_no_final_sidecar_v0_4_0() {
     silence_injection_panics();
     let manifest = load_manifest("real-v0.4.0.manifest.json");
     let original = std::fs::read(fixtures_dir().join("real-v0.4.0.redb")).unwrap();
@@ -329,19 +331,84 @@ fn mid_backup_pre_fsync_store_pristine_and_short_sidecar_not_trusted_v0_4_0() {
         "MidBackupPreFsync: the store must be untouched (destructive upgrade never ran)"
     );
 
-    // Truncate any leftover `.pre-substrate.bak` to a short/invalid sidecar, then
-    // show the re-run still succeeds. Because the store file itself is pristine
-    // (upgrade never ran), recovery re-migrates from its OWN intact bytes and never
-    // consults the sidecar — so a truncated leftover is inert (it is not a trusted
-    // sole rollback point here). This makes the `#53c` fsync a belt-and-suspenders
-    // for the separate destroyed-store case, not a dependency of this window.
+    // #5 (T7): `backup_once` builds the sidecar at a temp path and only publishes
+    // it to the FINAL `.pre-substrate.bak` via an atomic rename AFTER the `#53c`
+    // fsync. A crash at MidBackupPreFsync is BEFORE that rename, so the final
+    // sidecar path is ABSENT — never a truncated/partial file a later open could
+    // mistake for a genuine rollback point (the exact `AlreadyExists`-preserves-a-
+    // short-sidecar hazard this fix closes). A stale `.tmp` may remain; it is
+    // never consulted and is overwritten (create+truncate) by the next attempt.
     let bak = pre_substrate_bak(&store);
-    if bak.exists() {
-        let f = std::fs::OpenOptions::new().write(true).open(&bak).unwrap();
-        f.set_len(7).unwrap(); // truncate to a short, invalid sidecar
-    }
+    assert!(
+        !bak.exists(),
+        "MidBackupPreFsync crash must leave NO final `.pre-substrate.bak` \
+         (temp+rename publishes the sidecar only after it is fully fsync'd)"
+    );
 
+    // Recovery re-migrates from the store's OWN pristine bytes (upgrade never ran),
+    // never depending on the sidecar — so a clean re-run reads every entity back.
     assert_clean_rerun_value_identical(&store, &manifest);
+}
+
+// ---------------------------------------------------------------------------
+// #4 / T4 — post-backup upgrade-abort sidecar cleanup (deterministic wiring)
+// A real cross-version lock race surfaces at the PRE-backup redb-4.1 `create` on
+// most platforms, so it cannot deterministically drive the post-backup cleanup.
+// The UpgradeFault seam forces the abort to land INSIDE the destructive upgrade,
+// after `backup_once` — exercising the real create_or_migrate → backup → upgrade →
+// cleanup wiring (not just the cleanup decision in isolation).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lock_aborted_upgrade_removes_sidecar_via_real_wiring_v0_4_0() {
+    // DatabaseLocked ⟹ redb-v2 open failed ⟹ store untouched ⟹ the sidecar
+    // `backup_once` just wrote may be a stale snapshot: it must be REMOVED, and a
+    // disarmed retry must migrate cleanly from the store's OWN intact bytes.
+    let (_tmp, store) = copy_fixture("real-v0.4.0.redb");
+    let manifest = load_manifest("real-v0.4.0.manifest.json");
+    let bak = pre_substrate_bak(&store);
+
+    arm_upgrade_fault(UpgradeFault::Locked);
+    let err = PulseDB::open(&store, Config::default()).unwrap_err();
+    disarm_upgrade_fault();
+
+    assert!(
+        matches!(err, PulseDBError::Storage(StorageError::DatabaseLocked)),
+        "the injected lock-abort must surface as DatabaseLocked, got: {err:?}"
+    );
+    assert!(
+        !bak.exists(),
+        "a lock-aborted upgrade must REMOVE the sidecar `backup_once` wrote (it may be stale)"
+    );
+    // The aborted upgrade left the store untouched (still un-migrated v2).
+    assert!(
+        !marker_is_current(&store),
+        "the lock-aborted upgrade must not have migrated the store"
+    );
+    // The disarmed retry migrates for real and reads every entity back identically.
+    assert_clean_rerun_value_identical(&store, &manifest);
+}
+
+#[test]
+fn torn_upgrade_keeps_sidecar_via_real_wiring_v0_4_0() {
+    // The KEEP branch: a NON-lock upgrade error (a torn in-place upgrade) must KEEP
+    // the `.pre-substrate.bak` — it is the rollback point for a partially-rewritten
+    // primary, not a stale snapshot to discard.
+    let (_tmp, store) = copy_fixture("real-v0.4.0.redb");
+    let bak = pre_substrate_bak(&store);
+
+    arm_upgrade_fault(UpgradeFault::Torn);
+    let err = PulseDB::open(&store, Config::default()).unwrap_err();
+    disarm_upgrade_fault();
+
+    assert!(
+        matches!(err, PulseDBError::Storage(StorageError::Redb(_))),
+        "the injected torn upgrade must surface as a non-lock Redb error, got: {err:?}"
+    );
+    assert!(
+        bak.exists(),
+        "a torn (non-lock) upgrade error must KEEP the sidecar as the rollback point"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -95,6 +95,45 @@ impl Drop for ArmGuard {
     }
 }
 
+/// A forced outcome for the destructive redb v2→v3 upgrade, armable by a test so
+/// it can drive `create_or_migrate`'s post-backup sidecar-cleanup branch (#4 / T7)
+/// deterministically. A real cross-version file-lock race is not enough: on most
+/// platforms it surfaces at the pre-backup redb-4.1 `create`, so the sidecar is
+/// never written and the post-backup cleanup path is never exercised. This forces
+/// the abort to land INSIDE the upgrade (after `backup_once`). Compiled out unless
+/// `fault-injection` is on; it changes no production behavior.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UpgradeFault {
+    /// Abort as if a legacy writer still held the file: the redb-v2 open failed, so
+    /// the store is untouched. `upgrade_redb_v2_to_v3` maps this to `DatabaseLocked`
+    /// (the sidecar must be REMOVED — it may be a stale snapshot).
+    Locked,
+    /// Abort with a non-lock error (a torn in-place `upgrade()`); the sidecar must
+    /// be KEPT as the rollback point.
+    Torn,
+}
+
+thread_local! {
+    static UPGRADE_FAULT: Cell<Option<UpgradeFault>> = const { Cell::new(None) };
+}
+
+/// Arm a forced upgrade outcome on the current thread (consumed on first read, so a
+/// disarmed retry migrates for real).
+pub fn arm_upgrade_fault(fault: UpgradeFault) {
+    UPGRADE_FAULT.with(|c| c.set(Some(fault)));
+}
+
+/// Clear any armed upgrade fault on the current thread.
+pub fn disarm_upgrade_fault() {
+    UPGRADE_FAULT.with(|c| c.set(None));
+}
+
+/// Consume any armed upgrade fault (the migration path calls this at the top of the
+/// destructive upgrade). `None` in the common case.
+pub(crate) fn take_upgrade_fault() -> Option<UpgradeFault> {
+    UPGRADE_FAULT.with(|c| c.take())
+}
+
 /// Called by the migration path at each boundary. When the armed boundary
 /// matches, crash per the armed action; otherwise a no-op.
 pub(crate) fn maybe_inject(boundary: Boundary) {
