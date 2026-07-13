@@ -871,6 +871,15 @@ impl RedbStorage {
             .ok_or_else(|| StorageError::corrupted("Missing database metadata"))?;
 
         match marker {
+            // NOTE: `Absent` (a pre-marker store) and `Older(_)` (a marker present but below
+            // CURRENT_SUBSTRATE_FORMAT) share this single decode path today. They are
+            // intentionally unified because both indicate a bincode-era store that decodes the
+            // same way. IF a future change splits these arms (e.g. to give `Older(_)` a
+            // distinct decode or validation), it MUST add a covering test for the `Older(_)`
+            // branch against a genuine marker-N store in that state — the #53b evidence
+            // currently derives `Older(1)` from a crashed marker-Absent store, which does not
+            // exercise the split path. (VS-4.1.4/4.03 deferred this fixture as speculative
+            // until CURRENT_SUBSTRATE_FORMAT actually bumps; see the slice README disposition.)
             SubstrateFormat::Absent | SubstrateFormat::Older(_) => {
                 legacy_bincode::decode::<DatabaseMetadata>(metadata_bytes.value()).map_err(|e| {
                     StorageError::corrupted(format!("Invalid legacy metadata format: {}", e)).into()
