@@ -72,7 +72,7 @@ use crate::collective::types::CollectiveStats;
 use crate::collective::{validate_collective_name, Collective};
 use crate::config::{Config, DecayConfig, EmbeddingProvider, RecallWeights};
 use crate::embedding::{create_embedding_service, EmbeddingService};
-use crate::error::{NotFoundError, PulseDBError, Result, ValidationError};
+use crate::error::{NotFoundError, PulseDBError, Result, StorageError, ValidationError};
 use crate::experience::{
     energy as experience_energy, validate_experience_update, validate_new_experience, Experience,
     ExperienceUpdate, NewExperience,
@@ -339,7 +339,7 @@ impl PulseDB {
     /// # }
     /// # fn main() -> Result<()> {
     /// # let dir = tempfile::tempdir().unwrap();
-    /// let embedder: Arc<dyn EmbeddingService + Send + Sync> = Arc::new(MyEmbedder);
+    /// let embedder: Arc<dyn EmbeddingService> = Arc::new(MyEmbedder);
     /// let db = PulseDB::open_with_embedder(
     ///     dir.path().join("injected.db"),
     ///     Config::default(),
@@ -353,7 +353,7 @@ impl PulseDB {
     pub fn open_with_embedder(
         path: impl AsRef<Path>,
         config: Config,
-        embedder: Arc<dyn EmbeddingService + Send + Sync>,
+        embedder: Arc<dyn EmbeddingService>,
     ) -> Result<Self> {
         info!("Opening PulseDB with injected embedder");
 
@@ -369,7 +369,14 @@ impl PulseDB {
         // `validate_embedding`). Runs BEFORE the stamp write so a refused
         // reopen writes nothing.
         let injected = embedder.identity();
-        match storage.provider_identity()? {
+        // `should_stamp` threads the match's intent out to the (post-match)
+        // stamp write. Audit challenge 3 (gap — redundant I/O on reopen): the
+        // matching reopen previously re-stamped identical bytes on every open,
+        // issuing a write txn + fsync for no semantic gain. Now only the
+        // lenient-adoption path (no prior stamp) writes; the Match arm
+        // preserves the existing stamp untouched. The mismatch arm returns
+        // before reaching `should_stamp`'s use site.
+        let should_stamp: bool = match storage.provider_identity()? {
             None => {
                 // Lenient no-stamp path (grill-resolved): the store has no
                 // `PROVIDER_IDENTITY_KEY` (a pre-1.03 store, or a store opened
@@ -384,6 +391,7 @@ impl PulseDB {
                     model_id = %injected.model_id,
                     "No persisted provider identity; adopting injected (lenient path)"
                 );
+                true
             }
             Some(persisted) => {
                 if persisted.provider != injected.provider
@@ -394,17 +402,22 @@ impl PulseDB {
                         requested: injected,
                     });
                 }
-                // Match — the persisted stamp already records this identity;
-                // the stamp write below is a benign re-stamp (idempotent).
+                // Match — the persisted stamp already records this identity.
+                // No stamp write needed: re-stamping identical bytes is a
+                // write txn + fsync for no semantic gain (audit challenge 3).
+                false
             }
-        }
+        };
 
         // STAMP — last successful step (audit challenge 4). After this point
         // the only remaining work is the zero-failure `PulseDB` struct
         // assembly, so a stamp written here survives. Any failure above (config
         // validation, storage open, HNSW load, mismatch refusal) returned
-        // before reaching this line — leaving the store unstamped.
-        storage.stamp_provider_identity(&injected)?;
+        // before reaching this line — leaving the store unstamped. Guarded by
+        // `should_stamp` so a matching reopen skips the redundant write.
+        if should_stamp {
+            storage.stamp_provider_identity(&injected)?;
+        }
 
         Ok(Self {
             storage,
@@ -537,15 +550,43 @@ impl PulseDB {
     ///
     /// # Errors
     ///
+    /// Returns the provider identity recorded for this store.
+    ///
+    /// For a store opened via [`open`], no stamp is written, so the in-memory
+    /// identity (config-derived, reconstructible) is authoritative.
+    ///
+    /// For a store opened via [`open_with_embedder`], the persisted stamp is
+    /// the source of truth and SHOULD always be present (it's the last
+    /// successful step of the constructor). A missing stamp on such a store
+    /// means the stamp was LOST — a silent integrity regression — and is
+    /// surfaced as a `StorageError::Corrupted` rather than silently falling
+    /// back to the in-memory embedder identity. Failing loud here prevents a
+    /// torn-write or fsync failure from masquerading as "lenient adoption"
+    /// (audit challenge 1, premise-level).
+    ///
     /// Returns a storage error if the persisted identity cannot be read or
-    /// decoded (corruption). Returns the in-memory identity if no stamp is
-    /// present (a store opened via `open`, or a pre-1.03 store mid-upgrade).
+    /// decoded (corruption).
     #[inline]
     pub fn provider_identity(&self) -> Result<crate::embedding::ProviderIdentity> {
-        Ok(self
-            .storage
-            .provider_identity()?
-            .unwrap_or_else(|| self.embedding.identity()))
+        match self.storage.provider_identity()? {
+            Some(stamped) => Ok(stamped),
+            None => {
+                if self.has_injected_embedder {
+                    // The stamp should ALWAYS be present on an
+                    // `open_with_embedder` store (it's the last successful
+                    // step of the constructor). Its absence means the stamp
+                    // was lost — a silent integrity regression.
+                    Err(StorageError::corrupted(
+                        "provider identity stamp missing on an open_with_embedder store",
+                    )
+                    .into())
+                } else {
+                    // `open` path: identity is config-derived and
+                    // reconstructible, so the in-memory value IS authoritative.
+                    Ok(self.embedding.identity())
+                }
+            }
+        }
     }
 
     // =========================================================================
@@ -2140,6 +2181,11 @@ impl PulseDB {
     #[instrument(skip(self, insight), fields(collective_id = %insight.collective_id))]
     pub fn store_insight(&self, insight: NewDerivedInsight) -> Result<InsightId> {
         self.check_writable()?;
+        // Structurally distinct from `record_experience` (which folds this
+        // check into `validate_new_experience(..., is_external)`): here the
+        // external-embedder gate is applied inline at the resolution site
+        // below (`if is_external { return Err(...) }`). Both behaviors are
+        // equivalent; this asymmetry is intentional, not a bug to flatten.
         let is_external = !self.has_injected_embedder
             && matches!(self.config.embedding_provider, EmbeddingProvider::External);
 
@@ -3528,7 +3574,7 @@ mod open_with_embedder {
         let db = PulseDB::open_with_embedder(
             &path,
             config,
-            embedder.clone() as Arc<dyn EmbeddingService + Send + Sync>,
+            embedder.clone() as Arc<dyn EmbeddingService>,
         )
         .expect("open_with_embedder succeeds");
 
@@ -3604,7 +3650,7 @@ mod open_with_embedder {
         let db = PulseDB::open_with_embedder(
             &path,
             config,
-            embedder.clone() as Arc<dyn EmbeddingService + Send + Sync>,
+            embedder.clone() as Arc<dyn EmbeddingService>,
         )
         .expect("open_with_embedder succeeds");
 
@@ -3666,7 +3712,7 @@ mod open_with_embedder {
         let db = PulseDB::open_with_embedder(
             &path,
             Config::default(),
-            embedder as Arc<dyn EmbeddingService + Send + Sync>,
+            embedder as Arc<dyn EmbeddingService>,
         )
         .expect("open_with_embedder succeeds");
 
@@ -3742,7 +3788,7 @@ mod provider_identity_persistence {
         }
     }
 
-    fn injected(identity: ProviderIdentity) -> Arc<dyn EmbeddingService + Send + Sync> {
+    fn injected(identity: ProviderIdentity) -> Arc<dyn EmbeddingService> {
         Arc::new(StubEmbedder::new(384, identity))
     }
 
@@ -3918,5 +3964,127 @@ mod provider_identity_persistence {
             "failed open left the stamp intact — no overwrite from the refused reopen"
         );
         probe.close().unwrap();
+    }
+
+    /// (f) Audit challenge 1 (premise-level — silent corruption). For a store
+    /// opened via `open_with_embedder`, the stamp should ALWAYS be present
+    /// (it's the last successful step of the constructor). If
+    /// `storage.provider_identity()` returns `None` on such a store, the stamp
+    /// was LOST — a silent integrity regression, not a "lenient adoption."
+    ///
+    /// Pre-fix: the getter silently fell back to `self.embedding.identity()`,
+    /// hiding the corruption. Post-fix: the getter returns a
+    /// `StorageError::Corrupted` (surfaced as `PulseDBError::Storage`).
+    ///
+    /// The missing-stamp state is constructed in-scope by replaying
+    /// `open_with_embedder`'s tail WITHOUT the stamp write — i.e. assemble a
+    /// `PulseDB` from `open_parts` whose `has_injected_embedder` is true but
+    /// whose storage holds no `PROVIDER_IDENTITY_KEY`. This is exactly the
+    /// shape "constructor finished all pre-stamp steps, but the stamp write
+    /// was later lost" (torn write, fsync failure, manual metadata edit).
+    #[test]
+    fn provider_identity_errors_on_missing_stamp_for_injected_store() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("missing-stamp.db");
+
+        let embedder = injected(id("external", "ada-002"));
+        let config = Config::default();
+
+        // Replay `open_with_embedder`'s successful open path, but deliberately
+        // SKIP `stamp_provider_identity` — simulating a lost stamp on an
+        // `open_with_embedder` store. `open_parts` is the shared helper both
+        // constructors use; calling it here mirrors the real constructor tail
+        // minus the stamp. `has_injected_embedder: true` is the load-bearing
+        // bit — it tells the getter this store OUGHT to have a stamp.
+        let (storage, vectors, insight_vectors, watch) =
+            PulseDB::open_parts(&path, &config).expect("open_parts succeeds");
+
+        let unstamped = PulseDB {
+            storage,
+            embedding: embedder,
+            config,
+            vectors: RwLock::new(vectors),
+            insight_vectors: RwLock::new(insight_vectors),
+            watch,
+            has_injected_embedder: true,
+        };
+
+        // Sanity: the storage layer genuinely has no stamp (the precondition).
+        assert_eq!(
+            unstamped.storage.provider_identity().expect("storage read"),
+            None,
+            "test precondition: stamp is absent"
+        );
+
+        // The getter MUST surface this as corruption, NOT silently fall back
+        // to the in-memory embedder identity.
+        let err = unstamped
+            .provider_identity()
+            .expect_err("missing stamp on an injected store is corruption, not a fallback");
+        match err {
+            PulseDBError::Storage(storage_err) => {
+                let msg = storage_err.to_string();
+                assert!(
+                    msg.to_lowercase().contains("corrupt"),
+                    "expected a Corrupted-class storage error, got: {msg}"
+                );
+                assert!(
+                    msg.contains("provider identity stamp missing"),
+                    "expected the corruption message to name the missing stamp, got: {msg}"
+                );
+            }
+            other => panic!("expected PulseDBError::Storage(Corrupted(..)), got {other:?}"),
+        }
+
+        unstamped.close().unwrap();
+    }
+
+    /// (g) Audit challenge 3 (gap — redundant I/O on reopen). A successful
+    /// reopen whose injected identity MATCHES the persisted stamp should NOT
+    /// re-stamp — the bytes are identical and the write txn + fsync is pure
+    /// overhead on the hot open path. The structural guard (`should_stamp`)
+    /// is in place and grep-verified (AC-3); this BEHAVIORAL assertion is
+    /// the harder half.
+    ///
+    /// DEFERRED (handoff §4 item 5: "do not skip silently"). Two witness
+    /// strategies were attempted, both infeasible within the `src/db.rs`-only
+    /// scope of this work item:
+    ///
+    /// 1. **mtime-unchanged observation.** Fails because `open_existing`
+    ///    (redb.rs ~1171-1256) ALWAYS issues a write txn on reopen when
+    ///    `!read_only` — it calls `metadata.touch()` (bumps `last_opened_at`)
+    ///    and rewrites `METADATA_KEY` unconditionally. That write pollutes
+    ///    the store file's mtime regardless of whether `stamp_provider_identity`
+    ///    fires, so mtime cannot distinguish "stamped" from "not stamped."
+    ///    (Verified empirically: the assertion fails by ~88ms even with the
+    ///    `should_stamp` guard in place.)
+    ///
+    /// 2. **content-spy on `stamp_provider_identity` call count.** Would
+    ///    require a delegating `impl StorageEngine for StampCountingSpy` that
+    ///    forwards all 53 trait methods to an inner `Box<dyn StorageEngine>`
+    ///    while counting the stamp call. `StorageEngine` has no `as_any` /
+    ///    downcast path, and adding `clear_provider_identity` or `as_any` to
+    ///    the trait would edit `src/storage/mod.rs` (out of scope for 1.05).
+    ///    A 53-method spy is the "non-trivial new test infra" the handoff
+    ///    explicitly allows deferring.
+    ///
+    /// The fix itself (`should_stamp` threading) is sound and low-risk: the
+    /// Match arm sets `should_stamp = false` and the stamp call is guarded by
+    /// `if should_stamp { ... }`. Reopen with a matching identity provably
+    /// takes the Match arm (the existing `stamp_round_trips_across_reopen_with_same_provider`
+    /// test confirms the persisted value is read back identically). What's
+    /// missing is only the negative behavioral witness.
+    ///
+    /// RESUME: a follow-up work item should either (a) add a test-only
+    /// `stamp_call_count()` accessor to `StorageEngine` (or an `as_any`
+    /// downcast path) and convert this to a real assertion, or (b) extract a
+    /// minimal `ProviderIdentityStore` sub-trait that `open_with_embedder`
+    /// depends on, so a focused spy can be implemented over the small surface.
+    #[test]
+    #[ignore = "AC-3 behavioral witness deferred — see report §6 Deferrals; \
+                structural guard is in place and grep-verified (AC-3)"]
+    fn matching_reopen_skips_redundant_stamp() {
+        // Skipped body kept as living documentation of the intended assertion.
+        // When the spy infra lands, restore the mtime-independent witness here.
     }
 }
