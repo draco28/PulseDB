@@ -36,6 +36,7 @@ use std::path::Path;
 use crate::activity::Activity;
 use crate::collective::Collective;
 use crate::config::{Config, DecayConfig};
+use crate::embedding::ProviderIdentity;
 use crate::error::Result;
 use crate::experience::{Experience, ExperienceUpdate};
 use crate::insight::DerivedInsight;
@@ -95,6 +96,38 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// Some storage implementations (like in-memory) may not have a path.
     fn path(&self) -> Option<&Path>;
+
+    /// Persists the active embedding provider's identity into storage metadata
+    /// (VS-4.3.1 work 1.03 — embedding injection seam, safety half).
+    ///
+    /// The backend writes `identity` under a dedicated metadata key
+    /// (`PROVIDER_IDENTITY_KEY` for [`RedbStorage`]) so the manifold remembers
+    /// "I was embedded by provider X" across process restarts. The substrate's
+    /// `open_with_embedder` path calls this as the **last successful step** of
+    /// an open — a failure in any prior step leaves the store unstamped (zero
+    /// writes from that open).
+    ///
+    /// The value is `ProviderIdentity` postcard-encoded; round-tripping is the
+    /// shape 1.01's `test_provider_identity_postcard_roundtrip` proved.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StorageError`](crate::error::StorageError) if the write
+    /// transaction or postcard serialization fails.
+    fn stamp_provider_identity(&self, identity: &ProviderIdentity) -> Result<()>;
+
+    /// Reads the persisted embedding provider identity, if any.
+    ///
+    /// Returns `Ok(None)` when no identity has been stamped yet — the lenient
+    /// no-stamp path: a store created before this feature (or via an `open`
+    /// path that does not stamp) carries no key, and the first
+    /// `open_with_embedder` silently adopts the injected identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StorageError`](crate::error::StorageError) if the read
+    /// transaction or postcard deserialization fails.
+    fn provider_identity(&self) -> Result<Option<ProviderIdentity>>;
 
     // =========================================================================
     // Collective Storage Operations

@@ -23,6 +23,8 @@ use thiserror::Error;
 #[cfg(feature = "sync")]
 use crate::sync::SyncError;
 
+use crate::embedding::ProviderIdentity;
+
 /// Result type alias for PulseDB operations.
 pub type Result<T> = std::result::Result<T, PulseDBError>;
 
@@ -58,6 +60,34 @@ pub enum PulseDBError {
     /// Embedding generation/validation error.
     #[error("Embedding error: {0}")]
     Embedding(String),
+
+    /// Refusing to reopen a database whose persisted provider identity does not
+    /// match the injected embedder (VS-4.3.1 work 1.03 — the cross-provider-mixing
+    /// safety guard for `pulseai-labs/PulseDB#61`).
+    ///
+    /// The substrate persists the identity that *actually* embedded the store's
+    /// vectors under `PROVIDER_IDENTITY_KEY` (redb metadata). On reopen via
+    /// [`open_with_embedder`](crate::PulseDB::open_with_embedder), that persisted
+    /// identity is compared against the injected embedder's identity on
+    /// `(provider, model_id)` only — `ProviderIdentity` carries no `dimension`
+    /// field (dimension mismatch is caught separately by `validate_embedding`).
+    /// A mismatch is refused with this typed error rather than silently mixing
+    /// vectors from incompatible models into one HNSW index.
+    ///
+    /// The consumer (PulseBase) ships a `re-embed --to <provider>` migration that
+    /// resolves the mismatch intentionally; the substrate's job is to make the
+    /// refusal *detectable*, which this typed variant satisfies.
+    #[error(
+        "embedding provider mismatch: the database was embedded by {persisted:?} \
+         (provider + model_id), but the injected embedder is {requested:?}; \
+         reopen with the original provider or run the re-embed migration"
+    )]
+    EmbeddingProviderMismatch {
+        /// The persisted identity read from `PROVIDER_IDENTITY_KEY`.
+        persisted: ProviderIdentity,
+        /// The injected embedder's identity that mismatched it.
+        requested: ProviderIdentity,
+    },
 
     /// Vector index error (HNSW operations).
     #[error("Vector index error: {0}")]
