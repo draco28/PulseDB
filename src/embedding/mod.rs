@@ -89,6 +89,13 @@ pub struct ProviderIdentity {
 ///     fn dimension(&self) -> usize {
 ///         self.dimension
 ///     }
+///
+///     fn identity(&self) -> pulsedb::embedding::ProviderIdentity {
+///         pulsedb::embedding::ProviderIdentity {
+///             provider: "my-api".to_string(),
+///             model_id: format!("my-model-{}", self.dimension),
+///         }
+///     }
 /// }
 /// ```
 pub trait EmbeddingService: Send + Sync {
