@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Embedding injection seam (`PulseDB::open_with_embedder`).** A downstream consumer can now drive embed-on-write through its own `impl EmbeddingService` instead of pre-computing vectors and passing `Some(vec)` on every write. Pass an `Arc<dyn EmbeddingService + Send + Sync>` at open; `record_experience`/`record_insight` with `embedding: None` route through it. The existing `PulseDB::open` path is unchanged. Unblocks embedded-Rust consumers (e.g. PulseBase). Closes #61.
+- **Provider identity travels with the manifold.** Every `EmbeddingService` now declares a `ProviderIdentity` (provider name + model id) via a required `identity()` trait method. `PulseDB::provider_identity()` returns the identity stamped into the store's persisted metadata — so the open database reports which provider embedded its contents.
+- **Cross-provider-mismatch guard.** Re-opening an existing manifold via `open_with_embedder` with an embedder whose persisted identity differs from the stored one is refused with a typed `PulseDBError::EmbeddingProviderMismatch` — preventing silent cross-provider vector mixing in a single HNSW index.
+
+### Known Limitations
+- **First `open_with_embedder` of a pre-0.7.0 store silently adopts the passed provider's identity.** Stores created by `PulseDB::open` (builtin/external, the 0.6.0-and-earlier path) carry no `PROVIDER_IDENTITY_KEY`; the first time one is opened via `open_with_embedder`, the injected embedder's identity is stamped as ground truth without verification. If you have a pre-0.7.0 store whose vectors were produced by a *different* model than the one you first open it with, that store will be mislabeled and the mismatch guard will subsequently "protect" the wrong identity. This is a one-time, at-the-upgrade-boundary behavior; stores created under 0.7.0+ via `open_with_embedder` always carry a verified stamp. (The `PulseDB::open` path itself does not stamp — only `open_with_embedder` does.)
+
 ### Fixed
 - **Migration backup sidecar is now crash-atomic.** `backup_once` stages the pristine `.pre-substrate.bak` at a temp path and publishes it via an atomic rename after the `sync_all`, so an abrupt process death mid-copy leaves the final sidecar **absent** — a clean retry re-copies a fresh pristine backup — instead of a truncated file a later open could preserve and trust as a valid rollback point.
 - **A lock-aborted redb v2→v3 upgrade no longer leaves a stale backup sidecar.** When the destructive upgrade aborts because a legacy writer still holds the file (`DatabaseLocked`; the store is untouched), a `.pre-substrate.bak` *written by that attempt* — which may be a stale snapshot — is removed so the retry re-backs-up a fresh copy. A sidecar preserved from an earlier attempt, or one left by a torn in-place upgrade, is kept as the rollback point.
