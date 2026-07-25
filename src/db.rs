@@ -135,6 +135,21 @@ pub struct PulseDB {
     /// Arc-wrapped because [`WatchStream`] holds a weak reference for
     /// cleanup on drop.
     watch: Arc<WatchService>,
+
+    /// Whether this `PulseDB` was opened via [`open_with_embedder`] (true) or
+    /// [`open`] (false). Set at the divergence point in each constructor —
+    /// NOT inside [`open_parts`] (the shared helper does not know which path
+    /// called it).
+    ///
+    /// When true, the validation gate in [`record_experience`] and
+    /// [`store_insight`] treats `embedding: None` as always valid: an injected
+    /// embedder handles it regardless of what [`EmbeddingProvider`](crate::config::EmbeddingProvider)
+    /// the config carries. When false, the pre-1.04 behavior is preserved
+    /// exactly (`External` still requires pre-computed embeddings).
+    ///
+    /// Private + instance-level: not part of [`Config`](crate::config::Config),
+    /// does not serialize, does not affect any public signature.
+    has_injected_embedder: bool,
 }
 
 impl std::fmt::Debug for PulseDB {
@@ -218,6 +233,7 @@ impl PulseDB {
             vectors: RwLock::new(vectors),
             insight_vectors: RwLock::new(insight_vectors),
             watch,
+            has_injected_embedder: false,
         })
     }
 
@@ -397,6 +413,7 @@ impl PulseDB {
             vectors: RwLock::new(vectors),
             insight_vectors: RwLock::new(insight_vectors),
             watch,
+            has_injected_embedder: true,
         })
     }
 
@@ -1023,7 +1040,8 @@ impl PulseDB {
     #[instrument(skip(self, exp), fields(collective_id = %exp.collective_id))]
     pub fn record_experience(&self, exp: NewExperience) -> Result<ExperienceId> {
         self.check_writable()?;
-        let is_external = matches!(self.config.embedding_provider, EmbeddingProvider::External);
+        let is_external = !self.has_injected_embedder
+            && matches!(self.config.embedding_provider, EmbeddingProvider::External);
 
         // Verify collective exists and get its dimension
         let collective = self
@@ -2122,7 +2140,8 @@ impl PulseDB {
     #[instrument(skip(self, insight), fields(collective_id = %insight.collective_id))]
     pub fn store_insight(&self, insight: NewDerivedInsight) -> Result<InsightId> {
         self.check_writable()?;
-        let is_external = matches!(self.config.embedding_provider, EmbeddingProvider::External);
+        let is_external = !self.has_injected_embedder
+            && matches!(self.config.embedding_provider, EmbeddingProvider::External);
 
         // Validate input fields
         validate_new_insight(&insight)?;
@@ -3548,6 +3567,88 @@ mod open_with_embedder {
         assert!(
             embedded.iter().any(|c| c == insight_content),
             "store_insight must route content through the injected embedder; saw: {embedded:?}"
+        );
+
+        db.close().unwrap();
+    }
+
+    /// Regression for the VS-4.3.1 slice-close manual-demo defect (work 1.04).
+    ///
+    /// `open_with_embedder` + `EmbeddingProvider::External` (the natural config
+    /// for a consumer like PulseBase that supplies its own embedder) MUST accept
+    /// `record_experience { embedding: None }` and route the content through the
+    /// injected embedder. Before 1.04, `record_experience` derived `is_external`
+    /// purely from `config.embedding_provider`, so the `External` config tripped
+    /// the "embedding required" gate even though an injected embedder was
+    /// present — `Validation(RequiredField { field: "embedding (required when
+    /// using External embedding provider)" })`.
+    ///
+    /// This test uses `Config::default()` (whose `embedding_provider` is
+    /// `EmbeddingProvider::External`) on purpose: a `Builtin`-config test would
+    /// pass before AND after the fix and prove nothing (the 1.02 test missed the
+    /// bug for exactly this reason). The end-to-end manual-demo prototype
+    /// surfaced it; this unit test is the durable guard.
+    #[test]
+    fn open_with_embedder_with_external_config_accepts_embedding_none() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("external-injected.db");
+
+        let embedder = Arc::new(RecordingEmbedding::new(384));
+        // Config::default() carries EmbeddingProvider::External — the bug only
+        // manifests under this variant.
+        let config = Config::default();
+        assert!(
+            config.embedding_provider.is_external(),
+            "test setup invariant: Config::default() must use EmbeddingProvider::External"
+        );
+        let db = PulseDB::open_with_embedder(
+            &path,
+            config,
+            embedder.clone() as Arc<dyn EmbeddingService + Send + Sync>,
+        )
+        .expect("open_with_embedder succeeds");
+
+        let collective_id = db
+            .create_collective("external-injected-seam")
+            .expect("create collective");
+
+        // record_experience with embedding: None under External config — must
+        // succeed and route through the injected embedder, NOT trip the
+        // RequiredField { embedding } gate.
+        let exp_content = "experience recorded via injected embedder under External config";
+        let exp = NewExperience {
+            collective_id,
+            content: exp_content.to_string(),
+            embedding: None,
+            ..Default::default()
+        };
+        let exp_id = db
+            .record_experience(exp)
+            .expect("record_experience accepts embedding: None when an embedder is injected");
+
+        // Symmetric check on store_insight — the same derivation lives there
+        // (db.rs:2125) and must be fixed in lockstep.
+        let insight_content = "insight recorded via injected embedder under External config";
+        let insight = NewDerivedInsight {
+            collective_id,
+            content: insight_content.to_string(),
+            embedding: None,
+            source_experience_ids: vec![exp_id],
+            insight_type: InsightType::Pattern,
+            confidence: 0.8,
+            domain: Vec::new(),
+        };
+        db.store_insight(insight)
+            .expect("store_insight accepts embedding: None when an embedder is injected");
+
+        let embedded = embedder.embedded_texts();
+        assert!(
+            embedded.iter().any(|c| c == exp_content),
+            "record_experience must route content through the injected embedder under External config; saw: {embedded:?}"
+        );
+        assert!(
+            embedded.iter().any(|c| c == insight_content),
+            "store_insight must route content through the injected embedder under External config; saw: {embedded:?}"
         );
 
         db.close().unwrap();
