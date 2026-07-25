@@ -283,6 +283,18 @@ pub const ACTIVITIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new
 /// protocol to identify this PulseDB instance.
 pub const INSTANCE_ID_KEY: &str = "instance_id";
 
+/// Metadata key for the persisted embedding provider identity
+/// (VS-4.3.1 work 1.03 — embedding injection seam, safety half).
+///
+/// Stored in `METADATA_TABLE` as postcard-encoded `ProviderIdentity` bytes
+/// (the round-trip shape 1.01's `test_provider_identity_postcard_roundtrip`
+/// proved). Lives alongside `"instance_id"` and `"substrate_format"`. Stamped
+/// by `RedbStorage::stamp_provider_identity` as the **last successful step**
+/// of `open_with_embedder`; absent for stores created via `open` (the lenient
+/// no-stamp path silently adopts the injected identity on first
+/// `open_with_embedder`).
+pub const PROVIDER_IDENTITY_KEY: &str = "provider_identity";
+
 /// Sync cursors table — per-peer sync position tracking.
 ///
 /// Each entry records the last WAL sequence number successfully synced
