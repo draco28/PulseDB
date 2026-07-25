@@ -105,8 +105,14 @@ pub struct PulseDB {
     /// Storage engine (redb or mock for testing).
     storage: Box<dyn StorageEngine>,
 
-    /// Embedding service (external or ONNX).
-    embedding: Box<dyn EmbeddingService>,
+    /// Embedding service (external or ONNX), or a caller-injected instance.
+    ///
+    /// Held as `Arc<dyn>` (was `Box<dyn>`) so a caller that retains a handle
+    /// to the embedder — e.g. PulseBase wiring its candle stack into other
+    /// subsystems — shares the same instance that backs this open `PulseDB`.
+    /// Both embed call sites (`record_experience` and `store_insight`) reach
+    /// the injected instance through this field.
+    embedding: Arc<dyn EmbeddingService>,
 
     /// Configuration used to open this database.
     config: Config,
@@ -186,16 +192,77 @@ impl PulseDB {
     /// ```
     #[instrument(skip(config), fields(path = %path.as_ref().display()))]
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self> {
+        // Build the embedder internally (unchanged contract) and delegate to
+        // `open_with_embedder`. The `Box`→`Arc` conversion happens here so
+        // `create_embedding_service` keeps its existing `Box<dyn>` return type.
+        let embedding: Arc<dyn EmbeddingService> = Arc::from(create_embedding_service(&config)?);
+        Self::open_with_embedder(path, config, embedding)
+    }
+
+    /// Opens or creates a PulseDB database with a **caller-supplied** embedding
+    /// service (VS-4.3.1, work 1.02 — embedding injection seam).
+    ///
+    /// This is the Phase-0-unblocking constructor for downstream consumers
+    /// (e.g. PulseBase) that own their embedding stack and want
+    /// `record_experience` / `store_insight` to embed-on-write through their
+    /// own provider. The same `Arc<dyn>` instance backs the open `PulseDB`
+    /// and the caller's retained handle.
+    ///
+    /// The injected embedder bypasses [`EmbeddingProvider`] / [`Config`]
+    /// entirely — it is passed in, not encoded in `Config`. Validation,
+    /// storage open, and HNSW index load behave identically to [`open`].
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the database file (created if it doesn't exist)
+    /// * `config` - Configuration options for the database
+    /// * `embedder` - Caller-supplied embedding service (shared ownership)
+    ///
+    /// # Errors
+    ///
+    /// Same failure modes as [`open`] (invalid config, corrupted file, lock
+    /// contention, schema mismatch) plus whatever the injected embedder
+    /// raises when embed-on-write is invoked.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use pulsedb::{PulseDB, Config, Result, embedding::EmbeddingService};
+    /// # use std::sync::Arc;
+    /// # struct MyEmbedder;
+    /// # impl EmbeddingService for MyEmbedder {
+    /// #     fn embed(&self, _: &str) -> pulsedb::Result<Vec<f32>> { Ok(vec![0.0; 384]) }
+    /// #     fn embed_batch(&self, _: &[&str]) -> pulsedb::Result<Vec<Vec<f32>>> { Ok(vec![]) }
+    /// #     fn dimension(&self) -> usize { 384 }
+    /// #     fn identity(&self) -> pulsedb::embedding::ProviderIdentity {
+    /// #         pulsedb::embedding::ProviderIdentity { provider: "mine".into(), model_id: "m-1".into() }
+    /// #     }
+    /// # }
+    /// # fn main() -> Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// let embedder: Arc<dyn EmbeddingService + Send + Sync> = Arc::new(MyEmbedder);
+    /// let db = PulseDB::open_with_embedder(
+    ///     dir.path().join("injected.db"),
+    ///     Config::default(),
+    ///     embedder,
+    /// )?;
+    /// # drop(db);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(skip(config, embedder), fields(path = %path.as_ref().display()))]
+    pub fn open_with_embedder(
+        path: impl AsRef<Path>,
+        config: Config,
+        embedder: Arc<dyn EmbeddingService + Send + Sync>,
+    ) -> Result<Self> {
         // Validate configuration first
         config.validate().map_err(PulseDBError::from)?;
 
-        info!("Opening PulseDB");
+        info!("Opening PulseDB with injected embedder");
 
         // Open storage engine
         let storage = open_storage(&path, &config)?;
-
-        // Create embedding service
-        let embedding = create_embedding_service(&config)?;
 
         // Load or rebuild HNSW indexes for all existing collectives
         let vectors = Self::load_all_indexes(&*storage, &config)?;
@@ -215,7 +282,7 @@ impl PulseDB {
 
         Ok(Self {
             storage,
-            embedding,
+            embedding: embedder,
             config,
             vectors: RwLock::new(vectors),
             insight_vectors: RwLock::new(insight_vectors),
@@ -323,6 +390,22 @@ impl PulseDB {
     #[inline]
     pub fn embedding_dimension(&self) -> usize {
         self.config.embedding_dimension.size()
+    }
+
+    /// Returns the persistable identity of this database's embedding provider
+    /// (VS-4.3.1, work 1.02 — embedding injection seam).
+    ///
+    /// **This round reads from the in-memory embedder** (`self.embedding.identity()`)
+    /// and does NOT survive a reopen — identity is not yet persisted. Work item
+    /// 1.03 swaps this read site to a stamp persisted into redb metadata. The
+    /// getter's signature is stable across both rounds.
+    ///
+    /// For a database opened via [`open`], this is the identity of the
+    /// internally-built embedder; for [`open_with_embedder`], it is the identity
+    /// of the caller-supplied instance.
+    #[inline]
+    pub fn provider_identity(&self) -> crate::embedding::ProviderIdentity {
+        self.embedding.identity()
     }
 
     // =========================================================================
@@ -3199,6 +3282,186 @@ mod tests {
             "the archived cold experience does NOT appear"
         );
 
+        db.close().unwrap();
+    }
+}
+
+// ============================================================================
+// open_with_embedder — embedding injection seam (VS-4.3.1, work 1.02)
+// ============================================================================
+//
+// Isolated test module so the AC filter `cargo test --lib db::open_with_embedder`
+// matches by full path (`db::open_with_embedder::*`).
+//
+// Audit challenge 2 (load-bearing): these tests exercise BOTH `record_experience`
+// AND `store_insight` routing through the injected embedder — not just the
+// experience path. Both reach the injected embedder via the `Box`→`Arc` field
+// swap (db.rs `self.embedding`), and the recording-stub asserts both contents
+// landed in the embedder, so coverage is tested rather than accidental.
+#[cfg(test)]
+mod open_with_embedder {
+    use super::*;
+    use crate::config::EmbeddingDimension;
+    use crate::embedding::{EmbeddingService, ProviderIdentity};
+    use crate::experience::NewExperience;
+    use crate::insight::{InsightType, NewDerivedInsight};
+    use crate::Embedding;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
+
+    /// A stub `EmbeddingService` that records every text it is asked to embed
+    /// and emits a deterministic, content-tagged vector. Used to prove that
+    /// `record_experience` and `store_insight` both route through the
+    /// injected embedder (audit challenge 2).
+    struct RecordingEmbedding {
+        dimension: usize,
+        embedded: Mutex<Vec<String>>,
+        identity: ProviderIdentity,
+    }
+
+    impl RecordingEmbedding {
+        fn new(dimension: usize) -> Self {
+            Self {
+                dimension,
+                embedded: Mutex::new(Vec::new()),
+                identity: ProviderIdentity {
+                    provider: "stub-injected".to_string(),
+                    model_id: format!("recording-{dimension}"),
+                },
+            }
+        }
+
+        fn embedded_texts(&self) -> Vec<String> {
+            self.embedded.lock().expect("embedded lock").clone()
+        }
+    }
+
+    impl EmbeddingService for RecordingEmbedding {
+        fn embed(&self, text: &str) -> Result<Embedding> {
+            self.embedded
+                .lock()
+                .expect("embedded lock")
+                .push(text.to_string());
+            // Deterministic non-zero vector so HNSW insertion accepts it.
+            Ok(vec![0.5f32; self.dimension])
+        }
+
+        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Embedding>> {
+            let mut guard = self.embedded.lock().expect("embedded lock");
+            let mut out = Vec::with_capacity(texts.len());
+            for t in texts {
+                guard.push((*t).to_string());
+                out.push(vec![0.5f32; self.dimension]);
+            }
+            Ok(out)
+        }
+
+        fn dimension(&self) -> usize {
+            self.dimension
+        }
+
+        fn identity(&self) -> ProviderIdentity {
+            self.identity.clone()
+        }
+    }
+
+    /// AC-1, AC-3: `open_with_embedder` exists and routes BOTH record paths
+    /// through the injected embedder. Records an experience AND an insight
+    /// (both with `embedding: None`) and asserts the stub saw both contents —
+    /// proving `record_experience` (db.rs ~836) and `store_insight`
+    /// (db.rs ~1963) reach the injected instance via the shared field.
+    ///
+    /// Uses `Config::with_builtin_embeddings()` because the `None`-embedding
+    /// branch (embed-on-write) is only taken when the configured provider is
+    /// not `External`. The injected embedder bypasses `EmbeddingProvider`
+    /// (per spec §3), and the `Builtin` config value is the one that admits
+    /// `embedding: None` on record.
+    #[test]
+    fn routes_both_record_paths_through_injected_embedder() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("injected.db");
+
+        let embedder = Arc::new(RecordingEmbedding::new(384));
+        let config = Config::with_builtin_embeddings();
+        let db = PulseDB::open_with_embedder(
+            &path,
+            config,
+            embedder.clone() as Arc<dyn EmbeddingService + Send + Sync>,
+        )
+        .expect("open_with_embedder succeeds");
+
+        let collective_id = db
+            .create_collective("injected-seam")
+            .expect("create collective");
+
+        // record_experience with embedding: None -> must hit self.embedding.embed
+        let exp_content = "experience routed through injected embedder";
+        let exp = NewExperience {
+            collective_id,
+            content: exp_content.to_string(),
+            embedding: None,
+            ..Default::default()
+        };
+        let exp_id = db.record_experience(exp).expect("record_experience");
+
+        // store_insight with embedding: None -> must ALSO hit self.embedding.embed
+        let insight_content = "insight routed through injected embedder";
+        let insight = NewDerivedInsight {
+            collective_id,
+            content: insight_content.to_string(),
+            embedding: None,
+            source_experience_ids: vec![exp_id],
+            insight_type: InsightType::Pattern,
+            confidence: 0.8,
+            domain: Vec::new(),
+        };
+        db.store_insight(insight).expect("store_insight");
+
+        let embedded = embedder.embedded_texts();
+        assert!(
+            embedded.iter().any(|c| c == exp_content),
+            "record_experience must route content through the injected embedder; saw: {embedded:?}"
+        );
+        assert!(
+            embedded.iter().any(|c| c == insight_content),
+            "store_insight must route content through the injected embedder; saw: {embedded:?}"
+        );
+
+        db.close().unwrap();
+    }
+
+    /// AC-4: `provider_identity()` reads from the in-memory injected embedder
+    /// (this round — 1.03 swaps the read site to persisted metadata).
+    #[test]
+    fn provider_identity_reads_from_injected_embedder() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("identity.db");
+
+        let embedder = Arc::new(RecordingEmbedding::new(384));
+        let db = PulseDB::open_with_embedder(
+            &path,
+            Config::default(),
+            embedder as Arc<dyn EmbeddingService + Send + Sync>,
+        )
+        .expect("open_with_embedder succeeds");
+
+        let id = db.provider_identity();
+        assert_eq!(id.provider, "stub-injected");
+        assert_eq!(id.model_id, "recording-384");
+
+        db.close().unwrap();
+    }
+
+    /// The existing `open` path is unchanged: it delegates to
+    /// `open_with_embedder` with an internally-built embedder and behaves
+    /// exactly as before (regression guard for the delegation refactor).
+    #[test]
+    fn open_delegates_and_still_works() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("delegate.db");
+
+        let db = PulseDB::open(&path, Config::default()).expect("open succeeds via delegation");
+        assert_eq!(db.embedding_dimension(), EmbeddingDimension::D384.size());
         db.close().unwrap();
     }
 }
