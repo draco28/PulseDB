@@ -26,8 +26,35 @@
 #[cfg_attr(docsrs, doc(cfg(feature = "builtin-embeddings")))]
 pub mod onnx;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{PulseDBError, Result};
 use crate::types::Embedding;
+
+/// Persistable identity of an `EmbeddingService` impl.
+///
+/// Carries the opaque tokens the embedding-injection seam (VS-4.3.1) stamps
+/// into persisted metadata so a later re-open can detect that a *different*
+/// provider embedded the existing vectors and refuse the mismatch (work item
+/// 1.03). Fields are deliberately `provider` + `model_id` ONLY — **no
+/// `dimension`**. Dimension already has a single source of truth in
+/// [`EmbeddingService::dimension`]; carrying it here would create two values
+/// that can drift. (Audit challenge 3 accepted.)
+///
+/// The exact string values are opaque identity tokens: they need not match any
+/// external registry, but MUST be stable across runs of the same impl and
+/// across machines (derived from deterministic inputs, never runtime state
+/// like a timestamp or absolute path).
+///
+/// `Serialize` + `Deserialize` (via postcard) is the shape 1.03 persists into
+/// redb metadata; see `test_provider_identity_postcard_roundtrip`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderIdentity {
+    /// Opaque provider name, e.g. `"external"` or `"builtin-onnx"`.
+    pub provider: String,
+    /// Opaque, stable model identifier derived deterministically by the impl.
+    pub model_id: String,
+}
 
 /// Embedding service trait for generating vector representations of text.
 ///
@@ -61,6 +88,13 @@ use crate::types::Embedding;
 ///
 ///     fn dimension(&self) -> usize {
 ///         self.dimension
+///     }
+///
+///     fn identity(&self) -> pulsedb::embedding::ProviderIdentity {
+///         pulsedb::embedding::ProviderIdentity {
+///             provider: "my-api".to_string(),
+///             model_id: format!("my-model-{}", self.dimension),
+///         }
 ///     }
 /// }
 /// ```
@@ -102,6 +136,17 @@ pub trait EmbeddingService: Send + Sync {
     ///
     /// All embeddings from this service will have exactly this many dimensions.
     fn dimension(&self) -> usize;
+
+    /// Returns the persistable identity of this provider.
+    ///
+    /// This is a **required** method (no default impl): every `EmbeddingService`
+    /// must declare its identity to be usable, so the compiler — not convention
+    /// — enforces "identity cannot drift from the impl" (spec §3, audit
+    /// challenge locked). The returned [`ProviderIdentity`] is the token the
+    /// embedding-injection seam stamps into persisted metadata (work item
+    /// 1.03). Implementations MUST derive `model_id` from deterministic inputs
+    /// so it is stable across runs and across machines.
+    fn identity(&self) -> ProviderIdentity;
 
     /// Validates that an embedding has the correct dimension.
     ///
@@ -186,6 +231,17 @@ impl EmbeddingService for ExternalEmbedding {
 
     fn dimension(&self) -> usize {
         self.dimension
+    }
+
+    fn identity(&self) -> ProviderIdentity {
+        // `external` is the closed EmbeddingProvider::External variant's
+        // identity token. model_id pins the dimension the caller configured,
+        // so two external services configured for different dims are distinct
+        // identities (1.03's mismatch guard keys on this).
+        ProviderIdentity {
+            provider: "external".to_string(),
+            model_id: format!("external-{}", self.dimension),
+        }
     }
 }
 
@@ -298,5 +354,56 @@ mod tests {
         let result = create_embedding_service(&config);
         // With auto-download, this should succeed if network is available
         assert!(result.is_ok());
+    }
+}
+
+/// Identity-surface tests for `ProviderIdentity` + `EmbeddingService::identity()`.
+///
+/// Lives in its own module so the AC-1 filter `cargo test --lib embedding::identity`
+/// matches these tests by their full path (`embedding::identity::…`).
+#[cfg(test)]
+mod identity {
+    use super::*;
+
+    #[test]
+    fn provider_identity_postcard_roundtrip() {
+        // 1.03 will persist ProviderIdentity via postcard into redb metadata.
+        // This test pins the Serialize/Deserialize shape that persistence relies on.
+        let id = ProviderIdentity {
+            provider: "external".to_string(),
+            model_id: "external-384".to_string(),
+        };
+        let bytes = postcard::to_stdvec(&id).expect("serialize");
+        let restored: ProviderIdentity = postcard::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(id, restored);
+    }
+
+    #[test]
+    fn external_embedding_identity_is_stable_and_nonempty() {
+        // Identity must be deterministic across calls of the same impl and
+        // carry only provider + model_id (no dimension field — see spec §3).
+        let service = ExternalEmbedding::new(384);
+        let id = service.identity();
+        assert_eq!(id.provider, "external");
+        assert_eq!(id.model_id, "external-384");
+        assert!(!id.provider.is_empty());
+        assert!(!id.model_id.is_empty());
+        // Stable across calls.
+        assert_eq!(service.identity(), id);
+        // Dimension varies with config -> model_id varies with it.
+        let big = ExternalEmbedding::new(1536).identity();
+        assert_eq!(big.model_id, "external-1536");
+    }
+
+    #[test]
+    fn identity_dispatches_through_trait_object() {
+        // Spec §3: identity() is a required trait method (no default impl),
+        // so the compiler enforces "identity must be declared to be usable".
+        // This is a compile-time guarantee; this test just exercises the call
+        // through the trait object to confirm it dispatches to the impl.
+        let service = ExternalEmbedding::new(384);
+        let dyn_ref: &dyn EmbeddingService = &service;
+        let id = dyn_ref.identity();
+        assert_eq!(id.provider, "external");
     }
 }

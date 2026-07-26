@@ -43,12 +43,14 @@ use super::schema::{
     WatchEventTypeTag, ACTIVITIES_TABLE, COLLECTIVES_TABLE, CURRENT_SUBSTRATE_FORMAT,
     DECAY_CONFIGS_TABLE, EMBEDDINGS_TABLE, EXPERIENCES_BY_COLLECTIVE_TABLE,
     EXPERIENCES_BY_TYPE_TABLE, EXPERIENCES_TABLE, INSIGHTS_BY_COLLECTIVE_TABLE, INSIGHTS_TABLE,
-    INSTANCE_ID_KEY, LEGACY_SUBSTRATE_FORMAT, METADATA_TABLE, RELATIONS_BY_SOURCE_TABLE,
-    RELATIONS_BY_TARGET_TABLE, RELATIONS_TABLE, SCHEMA_VERSION, SUBSTRATE_FORMAT_KEY,
-    SUBSTRATE_MAGIC, SUBSTRATE_MARKER_LEN, WAL_SEQUENCE_KEY, WATCH_EVENTS_TABLE,
+    INSTANCE_ID_KEY, LEGACY_SUBSTRATE_FORMAT, METADATA_TABLE, PROVIDER_IDENTITY_KEY,
+    RELATIONS_BY_SOURCE_TABLE, RELATIONS_BY_TARGET_TABLE, RELATIONS_TABLE, SCHEMA_VERSION,
+    SUBSTRATE_FORMAT_KEY, SUBSTRATE_MAGIC, SUBSTRATE_MARKER_LEN, WAL_SEQUENCE_KEY,
+    WATCH_EVENTS_TABLE,
 };
 use super::StorageEngine;
 use crate::config::{Config, EmbeddingDimension, RecallWeights};
+use crate::embedding::ProviderIdentity;
 use crate::error::{PulseDBError, Result, StorageError, ValidationError};
 
 /// Metadata key in the metadata table.
@@ -871,6 +873,15 @@ impl RedbStorage {
             .ok_or_else(|| StorageError::corrupted("Missing database metadata"))?;
 
         match marker {
+            // NOTE: `Absent` (a pre-marker store) and `Older(_)` (a marker present but below
+            // CURRENT_SUBSTRATE_FORMAT) share this single decode path today. They are
+            // intentionally unified because both indicate a bincode-era store that decodes the
+            // same way. IF a future change splits these arms (e.g. to give `Older(_)` a
+            // distinct decode or validation), it MUST add a covering test for the `Older(_)`
+            // branch against a genuine marker-N store in that state — the #53b evidence
+            // currently derives `Older(1)` from a crashed marker-Absent store, which does not
+            // exercise the split path. (VS-4.1.4/4.03 deferred this fixture as speculative
+            // until CURRENT_SUBSTRATE_FORMAT actually bumps; see the slice README disposition.)
             SubstrateFormat::Absent | SubstrateFormat::Older(_) => {
                 legacy_bincode::decode::<DatabaseMetadata>(metadata_bytes.value()).map_err(|e| {
                     StorageError::corrupted(format!("Invalid legacy metadata format: {}", e)).into()
@@ -2150,6 +2161,49 @@ impl StorageEngine for RedbStorage {
 
     fn path(&self) -> Option<&Path> {
         Some(&self.path)
+    }
+
+    // =========================================================================
+    // Provider Identity Stamp (VS-4.3.1 work 1.03 — embedding injection seam)
+    // =========================================================================
+    //
+    // Mirrors the `INSTANCE_ID_KEY` raw-bytes-in-METADATA_TABLE pattern: write
+    // under a dedicated `PROVIDER_IDENTITY_KEY` key, postcard-encoded (NOT raw
+    // bytes — the value is serde-shaped, and unlike `instance_id` / the
+    // substrate marker it is only read after the serializer identity is
+    // established, so postcard is safe here). The value shape 1.01's
+    // `test_provider_identity_postcard_roundtrip` proved round-trippable.
+
+    fn stamp_provider_identity(&self, identity: &ProviderIdentity) -> Result<()> {
+        let bytes = postcard::to_stdvec(identity)
+            .map_err(|e| StorageError::serialization(e.to_string()))?;
+
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        {
+            let mut meta_table = write_txn.open_table(METADATA_TABLE)?;
+            meta_table.insert(PROVIDER_IDENTITY_KEY, bytes.as_slice())?;
+        }
+        write_txn.commit().map_err(StorageError::from)?;
+
+        debug!(
+            provider = %identity.provider,
+            model_id = %identity.model_id,
+            "Stamped provider identity into redb metadata"
+        );
+        Ok(())
+    }
+
+    fn provider_identity(&self) -> Result<Option<ProviderIdentity>> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let meta_table = read_txn.open_table(METADATA_TABLE)?;
+        match meta_table.get(PROVIDER_IDENTITY_KEY)? {
+            None => Ok(None),
+            Some(entry) => {
+                let identity: ProviderIdentity = postcard::from_bytes(entry.value())
+                    .map_err(|e| StorageError::serialization(e.to_string()))?;
+                Ok(Some(identity))
+            }
+        }
     }
 
     // =========================================================================
