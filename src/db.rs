@@ -207,6 +207,13 @@ impl PulseDB {
     /// ```
     #[instrument(skip(config), fields(path = %path.as_ref().display()))]
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self> {
+        // Validate config BEFORE constructing the embedder (Codex review):
+        // `create_embedding_service` for `Builtin` downloads/loads the ONNX
+        // model (expensive), so an invalid config (e.g. `cache_size_mb == 0`)
+        // should fail fast here, not after the model download. `open_parts`
+        // keeps its own `config.validate()` as defense-in-depth.
+        config.validate().map_err(PulseDBError::from)?;
+
         // Build the embedder internally (unchanged contract) and delegate to
         // the shared open helper. The `Box`→`Arc` conversion happens here so
         // `create_embedding_service` keeps its existing `Box<dyn>` return type.
@@ -415,7 +422,19 @@ impl PulseDB {
         // validation, storage open, HNSW load, mismatch refusal) returned
         // before reaching this line — leaving the store unstamped. Guarded by
         // `should_stamp` so a matching reopen skips the redundant write.
+        //
+        // Read-only guard (Codex review): the lenient-adoption path (no prior
+        // stamp → `should_stamp = true`) must NOT write under a read-only
+        // config. `open_parts` respects read-only (storage opens read-only,
+        // no schema migration), but the stamp write is a separate write txn
+        // that would violate the read-only contract, contend with a writer,
+        // and mutate stores used by read-only observers. Refuse the unstamped
+        // adoption in read-only mode — the caller can reopen writable to
+        // stamp, then reopen read-only.
         if should_stamp {
+            if config.read_only {
+                return Err(PulseDBError::ReadOnly);
+            }
             storage.stamp_provider_identity(&injected)?;
         }
 
@@ -3888,6 +3907,51 @@ mod provider_identity_persistence {
             db2.provider_identity().expect("read stamp"),
             adopted,
             "lenient path stamped the injected identity"
+        );
+        db2.close().unwrap();
+    }
+
+    /// (g) Read-only guard (Codex review): a read-only `open_with_embedder` of
+    /// an unstamped store must NOT stamp — the lenient-adoption path requires
+    /// a write, which violates the read-only contract. Refuse with the typed
+    /// `ReadOnly` error. The caller can reopen writable to stamp, then reopen
+    /// read-only. Regression guard for the db.rs:419 read-only bug.
+    #[test]
+    fn read_only_open_with_embedder_does_not_stamp_unstamped_store() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("readonly-unstamped.db");
+
+        // Create via `open` — no PROVIDER_IDENTITY_KEY is written.
+        let db = PulseDB::open(&path, Config::default()).expect("open creates the store");
+        db.close().unwrap();
+
+        // Reopen via `open_with_embedder` in READ-ONLY mode. The lenient
+        // adoption path would stamp, but read-only must refuse the write.
+        let read_only_config = Config {
+            read_only: true,
+            ..Config::default()
+        };
+        let err = PulseDB::open_with_embedder(
+            &path,
+            read_only_config,
+            injected(id("external", "ada-002")),
+        )
+        .expect_err("read-only + unstamped + injected must refuse the stamp write");
+        assert!(err.is_read_only(), "expected ReadOnly error, got {err:?}");
+
+        // The refused read-only open wrote nothing. Reopen WRITABLE with the
+        // same identity to confirm the lenient path still works (the store
+        // remained unstamped, so writable adoption stamps now).
+        let db2 = PulseDB::open_with_embedder(
+            &path,
+            Config::default(),
+            injected(id("external", "ada-002")),
+        )
+        .expect("writable reopen adopts the identity");
+        assert_eq!(
+            db2.provider_identity().expect("read stamp"),
+            id("external", "ada-002"),
+            "writable reopen stamped; read-only open left no trace"
         );
         db2.close().unwrap();
     }
