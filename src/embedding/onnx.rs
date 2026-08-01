@@ -80,8 +80,7 @@ const MINILM_HF_PINNED_SHA: &str = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41";
 /// (length-framed model ‖ tokenizer SHA-256). Used by the one-time main_graph
 /// migration to recognize the bundled MiniLM. Verified 2026-07-31 against HF
 /// commit 1110a243fdf4706b3f48f1d95db1a4f5529b4d41.
-const BUNDLED_MINILM_FINGERPRINT: &str =
-    "589318e079c05f6ccede875658e0eeeb179945698317711efedd77c0111cacba";
+use super::BUNDLED_MINILM_FINGERPRINT;
 
 // ---------------------------------------------------------------------------
 // OnnxEmbedding struct
