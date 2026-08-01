@@ -266,6 +266,8 @@ impl PulseDB {
                 if persisted.provider == "builtin-onnx"
                     && persisted.model_id == "main_graph"
                     && requested.provider == "builtin-onnx"
+                    && requested.model_id
+                        == format!("onnx-{}", crate::embedding::BUNDLED_MINILM_FINGERPRINT)
                 {
                     tracing::info!(
                         persisted_model_id = %persisted.model_id,
@@ -490,16 +492,15 @@ impl PulseDB {
         // lenient-adoption path (no prior stamp) writes; the Match arm
         // preserves the existing stamp untouched. The mismatch arm returns
         // before reaching `should_stamp`'s use site.
-        let should_stamp: bool = match storage.provider_identity()? {
-            None => {
-                // Lenient no-stamp path (grill-resolved): the store has no
-                // `PROVIDER_IDENTITY_KEY` (a pre-1.03 store, or a store opened
-                // via `open` which does not stamp). Silently adopt the injected
-                // identity — safe because no production users carry
-                // pre-existing stores. The adoption stamp happens only if the
-                // rest of this constructor succeeds (see the ordering note
-                // below). Do NOT add an `assume_identity` flag (grill
-                // rejected the strict path as unnecessary friction).
+        // VS-4.3.3/1.06 (slice-close fix-up): mirror the `open` path's era-
+        // marker check. A post-0.7.0 store whose stamp was lost (era present,
+        // identity absent) must NOT be silently re-adopted via
+        // open_with_embedder — that bypasses the cross-provider-mismatch guard.
+        let persisted_identity = storage.provider_identity()?;
+        let era = storage.provider_identity_era_marker()?;
+        let should_stamp: bool = match (persisted_identity, era) {
+            (None, false) => {
+                // Genuine pre-0.7.0 store: BOTH keys absent. Lenient adoption.
                 tracing::debug!(
                     provider = %injected.provider,
                     model_id = %injected.model_id,
@@ -507,7 +508,16 @@ impl PulseDB {
                 );
                 true
             }
-            Some(persisted) => {
+            (None, true) => {
+                // Post-0.7.0 store whose stamp was LOST/CORRUPTED (era marker
+                // present, identity absent). NOT silent re-adoption — typed
+                // corruption error (closes Codex #17 on BOTH constructors).
+                return Err(PulseDBError::Storage(StorageError::corrupted(
+                    "provider identity stamp missing but era marker present — \
+                     the stamp was lost or corrupted; refusing silent re-adoption",
+                )));
+            }
+            (Some(persisted), _) => {
                 if persisted.provider != injected.provider
                     || persisted.model_id != injected.model_id
                 {
@@ -4625,7 +4635,109 @@ mod provider_identity_persistence {
         }
     }
 
-    /// (g) Audit challenge 3 (gap — redundant I/O on reopen). A successful
+    /// VS-4.3.3/1.06 fix-up (close-depth challenge 1): `open_with_embedder`
+    /// must ALSO refuse an era-present/identity-absent store — not silently
+    /// adopt the injected identity. Mirrors the `open` path test above.
+    #[test]
+    fn open_with_embedder_era_marker_present_identity_absent_is_corruption() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("injected-era-without-identity.db");
+
+        // Stamp both keys via `open_with_embedder`.
+        let db = PulseDB::open_with_embedder(
+            &path,
+            Config::default(),
+            injected(id("external", "ada-002")),
+        )
+        .expect("open_with_embedder stamps both keys");
+        db.close().unwrap();
+
+        // Remove ONLY the identity key, leaving the era marker behind.
+        let redb_db = redb::Database::open(&path).expect("open redb directly to corrupt");
+        {
+            let wtxn = redb_db.begin_write().unwrap();
+            {
+                let mut meta = wtxn
+                    .open_table(crate::storage::schema::METADATA_TABLE)
+                    .unwrap();
+                meta.remove(crate::storage::schema::PROVIDER_IDENTITY_KEY)
+                    .unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+        drop(redb_db);
+
+        // Reopen via `open_with_embedder` with a DIFFERENT identity → (None,
+        // true) → corruption error (not silent adoption of the new identity).
+        let err = PulseDB::open_with_embedder(
+            &path,
+            Config::default(),
+            injected(id("external", "different-model")),
+        )
+        .expect_err("open_with_embedder must refuse era-present + identity-absent as corruption");
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("corrupt"),
+            "expected a Corrupted-class error, got: {msg}"
+        );
+        assert!(
+            msg.contains("era marker present"),
+            "expected the message to name the era-marker-present state, got: {msg}"
+        );
+    }
+
+    /// VS-4.3.3/1.06 fix-up (close-depth challenge 2): the `main_graph`
+    /// migration must fire ONLY for the bundled MiniLM, not for an arbitrary
+    /// builtin model. A non-MiniLM `main_graph` reopen must be refused (the
+    /// user must re-embed), not silently re-stamped.
+    #[test]
+    fn main_graph_migration_refuses_non_bundled_minilm() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("main-graph-non-minilm.db");
+
+        // Create a store through open_with_embedder (sets up all tables +
+        // stamps both keys), then overwrite the identity key with
+        // {builtin-onnx, main_graph} to simulate a VS-4.3.1-era stamp.
+        let db = PulseDB::open_with_embedder(
+            &path,
+            Config::default(),
+            injected(id("external", "ada-002")),
+        )
+        .expect("create store");
+        db.close().unwrap();
+
+        let redb_db = redb::Database::open(&path).expect("open redb to overwrite identity");
+        {
+            let wtxn = redb_db.begin_write().unwrap();
+            {
+                let mut meta = wtxn
+                    .open_table(crate::storage::schema::METADATA_TABLE)
+                    .unwrap();
+                let legacy = crate::embedding::ProviderIdentity {
+                    provider: "builtin-onnx".to_string(),
+                    model_id: "main_graph".to_string(),
+                };
+                let bytes = postcard::to_allocvec(&legacy).unwrap();
+                meta.insert(
+                    crate::storage::schema::PROVIDER_IDENTITY_KEY,
+                    bytes.as_slice(),
+                )
+                .unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+        drop(redb_db);
+
+        // Reopen via `open` with External config → config-derived identity is
+        // {external, external-384}, NOT {builtin-onnx, onnx-<minilm>}. The
+        // migration must NOT fire; the mismatch guard must refuse.
+        let err = PulseDB::open(&path, Config::default())
+            .expect_err("non-MiniLM main_graph reopen must be refused");
+        assert!(
+            matches!(err, PulseDBError::EmbeddingProviderMismatch { .. }),
+            "expected EmbeddingProviderMismatch (migration should NOT fire for non-MiniLM), got: {err:?}"
+        );
+    }
     /// reopen whose injected identity MATCHES the persisted stamp should NOT
     /// re-stamp — the bytes are identical and the write txn + fsync is pure
     /// overhead on the hot open path. The structural guard (`should_stamp`)
