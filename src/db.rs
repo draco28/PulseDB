@@ -295,6 +295,17 @@ impl PulseDB {
         // STAMP — last successful step (mirrors open_with_embedder). Read-only
         // guard: the lenient-adoption/migration path (a write) must not fire
         // under a read-only config.
+        //
+        // Concurrency (pulsedb-internal #11): the check-then-set shape (read
+        // `provider_identity` + era marker → compare → stamp) is safe under
+        // redb 4.1's exclusive writable file lock — on supported platforms two
+        // processes cannot hold writable handles to the same store
+        // concurrently, so the read-then-write sequence is serialized by the
+        // lock. The "check-then-set race" only exists on platforms without
+        // file locking, where concurrent writable opens are explicitly the
+        // caller's responsibility per redb's contract. No CAS
+        // (compare-and-set) is needed; the lock is the serialization
+        // mechanism (Codex #11 closed the race; #12 dropped the trait break).
         if let Some(to_stamp) = should_stamp {
             if config.read_only {
                 return Err(PulseDBError::ReadOnly);
@@ -516,6 +527,17 @@ impl PulseDB {
         // and mutate stores used by read-only observers. Refuse the unstamped
         // adoption in read-only mode — the caller can reopen writable to
         // stamp, then reopen read-only.
+        //
+        // Concurrency (pulsedb-internal #11): the check-then-set shape (read
+        // `provider_identity` → compare → stamp) is safe under redb 4.1's
+        // exclusive writable file lock — on supported platforms two processes
+        // cannot hold writable handles to the same store concurrently, so the
+        // read-then-write sequence is serialized by the lock. The
+        // "check-then-set race" only exists on platforms without file locking,
+        // where concurrent writable opens are explicitly the caller's
+        // responsibility per redb's contract. No CAS (compare-and-set) is
+        // needed; the lock is the serialization mechanism (Codex #11 closed
+        // the race; #12 dropped the trait break).
         if should_stamp {
             if config.read_only {
                 return Err(PulseDBError::ReadOnly);
