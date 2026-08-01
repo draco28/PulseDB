@@ -1210,6 +1210,21 @@ impl PulseDB {
         let is_external = !self.has_injected_embedder
             && matches!(self.config.embedding_provider, EmbeddingProvider::External);
 
+        // VS-4.3.3/1.03 (pulsedb-internal #8): refuse `embedding: Some(vec)`
+        // under `open_with_embedder`. The injected embedder's contract is "I
+        // embed everything"; a caller-supplied vector bypasses it, so the
+        // stamped identity could no longer truthfully describe who embedded the
+        // stored vectors. The `open` + `Some(vec)` legacy API stays legal (its
+        // identity is config-derived; `External`-via-`open` is the
+        // caller-controlled path). Placed before the collective fetch + dim
+        // validation so the gate fires first — catches `Some(vec![])` as
+        // misuse, not as a dim-0 error.
+        if self.has_injected_embedder && exp.embedding.is_some() {
+            return Err(PulseDBError::InjectedEmbedderPresent {
+                record_kind: "experience",
+            });
+        }
+
         // Verify collective exists and get its dimension
         let collective = self
             .storage
@@ -2314,6 +2329,18 @@ impl PulseDB {
         // equivalent; this asymmetry is intentional, not a bug to flatten.
         let is_external = !self.has_injected_embedder
             && matches!(self.config.embedding_provider, EmbeddingProvider::External);
+
+        // VS-4.3.3/1.03 (pulsedb-internal #8): refuse `embedding: Some(vec)`
+        // under `open_with_embedder`. Same gate as `record_experience` above
+        // (the asymmetry comment just above explains why the *external-embedder*
+        // gate is shaped differently here; THIS gate is identical at both sites
+        // — same condition, different `record_kind`). Placed before the
+        // collective fetch + dim validation so the gate fires first.
+        if self.has_injected_embedder && insight.embedding.is_some() {
+            return Err(PulseDBError::InjectedEmbedderPresent {
+                record_kind: "insight",
+            });
+        }
 
         // Validate input fields
         validate_new_insight(&insight)?;
@@ -3862,6 +3889,187 @@ mod open_with_embedder {
 
         let db = PulseDB::open(&path, Config::default()).expect("open succeeds via shared helper");
         assert_eq!(db.embedding_dimension(), EmbeddingDimension::D384.size());
+        db.close().unwrap();
+    }
+
+    // ---- VS-4.3.3 work 1.03: forbid `embedding: Some(vec)` under
+    //      `open_with_embedder` (pulsedb-internal #8). The injected embedder's
+    //      contract is "I embed everything"; a caller-supplied vector bypasses
+    //      it. The `open` + `Some(vec)` legacy API stays legal. ----
+
+    /// Opens a store via `open_with_embedder` with a 384-d `RecordingEmbedder`
+    /// and `Config::with_builtin_embeddings()` (the config that admits
+    /// `embedding: None` on record), then creates a single collective. Shared
+    /// setup for the 1.03 refusal/regression tests.
+    fn injected_store_with_collective(
+        dir: &tempfile::TempDir,
+        db_name: &str,
+    ) -> (PulseDB, Arc<RecordingEmbedding>, CollectiveId) {
+        let path = dir.path().join(db_name);
+        let embedder = Arc::new(RecordingEmbedding::new(384));
+        let db = PulseDB::open_with_embedder(
+            &path,
+            Config::with_builtin_embeddings(),
+            embedder.clone() as Arc<dyn EmbeddingService>,
+        )
+        .expect("open_with_embedder succeeds");
+        let collective_id = db
+            .create_collective("injected-1.03")
+            .expect("create collective");
+        (db, embedder, collective_id)
+    }
+
+    /// AC-1 (a): `record_experience { embedding: Some(vec) }` under
+    /// `open_with_embedder` is refused with `InjectedEmbedderPresent {
+    /// record_kind: "experience" }`.
+    #[test]
+    fn record_experience_with_some_vec_under_injected_is_refused() {
+        let dir = tempdir().unwrap();
+        let (db, _embedder, collective_id) = injected_store_with_collective(&dir, "refused-exp.db");
+
+        let exp = NewExperience {
+            collective_id,
+            content: "caller-supplied vector under injected embedder".to_string(),
+            embedding: Some(vec![0.5f32; 384]),
+            ..Default::default()
+        };
+        match db.record_experience(exp) {
+            Err(PulseDBError::InjectedEmbedderPresent {
+                record_kind: "experience",
+            }) => {}
+            other => panic!(
+                "expected InjectedEmbedderPresent{{record_kind: \"experience\"}}, got {other:?}"
+            ),
+        }
+
+        db.close().unwrap();
+    }
+
+    /// AC-1 (b): `store_insight { embedding: Some(vec) }` under
+    /// `open_with_embedder` is refused with `InjectedEmbedderPresent {
+    /// record_kind: "insight" }`. The source experience is created first via
+    /// `record_experience { embedding: None }` (which succeeds — the injected
+    /// embedder embeds it).
+    #[test]
+    fn store_insight_with_some_vec_under_injected_is_refused() {
+        let dir = tempdir().unwrap();
+        let (db, _embedder, collective_id) =
+            injected_store_with_collective(&dir, "refused-insight.db");
+
+        // Source experience via the injected embedder (embedding: None) — the
+        // path this gate must NOT over-fire on.
+        let exp = NewExperience {
+            collective_id,
+            content: "source experience for the refused insight".to_string(),
+            embedding: None,
+            ..Default::default()
+        };
+        let exp_id = db
+            .record_experience(exp)
+            .expect("record_experience with None routes through the injected embedder");
+
+        let insight = NewDerivedInsight {
+            collective_id,
+            content: "caller-supplied insight vector under injected embedder".to_string(),
+            embedding: Some(vec![0.5f32; 384]),
+            source_experience_ids: vec![exp_id],
+            insight_type: InsightType::Pattern,
+            confidence: 0.8,
+            domain: Vec::new(),
+        };
+        match db.store_insight(insight) {
+            Err(PulseDBError::InjectedEmbedderPresent {
+                record_kind: "insight",
+            }) => {}
+            other => panic!(
+                "expected InjectedEmbedderPresent{{record_kind: \"insight\"}}, got {other:?}"
+            ),
+        }
+
+        db.close().unwrap();
+    }
+
+    /// AC-1 (c): regression guard — `record_experience { embedding: None }`
+    /// under `open_with_embedder` still routes through the injected embedder
+    /// (the gate must not over-fire on `None`). Preserves the VS-4.3.1/1.04
+    /// behavior.
+    #[test]
+    fn record_experience_with_none_under_injected_routes_through_embedder() {
+        let dir = tempdir().unwrap();
+        let (db, embedder, collective_id) = injected_store_with_collective(&dir, "none-routes.db");
+
+        let content = "embedding None must route through the injected embedder";
+        let exp = NewExperience {
+            collective_id,
+            content: content.to_string(),
+            embedding: None,
+            ..Default::default()
+        };
+        db.record_experience(exp)
+            .expect("record_experience with None succeeds under open_with_embedder");
+
+        let embedded = embedder.embedded_texts();
+        assert!(
+            embedded.iter().any(|c| c == content),
+            "embedding: None must route content through the injected embedder; saw: {embedded:?}"
+        );
+
+        db.close().unwrap();
+    }
+
+    /// AC-1 (d): regression guard — `record_experience { embedding: Some(vec) }`
+    /// under the LEGACY `PulseDB::open` (NOT `open_with_embedder`) still
+    /// succeeds. Proves the gate fires only under the injected-embedder
+    /// constructor; the `open` + `Some(vec)` API (since v0.1.0) is unchanged.
+    /// Uses `Config::default()` (`EmbeddingProvider::External`) — the
+    /// caller-controlled path this slice intentionally keeps legal.
+    #[test]
+    fn record_experience_with_some_vec_under_open_legacy_succeeds() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy-open.db");
+
+        // Config::default() -> External; under `open` (has_injected_embedder =
+        // false) this is the caller-controlled per-record-vector path.
+        let db = PulseDB::open(&path, Config::default()).expect("open succeeds");
+        let collective_id = db
+            .create_collective("legacy-open")
+            .expect("create collective");
+
+        let exp = NewExperience {
+            collective_id,
+            content: "caller-supplied vector under the legacy open path".to_string(),
+            embedding: Some(vec![0.5f32; 384]),
+            ..Default::default()
+        };
+        db.record_experience(exp)
+            .expect("record_experience with Some(vec) succeeds under the legacy open path");
+
+        db.close().unwrap();
+    }
+
+    /// AC-1 (e): empty-vec ordering pin — `record_experience { embedding:
+    /// Some(vec![]) }` under `open_with_embedder` is refused by the gate as
+    /// misuse, NOT by `validate_new_experience`'s dim check (dim 0 != 384).
+    /// Proves the gate fires BEFORE dim validation, so an empty vector reads as
+    /// misuse rather than a dimension-mismatch error.
+    #[test]
+    fn record_experience_with_empty_vec_under_injected_refused_by_gate_not_dim() {
+        let dir = tempdir().unwrap();
+        let (db, _embedder, collective_id) = injected_store_with_collective(&dir, "empty-vec.db");
+
+        let exp = NewExperience {
+            collective_id,
+            content: "empty caller-supplied vector under injected embedder".to_string(),
+            embedding: Some(vec![]),
+            ..Default::default()
+        };
+        match db.record_experience(exp) {
+            Err(PulseDBError::InjectedEmbedderPresent {
+                record_kind: "experience",
+            }) => {}
+            other => panic!("expected InjectedEmbedderPresent (gate-before-dim), got {other:?}"),
+        }
+
         db.close().unwrap();
     }
 }
