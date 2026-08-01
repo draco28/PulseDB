@@ -49,6 +49,7 @@ jobs:
         timeout-minutes: 18
         env:
           CI: true
+          FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
         run: |
           mkdir -p qa-results
           droid exec --auto high "You are running in a non-interactive CI environment. There is NO human available. Do NOT use AskUser, do NOT wait for confirmations, do NOT pause for input. Run the qa skill (.factory/skills/qa/SKILL.md). Analyze the git diff (origin/main...HEAD). Write consumer-simulation Rust test programs that exercise the changed public API areas. Compile and run them with cargo test across the relevant feature configurations. Write the final report to qa-results/report.md. Clean up any tests/qa_flow_*.rs files you created." 2>&1 | tee qa-results/qa-output.txt || true
