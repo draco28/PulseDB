@@ -310,6 +310,17 @@ impl PulseDB {
             if config.read_only {
                 return Err(PulseDBError::ReadOnly);
             }
+            // VS-4.3.3/1.05 (#10): validate the embedder's dimension matches
+            // the configured dimension BEFORE stamping. Catches a 384-config +
+            // 768-embedder mismatch that would stamp successfully then corrupt
+            // the HNSW on the first record.
+            let expected = config.embedding_dimension.size();
+            let actual = embedding.dimension();
+            if actual != expected {
+                return Err(PulseDBError::Validation(
+                    ValidationError::dimension_mismatch(expected, actual),
+                ));
+            }
             storage.stamp_provider_identity(&to_stamp)?;
         }
 
@@ -541,6 +552,17 @@ impl PulseDB {
         if should_stamp {
             if config.read_only {
                 return Err(PulseDBError::ReadOnly);
+            }
+            // VS-4.3.3/1.05 (#10): validate the injected embedder's dimension
+            // against the configured dimension BEFORE stamping. Catches a
+            // 384-config + 768-embedder mismatch that would stamp successfully
+            // then corrupt the HNSW on the first record.
+            let expected = config.embedding_dimension.size();
+            let actual = embedder.dimension();
+            if actual != expected {
+                return Err(PulseDBError::Validation(
+                    ValidationError::dimension_mismatch(expected, actual),
+                ));
             }
             storage.stamp_provider_identity(&injected)?;
         }
@@ -4082,7 +4104,7 @@ mod open_with_embedder {
 mod provider_identity_persistence {
     use super::*;
     use crate::embedding::{EmbeddingService, ProviderIdentity};
-    use crate::error::PulseDBError;
+    use crate::error::{PulseDBError, ValidationError};
     use crate::Embedding;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -4650,5 +4672,68 @@ mod provider_identity_persistence {
     fn matching_reopen_skips_redundant_stamp() {
         // Skipped body kept as living documentation of the intended assertion.
         // When the spy infra lands, restore the mtime-independent witness here.
+    }
+
+    /// (h) VS-4.3.3/1.05 (#10): a dimension mismatch between the injected
+    /// embedder and the configured dimension is refused BEFORE the stamp
+    /// fires. Catches the 384-config + 768-embedder case that would stamp
+    /// successfully then corrupt the HNSW on the first record. The "no stamp
+    /// written" half is proved by reopening with a CORRECT-dim embedder
+    /// carrying a DIFFERENT identity: if the failed open had left a stamp, the
+    /// different identity would trip the mismatch guard; instead the lenient
+    /// adoption path fires (persisted identity is None), proving nothing was
+    /// stamped.
+    #[test]
+    fn open_with_embedder_dim_mismatch_refused_before_stamp() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dim-mismatch.db");
+
+        // D384 config (Config::default()) but inject a 768-dim embedder.
+        let too_big = Arc::new(StubEmbedder::new(768, id("external", "ada-002")));
+        let err = PulseDB::open_with_embedder(&path, Config::default(), too_big)
+            .expect_err("768-dim embedder under D384 config must be refused");
+
+        match err {
+            PulseDBError::Validation(ValidationError::DimensionMismatch { expected, got }) => {
+                assert_eq!(expected, 384, "expected the configured D384");
+                assert_eq!(got, 768, "got the injected 768");
+            }
+            other => panic!("expected DimensionMismatch, got {other:?}"),
+        }
+
+        // No stamp was written: reopen with a CORRECT-dim (384) embedder
+        // carrying a DIFFERENT identity. If the failed open had left a stamp,
+        // this reopen would hit the EmbeddingProviderMismatch guard; instead
+        // the lenient adoption path fires (persisted is None), proving the
+        // dim-mismatch wrote nothing.
+        let correct = Arc::new(StubEmbedder::new(384, id("external", "cohere-embed-v3")));
+        let db = PulseDB::open_with_embedder(&path, Config::default(), correct)
+            .expect("no stamp left → lenient adoption of the new identity");
+        assert_eq!(
+            db.provider_identity().unwrap(),
+            id("external", "cohere-embed-v3"),
+            "lenient path stamped the correct-dim identity"
+        );
+        db.close().unwrap();
+    }
+
+    /// (i) VS-4.3.3/1.05 (#10) regression guard: when the injected embedder's
+    /// dimension MATCHES the configured dimension, the dim check does not
+    /// over-fire — the open succeeds and the stamp is written normally.
+    #[test]
+    fn open_with_embedder_matching_dim_stamps_normally() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dim-match.db");
+
+        let original = id("external", "ada-002");
+        // `injected()` builds a 384-dim StubEmbedder; Config::default() is D384.
+        let db = PulseDB::open_with_embedder(&path, Config::default(), injected(original.clone()))
+            .expect("matching dimension stamps normally");
+        assert_eq!(
+            db.provider_identity().expect("stamp written"),
+            original,
+            "stamp carries the injected identity"
+        );
+        db.close().unwrap();
     }
 }
