@@ -37,6 +37,24 @@ jobs:
           echo "=== rust ===" && rustc --version
           echo "=== cargo ===" && cargo --version
 
+      - name: Install QA skills into checkout
+        run: |
+          # The QA skills live in the AI workspace repo, not canonical.
+          # Copy them into the checkout so droid discovers them at project-level
+          # (.factory/skills/). This avoids global skill collisions across projects.
+          git clone --depth 1 https://github.com/pulseai-labs/pulsedb-internal /tmp/ai-workspace 2>/dev/null || \
+            git clone --depth 1 git@github.com:pulseai-labs/pulsedb-internal.git /tmp/ai-workspace
+          if [ -d /tmp/ai-workspace/.factory/skills/qa ]; then
+            mkdir -p .factory/skills
+            cp -R /tmp/ai-workspace/.factory/skills/qa .factory/skills/qa
+            cp -R /tmp/ai-workspace/.factory/skills/qa-library .factory/skills/qa-library
+            echo "QA skills installed into checkout"
+            ls .factory/skills/qa/SKILL.md .factory/skills/qa-library/SKILL.md
+          else
+            echo "WARNING: QA skills not found in AI workspace clone"
+          fi
+          rm -rf /tmp/ai-workspace
+
       - name: Cache ONNX model (for builtin-embeddings tests)
         uses: actions/cache@v4
         with:
@@ -52,7 +70,7 @@ jobs:
           CI: true
         run: |
           mkdir -p qa-results
-          droid exec --auto high -m "custom:GLM-[Z.AI-Coding-Plan]---Openai-0" "You are running in a non-interactive CI environment. There is NO human available. Do NOT use AskUser, do NOT wait for confirmations, do NOT pause for input. Run the qa skill (it's installed globally at ~/.factory/skills/qa/SKILL.md). Read config.yaml at ~/.factory/skills/qa/config.yaml for feature configurations. Read the qa-library sub-skill at ~/.factory/skills/qa-library/SKILL.md for the test flow menu. Analyze the git diff (origin/main...HEAD). Write consumer-simulation Rust test programs that exercise the changed public API areas. Compile and run them with cargo test across the relevant feature configurations. Write the final report to qa-results/report.md. Clean up any tests/qa_flow_*.rs files you created." 2>&1 | tee qa-results/qa-output.txt || true
+          droid exec --auto high -m "custom:GLM-[Z.AI-Coding-Plan]---Openai-0" "You are running in a non-interactive CI environment. There is NO human available. Do NOT use AskUser, do NOT wait for confirmations, do NOT pause for input. Run the qa skill (it's at .factory/skills/qa/SKILL.md in the current checkout). Read .factory/skills/qa/config.yaml for feature configurations. Read .factory/skills/qa-library/SKILL.md for the test flow menu. Analyze the git diff (origin/main...HEAD). Write consumer-simulation Rust test programs that exercise the changed public API areas. Compile and run them with cargo test across the relevant feature configurations. Write the final report to qa-results/report.md. Clean up any tests/qa_flow_*.rs files you created." 2>&1 | tee qa-results/qa-output.txt || true
 
       - name: Post QA report as PR comment
         if: always()
