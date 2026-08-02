@@ -12,15 +12,57 @@ using Droid with your GLM5.2 custom model.
 
 ---
 
+## ⚠️ Security: Dedicated User Account (READ THIS FIRST)
+
+**Self-hosted runners have NO sandbox.** The runner executes as the macOS user that
+registered it, with that user's full filesystem + network access. For a PUBLIC repo
+(this repo is public), this is a real attack surface: anyone can open a PR, and the
+workflow runs whatever code is in the workflow file.
+
+**Two layers of protection are in place:**
+
+### Layer 1: Workflow actor restriction
+
+The QA workflow (`qa.yml`) has `if: github.actor == 'draco28'` — it **only runs when YOU
+open or push to a PR.** Other contributors' PRs skip the self-hosted job entirely. This
+means untrusted PR code never reaches your Mac mini.
+
+### Layer 2: Dedicated macOS user account
+
+On the Mac mini, **do NOT register the runner under your personal user account.** Create
+a dedicated, restricted user:
+
+```bash
+# Create a standard (non-admin) user for the runner
+sudo sysadminctl -addUser github-runner -password - -admin no
+
+# Switch to the runner user to install everything
+su - github-runner
+```
+
+The `github-runner` user:
+- Is a **standard user** (no admin / sudo)
+- Has its own home directory (`/Users/github-runner/`) — isolated from your personal files
+- Has its own `~/.factory/` (separate droid login + GLM model config)
+- **Cannot read** your personal home directory, SSH keys, browser data, or personal credentials
+- Has Rust + droid installed under its own home
+
+This way, even if a future workflow change accidentally runs untrusted code, the blast
+radius is limited to the `github-runner` user's isolated home directory.
+
+---
+
+---
+
 ## Step 1: Register the Runner on GitHub
 
 1. Go to: https://github.com/pulseai-labs/PulseDB/settings/actions/runners
 2. Click **"New self-hosted runner"** → select **macOS** → select your architecture (ARM64 for Apple Silicon, x64 for Intel)
 3. GitHub shows a registration token + a series of commands. **Copy the token** — you'll need it below.
 
-## Step 2: Install the Runner on the Mac Mini
+## Step 2: Install the Runner (as the `github-runner` user)
 
-On the Mac mini, open Terminal:
+Log in as `github-runner` on the Mac mini, open Terminal:
 
 ```bash
 # Create a directory for the runner
@@ -40,10 +82,9 @@ tar xzf actions-runner-osx-arm64-2.322.0.tar.gz
   --labels self-hosted,macos,arm64 \
   --work _work
 
-# Install as a launchd service (starts on boot)
-sudo ./svc.sh install
-
-# Start the service
+# Install as a launchd service (starts on boot — needs admin)
+# Run this from YOUR admin account, not the github-runner account:
+sudo ./svc.sh install github-runner
 sudo ./svc.sh start
 ```
 
@@ -56,11 +97,10 @@ The runner should show as "Idle" on https://github.com/pulseai-labs/PulseDB/sett
 
 ---
 
-## Step 3: Install Rust Toolchain
-
-The QA workflow compiles + runs Rust test programs. The Mac mini needs Rust:
+## Step 3: Install Rust Toolchain (as `github-runner`)
 
 ```bash
+# Still logged in as github-runner
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 rustc --version  # should show 1.89+
@@ -68,35 +108,33 @@ rustc --version  # should show 1.89+
 
 ---
 
-## Step 4: Install Droid CLI
+## Step 4: Install + Authenticate Droid (as `github-runner`)
 
 ```bash
+# Install droid
 curl -fsSL https://app.factory.ai/cli | sh
-```
 
-## Step 5: Authenticate Droid
-
-```bash
+# Authenticate (opens browser — log in with your Factory account)
 droid login
-```
 
-This opens a browser for OAuth. Log in with your Factory account. Verify:
-
-```bash
+# Verify
 droid auth status
 ```
 
-## Step 6: Configure the GLM5.2 Custom Model
+---
 
-The custom model config lives in `~/.factory/settings.json`. Copy your existing config
-from your main Mac. The key section is `customModels` + `sessionDefaultSettings`:
+## Step 5: Configure the GLM5.2 Custom Model (as `github-runner`)
+
+The custom model config lives in `~/.factory/settings.json` under the `github-runner`
+user's home. This is a SEPARATE config from your personal Mac — the API key lives only
+in the runner user's isolated home.
 
 ```bash
 # Edit the settings file
 nano ~/.factory/settings.json
 ```
 
-Add (or copy from your main Mac's `~/.factory/settings.json`):
+Add the `customModels` + `sessionDefaultSettings` sections (same as your main Mac):
 
 ```json
 {
@@ -128,8 +166,6 @@ Verify Droid can run headless with the custom model:
 ```bash
 droid exec --auto high -m "custom:GLM-[Z.AI-Coding-Plan]---Openai-0" "echo hello world"
 ```
-
-If this prints a response, the setup is complete.
 
 ---
 

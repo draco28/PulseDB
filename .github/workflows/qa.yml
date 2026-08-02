@@ -20,8 +20,10 @@ permissions:
 jobs:
   qa:
     name: Functional QA (consumer simulation)
-    # Self-hosted runner (Mac mini) — uses local droid auth + GLM5.2 model config.
-    # See docs/self-hosted-runner-setup.md for setup.
+    # SECURITY: only run on the self-hosted runner for trusted actors (repo owner).
+    # Self-hosted runners have NO sandbox — untrusted PRs must not execute here.
+    # For non-trusted-actor PRs, the job is skipped (does not block merge).
+    if: github.actor == 'draco28'
     runs-on: self-hosted
     timeout-minutes: 25
     steps:
