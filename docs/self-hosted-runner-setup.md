@@ -179,6 +179,52 @@ mkdir -p ~/Library/Caches/pulsedb/models/all-MiniLM-L6-v2
 
 ---
 
+## Step 6: Install the QA Skills Globally (as `github-runner`)
+
+The QA skills live in the AI workspace repo (`PulseDB-ai/.factory/skills/`), NOT in the
+canonical repo. But the workflow checks out the canonical repo. Droid discovers skills from
+**both** project-level (`./.factory/skills/`) and **user-global** (`~/.factory/skills/`).
+Installing the skills globally makes them available regardless of the working directory.
+
+```bash
+# Still logged in as github-runner
+# Clone the AI workspace repo (or copy the skills from your main Mac)
+git clone https://github.com/pulseai-labs/PulseDB-ai /tmp/pulsedb-ai
+# If the AI workspace repo is private, use SSH or a personal access token
+
+# Copy the QA skills to the global skills directory
+mkdir -p ~/.factory/skills
+cp -R /tmp/pulsedb-ai/.factory/skills/qa ~/.factory/skills/qa
+cp -R /tmp/pulsedb-ai/.factory/skills/qa-library ~/.factory/skills/qa-library
+
+# Clean up the temp clone
+rm -rf /tmp/pulsedb-ai
+
+# Verify
+ls ~/.factory/skills/qa/SKILL.md ~/.factory/skills/qa/config.yaml ~/.factory/skills/qa-library/SKILL.md
+```
+
+**Important:** when the QA skills are updated in the AI workspace, you must re-copy them to
+the Mac mini's global skills directory. A simple way to keep them in sync: add a
+`before-run` hook or a periodic cron on the Mac mini:
+
+```bash
+# Optional: weekly sync (add to crontab — every Sunday at 3am)
+0 3 * * 0 git -C /tmp/pulsedb-ai pull && cp -R /tmp/pulsedb-ai/.factory/skills/qa ~/.factory/skills/qa && cp -R /tmp/pulsedb-ai/.factory/skills/qa-library ~/.factory/skills/qa-library
+```
+
+---
+
+## Step 7: Cache the ONNX Model (optional, for builtin-embeddings tests)
+
+```bash
+# Trigger the model download (happens automatically on first QA run, but pre-caching saves time)
+mkdir -p ~/Library/Caches/pulsedb/models/all-MiniLM-L6-v2
+# The QA workflow will download it on first run if not cached
+```
+
+---
+
 ## Step 8: Verify the Runner Picks Up Jobs
 
 1. Push any commit to a PR branch, or trigger the workflow manually
@@ -207,6 +253,14 @@ mkdir -p ~/Library/Caches/pulsedb/models/all-MiniLM-L6-v2
 - Verify `~/.factory/settings.json` has the `customModels` entry
 - Verify the model ID matches: `custom:GLM-[Z.AI-Coding-Plan]---Openai-0`
 - Test with `droid exec -m "custom:GLM-[Z.AI-Coding-Plan]---Openai-0" "hello"`
+
+**QA skill not found:**
+- The QA skills must be at `~/.factory/skills/qa/SKILL.md` and `~/.factory/skills/qa-library/SKILL.md`
+- They live in the AI workspace repo (`PulseDB-ai`), not the canonical repo — must be
+  installed globally per Step 6
+- Verify: `ls ~/.factory/skills/qa/SKILL.md ~/.factory/skills/qa-library/SKILL.md`
+- The workflow prompt references the global path (`~/.factory/skills/qa/SKILL.md`)
+- If you update the skills in the AI workspace, re-copy them to the Mac mini (Step 6)
 
 ---
 
