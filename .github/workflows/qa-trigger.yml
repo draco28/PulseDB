@@ -59,17 +59,20 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.login != 'dependabot[bot]'
     steps:
+      # Uses the DISPATCH app (actions:write only), not the worker app. Its key
+      # is the one credential that must live in this public repo's secrets, so
+      # it is deliberately the least powerful one in the system: it cannot read
+      # code, cannot comment, and covers only the private twin.
       - name: Mint a scoped App token
         id: token
         uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ vars.PULSEAI_CI_APP_ID }}
-          private-key: ${{ secrets.PULSEAI_CI_PRIVATE_KEY }}
+          app-id: ${{ vars.PULSEAI_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.PULSEAI_DISPATCH_PRIVATE_KEY }}
           owner: pulseai-labs
           # Scoped to the twin only. This token cannot touch any other repo.
           repositories: pulsedb-internal
           permission-actions: write
-          permission-contents: read
 
       # Values reach the shell through env, never through ${{ }} interpolation
       # inside run:. head.sha and the PR number are both attacker-influenceable
