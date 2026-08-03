@@ -38,22 +38,26 @@ jobs:
   dispatch:
     name: Request QA
     runs-on: ubuntu-latest
-    # Branch PRs only, and never Dependabot.
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │ DO NOT REMOVE OR WEAKEN THIS CONDITION. It is the security boundary. │
+    # └─────────────────────────────────────────────────────────────────────┘
     #
-    # Fork PRs receive no secrets, so the token step would fail anyway — the
-    # explicit check makes the intent visible and skips cleanly instead of
-    # failing red on every external contribution.
+    # Under pull_request_target, a FORK PR executes the base branch's workflow
+    # WITH ACCESS TO BASE-REPOSITORY SECRETS. The often-repeated "forks don't
+    # get secrets" rule applies to `pull_request`, NOT to this trigger. So the
+    # head-repo equality check below is not a convenience and not redundant --
+    # it is the only thing preventing an arbitrary fork PR from dispatching its
+    # untrusted SHA to the private self-hosted runner.
     #
-    # Dependabot needs its own exclusion. Its branches live in the BASE repo, so
-    # they satisfy the same-repository check above — but GitHub withholds
-    # ordinary Actions secrets from Dependabot-triggered runs. PULSEAI_CI_PRIVATE_KEY
-    # is an Actions secret (this repo has no Dependabot secrets), so the token
-    # action would receive an empty key and fail on every weekly dependency PR.
+    # Dependabot is excluded on the PR AUTHOR (pull_request.user.login), not on
+    # github.actor. When a maintainer closes and reopens a Dependabot PR, the
+    # actor is that maintainer, so an actor-based check would let the run
+    # proceed -- and PULSEAI_CI_PRIVATE_KEY is an Actions secret, which GitHub
+    # withholds from Dependabot-triggered runs, so the token step would fail.
     # A skipped job reports success and does not block the merge.
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.pull_request.head.repo.full_name == github.repository &&
-       github.actor != 'dependabot[bot]')
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]'
     steps:
       - name: Mint a scoped App token
         id: token
