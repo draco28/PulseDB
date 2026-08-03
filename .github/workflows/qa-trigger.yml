@@ -1,0 +1,101 @@
+name: QA Trigger
+
+# Asks the private twin (pulsedb-internal) to run droid QA on the self-hosted
+# Mac mini, and does nothing else.
+#
+# This repository is PUBLIC and cannot use the self-hosted runner: the org
+# runner group sets allows_public_repositories: false. That is deliberate — a
+# fork PR can supply its own workflow naming runs-on: [self-hosted, ...], so no
+# workflow-level guard protects the hardware; only the group does.
+#
+# This job runs on a GitHub-hosted runner, which is free for public repos.
+
+# pull_request_target, NOT pull_request — and deliberately no workflow_dispatch.
+#
+# This job holds PULSEAI_CI_PRIVATE_KEY, the App's master credential: it mints
+# tokens for every repo the App is installed on, with every permission it holds.
+# Under `pull_request` the workflow file that executes comes from the PR BRANCH,
+# so any collaborator able to push a branch here could rewrite this file to
+# print the key. `workflow_dispatch` is the same hole with a branch selector.
+#
+# pull_request_target always executes the BASE branch's copy, so neither the
+# guard below nor these steps can be modified by a PR. The usual danger of
+# pull_request_target — running untrusted code with secrets — does not apply:
+# this job checks nothing out and executes no repository code. It only
+# dispatches. Raised as a P1 by chatgpt-codex-connector in review.
+on:
+  pull_request_target:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qa-trigger-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dispatch:
+    name: Request QA
+    runs-on: ubuntu-latest
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │ DO NOT REMOVE OR WEAKEN THIS CONDITION. It is the security boundary. │
+    # └─────────────────────────────────────────────────────────────────────┘
+    #
+    # Under pull_request_target, a FORK PR executes the base branch's workflow
+    # WITH ACCESS TO BASE-REPOSITORY SECRETS. The often-repeated "forks don't
+    # get secrets" rule applies to `pull_request`, NOT to this trigger. So the
+    # head-repo equality check below is not a convenience and not redundant --
+    # it is the only thing preventing an arbitrary fork PR from dispatching its
+    # untrusted SHA to the private self-hosted runner.
+    #
+    # Dependabot is excluded on the PR AUTHOR (pull_request.user.login), not on
+    # github.actor. When a maintainer closes and reopens a Dependabot PR, the
+    # actor is that maintainer, so an actor-based check would let the run
+    # proceed -- and PULSEAI_CI_PRIVATE_KEY is an Actions secret, which GitHub
+    # withholds from Dependabot-triggered runs, so the token step would fail.
+    # A skipped job reports success and does not block the merge.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]'
+    steps:
+      - name: Mint a scoped App token
+        id: token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.PULSEAI_CI_APP_ID }}
+          private-key: ${{ secrets.PULSEAI_CI_PRIVATE_KEY }}
+          owner: pulseai-labs
+          # Scoped to the twin only. This token cannot touch any other repo.
+          repositories: pulsedb-internal
+          permission-actions: write
+          permission-contents: read
+
+      # Values reach the shell through env, never through ${{ }} interpolation
+      # inside run:. head.sha and the PR number are both attacker-influenceable
+      # on the fork path; the receiving workflow validates them again.
+      # workflow_dispatch, NOT repository_dispatch. Both trigger the twin, but
+      # POST /repos/{}/dispatches requires `contents: write` for a GitHub App —
+      # and for an App that grant IS push access to every installed repo.
+      # POST /actions/workflows/{}/dispatches needs only `actions: write`,
+      # which cannot modify code. See draco-hub-macos-server docs/adr/0001.
+      - name: Dispatch to pulsedb-internal
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR: ${{ github.event.pull_request.number || 0 }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::bad sha"; exit 1; }
+          printf '%s' "$PR"  | grep -Eq '^[0-9]{1,10}$'  || { echo "::error::bad pr"; exit 1; }
+          gh api -X POST \
+            /repos/pulseai-labs/pulsedb-internal/actions/workflows/droid.yml/dispatches \
+            -f ref=master \
+            -f "inputs[sha]=$SHA" \
+            -f "inputs[pr]=$PR"
+          echo "requested QA for $SHA (PR #$PR)"
+
+      - name: Note where the result appears
+        run: |
+          echo "QA runs in pulsedb-internal and comments back on this PR." >>"$GITHUB_STEP_SUMMARY"
+          echo "Run log: https://github.com/pulseai-labs/pulsedb-internal/actions" >>"$GITHUB_STEP_SUMMARY"
