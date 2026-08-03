@@ -1,0 +1,67 @@
+name: QA Trigger
+
+# Asks the private twin (pulsedb-internal) to run droid QA on the self-hosted
+# Mac mini, and does nothing else.
+#
+# This repository is PUBLIC and cannot use the self-hosted runner: the org
+# runner group sets allows_public_repositories: false. That is deliberate — a
+# fork PR can supply its own workflow naming runs-on: [self-hosted, ...], so no
+# workflow-level guard protects the hardware; only the group does.
+#
+# This job runs on a GitHub-hosted runner, which is free for public repos.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qa-trigger-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dispatch:
+    name: Request QA
+    runs-on: ubuntu-latest
+    # Branch PRs only. A fork PR receives no secrets, so the token step below
+    # would fail anyway — this makes the intent explicit and skips cleanly
+    # rather than failing red on every external contribution.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Mint a scoped App token
+        id: token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.PULSEAI_CI_APP_ID }}
+          private-key: ${{ secrets.PULSEAI_CI_PRIVATE_KEY }}
+          owner: pulseai-labs
+          # Scoped to the twin only. This token cannot touch any other repo.
+          repositories: pulsedb-internal
+
+      # Values reach the shell through env, never through ${{ }} interpolation
+      # inside run:. head.sha and the PR number are both attacker-influenceable
+      # on the fork path; the receiving workflow validates them again.
+      - name: Dispatch to pulsedb-internal
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR: ${{ github.event.pull_request.number || 0 }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::bad sha"; exit 1; }
+          printf '%s' "$PR"  | grep -Eq '^[0-9]{1,10}$'  || { echo "::error::bad pr"; exit 1; }
+          gh api -X POST /repos/pulseai-labs/pulsedb-internal/dispatches \
+            -f event_type=droid-qa \
+            -F "client_payload[sha]=$SHA" \
+            -F "client_payload[pr]=$PR"
+          echo "requested QA for $SHA (PR #$PR)"
+
+      - name: Note where the result appears
+        run: |
+          echo "QA runs in pulsedb-internal and comments back on this PR." >>"$GITHUB_STEP_SUMMARY"
+          echo "Run log: https://github.com/pulseai-labs/pulsedb-internal/actions" >>"$GITHUB_STEP_SUMMARY"
