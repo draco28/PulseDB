@@ -26,12 +26,22 @@ jobs:
   dispatch:
     name: Request QA
     runs-on: ubuntu-latest
-    # Branch PRs only. A fork PR receives no secrets, so the token step below
-    # would fail anyway — this makes the intent explicit and skips cleanly
-    # rather than failing red on every external contribution.
+    # Branch PRs only, and never Dependabot.
+    #
+    # Fork PRs receive no secrets, so the token step would fail anyway — the
+    # explicit check makes the intent visible and skips cleanly instead of
+    # failing red on every external contribution.
+    #
+    # Dependabot needs its own exclusion. Its branches live in the BASE repo, so
+    # they satisfy the same-repository check above — but GitHub withholds
+    # ordinary Actions secrets from Dependabot-triggered runs. PULSEAI_CI_PRIVATE_KEY
+    # is an Actions secret (this repo has no Dependabot secrets), so the token
+    # action would receive an empty key and fail on every weekly dependency PR.
+    # A skipped job reports success and does not block the merge.
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      github.event.pull_request.head.repo.full_name == github.repository
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.actor != 'dependabot[bot]')
     steps:
       - name: Mint a scoped App token
         id: token
