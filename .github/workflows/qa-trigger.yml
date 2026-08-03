@@ -10,10 +10,22 @@ name: QA Trigger
 #
 # This job runs on a GitHub-hosted runner, which is free for public repos.
 
+# pull_request_target, NOT pull_request — and deliberately no workflow_dispatch.
+#
+# This job holds PULSEAI_CI_PRIVATE_KEY, the App's master credential: it mints
+# tokens for every repo the App is installed on, with every permission it holds.
+# Under `pull_request` the workflow file that executes comes from the PR BRANCH,
+# so any collaborator able to push a branch here could rewrite this file to
+# print the key. `workflow_dispatch` is the same hole with a branch selector.
+#
+# pull_request_target always executes the BASE branch's copy, so neither the
+# guard below nor these steps can be modified by a PR. The usual danger of
+# pull_request_target — running untrusted code with secrets — does not apply:
+# this job checks nothing out and executes no repository code. It only
+# dispatches. Raised as a P1 by chatgpt-codex-connector in review.
 on:
-  pull_request:
+  pull_request_target:
     branches: [main]
-  workflow_dispatch:
 
 permissions:
   contents: read
