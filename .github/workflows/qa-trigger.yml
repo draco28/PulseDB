@@ -42,10 +42,17 @@ jobs:
           owner: pulseai-labs
           # Scoped to the twin only. This token cannot touch any other repo.
           repositories: pulsedb-internal
+          permission-actions: write
+          permission-contents: read
 
       # Values reach the shell through env, never through ${{ }} interpolation
       # inside run:. head.sha and the PR number are both attacker-influenceable
       # on the fork path; the receiving workflow validates them again.
+      # workflow_dispatch, NOT repository_dispatch. Both trigger the twin, but
+      # POST /repos/{}/dispatches requires `contents: write` for a GitHub App —
+      # and for an App that grant IS push access to every installed repo.
+      # POST /actions/workflows/{}/dispatches needs only `actions: write`,
+      # which cannot modify code. See draco-hub-macos-server docs/adr/0001.
       - name: Dispatch to pulsedb-internal
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
@@ -55,10 +62,11 @@ jobs:
           set -euo pipefail
           printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::bad sha"; exit 1; }
           printf '%s' "$PR"  | grep -Eq '^[0-9]{1,10}$'  || { echo "::error::bad pr"; exit 1; }
-          gh api -X POST /repos/pulseai-labs/pulsedb-internal/dispatches \
-            -f event_type=droid-qa \
-            -F "client_payload[sha]=$SHA" \
-            -F "client_payload[pr]=$PR"
+          gh api -X POST \
+            /repos/pulseai-labs/pulsedb-internal/actions/workflows/droid.yml/dispatches \
+            -f ref=master \
+            -f "inputs[sha]=$SHA" \
+            -f "inputs[pr]=$PR"
           echo "requested QA for $SHA (PR #$PR)"
 
       - name: Note where the result appears
