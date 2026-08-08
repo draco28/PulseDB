@@ -34,29 +34,20 @@ jobs:
         with:
           prefix-key: qa
 
+      - name: Install Droid CLI
+        run: |
+          curl -fsSL https://app.factory.ai/cli | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Run Droid QA
         id: qa
         continue-on-error: true
         timeout-minutes: 18
-        uses: Factory-AI/droid-action@main
-        with:
-          factory_api_key: ${{ secrets.FACTORY_API_KEY }}
-          droid_args: "-m glm-5.2 -r high"
-          prompt: |
-            You are running in a NON-INTERACTIVE CI environment. There is NO human available.
-            Do NOT use AskUser, do NOT wait for confirmations, do NOT pause for input.
-
-            Run the project's `qa` skill at `.factory/skills/qa/SKILL.md`.
-            Read `.factory/skills/qa/config.yaml` for feature configuration.
-            Read `.factory/skills/qa-library/SKILL.md` for the flow menu.
-
-            Analyze the git diff `origin/main...HEAD`. Write consumer-simulation Rust
-            test programs that exercise the changed public API areas. Compile and run
-            them with cargo test across the relevant feature configurations.
-
-            Write the final report to stdout. Lead with a one-line verdict
-            (PASS / FAIL / INCONCLUSIVE), then findings with evidence.
-            Clean up any test files you create.
+        env:
+          FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
+        run: |
+          mkdir -p qa-results
+          droid exec --auto high -m glm-5.2 -r high "You are running in a NON-INTERACTIVE CI environment. There is NO human available. Do NOT use AskUser, do NOT wait for confirmations, do NOT pause for input. Run the project's qa skill at .factory/skills/qa/SKILL.md. Read .factory/skills/qa/config.yaml for feature configuration. Read .factory/skills/qa-library/SKILL.md for the flow menu. Analyze the git diff origin/main...HEAD. Write consumer-simulation Rust test programs that exercise the changed public API areas. Compile and run them with cargo test across the relevant feature configurations. Write the final report to qa-results/report.md. Lead with a one-line verdict (PASS / FAIL / INCONCLUSIVE), then findings with evidence. Clean up any test files you create." 2>&1 | tee qa-results/qa-output.txt || true
 
       - name: Upload QA artifacts
         if: always()
