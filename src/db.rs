@@ -59,7 +59,7 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -2031,9 +2031,28 @@ impl PulseDB {
         let ef_search = self.config.hnsw.ef_search.max(over_fetch);
         let now = Timestamp::now();
 
+        // Resolve tag predicate → allowed set (filtered ANN, not post-filter).
+        let allowed: Option<HashSet<ExperienceId>> = match &filter.tags_all {
+            Some(tags) if !tags.is_empty() => {
+                let ids = self
+                    .storage
+                    .get_experience_ids_by_tags(collective_id, tags)?;
+                if ids.is_empty() {
+                    return Ok(rerank::rerank(vec![], k));
+                }
+                Some(ids)
+            }
+            _ => None,
+        };
+
         let candidates = self
             .with_vector_index(collective_id, |index| {
-                index.search_experiences(query, over_fetch, ef_search)
+                index.search_experiences_with_allowed(
+                    query,
+                    over_fetch,
+                    ef_search,
+                    allowed.as_ref(),
+                )
             })?
             .unwrap_or_default();
 
@@ -2069,8 +2088,15 @@ impl PulseDB {
     /// Like [`search_similar()`](Self::search_similar), but applies additional
     /// filters on domain, experience type, importance, confidence, and timestamp.
     ///
-    /// Over-fetches from the HNSW index (2x `k`) to account for entries removed
-    /// by post-filtering, then truncates to the requested `k`.
+    /// **Tag-filtered ANN:** when `filter.tags_all` is set, the tag predicate is
+    /// pushed into the HNSW graph traversal (filter-during-traversal), not
+    /// applied as a post-filter. This bounds the vector index's work and
+    /// guarantees that a search for `k` results among a tagged subset returns
+    /// exactly `k` tagged results, not fewer after a post-recall truncate.
+    ///
+    /// Other filters (domain, importance, confidence, since) are applied as
+    /// post-filters after vector retrieval. Over-fetches from the HNSW index
+    /// (2x `k`) to account for entries removed by these post-filters.
     ///
     /// # Arguments
     ///
@@ -2135,18 +2161,43 @@ impl PulseDB {
         }
 
         // Over-fetch from HNSW to compensate for post-filtering losses
+        // (domain, importance, etc.). The tag predicate, if present, is pushed
+        // INTO the HNSW traversal (filtered ANN) — not a post-filter.
         let over_fetch = k.saturating_mul(2).min(2000);
         let ef_search = self.config.hnsw.ef_search;
 
+        // Resolve tag predicate → allowed set (filtered ANN, not post-filter).
+        // This is the load-bearing requirement of VS-4.3.2: the filter bounds
+        // the vector index's traversal work, not the post-recall truncate.
+        let allowed: Option<HashSet<ExperienceId>> = match &filter.tags_all {
+            Some(tags) if !tags.is_empty() => {
+                let ids = self
+                    .storage
+                    .get_experience_ids_by_tags(collective_id, tags)?;
+                if ids.is_empty() {
+                    return Ok(vec![]); // no tagged experiences → empty result
+                }
+                Some(ids)
+            }
+            _ => None, // no tag predicate or empty predicate
+        };
+
         // Search HNSW index — returns (ExperienceId, cosine_distance) sorted
-        // by distance ascending (closest first)
+        // by distance ascending (closest first). When `allowed` is Some, the
+        // traversal skips non-allowed nodes (filter-during-traversal).
         let candidates = self
             .with_vector_index(collective_id, |index| {
-                index.search_experiences(query, over_fetch, ef_search)
+                index.search_experiences_with_allowed(
+                    query,
+                    over_fetch,
+                    ef_search,
+                    allowed.as_ref(),
+                )
             })?
             .unwrap_or_default();
 
-        // Fetch full experiences, apply filter, convert distance → similarity
+        // Fetch full experiences, apply remaining post-filters (domain, importance,
+        // confidence, since — tags are already guaranteed by the traversal filter).
         let mut results = Vec::with_capacity(k);
         for (exp_id, distance) in candidates {
             if results.len() >= k {

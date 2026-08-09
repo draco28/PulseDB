@@ -187,8 +187,8 @@ fn assert_clean_rerun_value_identical(store: &Path, manifest: &Value) {
         .unwrap_or_else(|e| panic!("clean re-run migrate+open failed: {e:?}"));
     assert_eq!(
         db.metadata().schema_version,
-        3,
-        "re-run must reach schema v3"
+        4,
+        "re-run must reach schema v4"
     );
     // marker is now CURRENT ({redb-v3, postcard}) — the migration completed.
     // (re-open must be dropped before reading the marker via a 2nd redb handle)
