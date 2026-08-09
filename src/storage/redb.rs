@@ -1055,14 +1055,20 @@ impl RedbStorage {
         // v3 backup exists for them).
         let db = if needs_v3_migration || needs_v4_migration {
             drop(db);
-            // Don't clobber an existing backup. The copy happens in the
-            // lock-release window before the re-read below can confirm migration is
-            // still needed; if a concurrent upgrader already migrated the file and
-            // wrote the backup, copying now would overwrite the genuine sidecar
-            // with already-migrated data. Atomically claim the backup path
-            // (create_new / O_EXCL) so only the first writer creates it — a
-            // concurrent upgrader that lost the race sees AlreadyExists and leaves
-            // the genuine sidecar untouched (no TOCTOU between exists() and copy()).
+            // Schema ≤ 2 stores take `.pre-v3.bak` (they run the v2→v3 reshape).
+            // Schema == 3 stores take `.pre-v4.bak` (v3→v4 tag-field append — no
+            // v3 backup exists for them).
+            //
+            // Uses `create_new` (O_EXCL) on the FINAL path: concurrent openers that
+            // both enter this block (the migration lock only covers `create_or_migrate`,
+            // not `open_existing`) are serialized by the O_EXCL claim. A concurrent
+            // upgrader that lost the race sees `AlreadyExists` and preserves the
+            // genuine sidecar. This has the same crash-atomicity posture as the
+            // pre-existing `.pre-v3.bak` backup: a hard kill mid-copy leaves a
+            // truncated file that a later open's `AlreadyExists` branch preserves.
+            // (The `.pre-substrate.bak` uses the temp+rename `backup_once` pattern
+            // because it runs under the exclusive migration lock; the schema backup
+            // does not.)
             let backup_path = if needs_v3_migration {
                 pre_v3_backup_path(&path)
             } else {
@@ -1074,20 +1080,12 @@ impl RedbStorage {
                 .open(&backup_path)
             {
                 Ok(mut backup_file) => {
-                    // If the copy fails after we claimed the path (disk full, short
-                    // write, interruption), remove the partial/empty backup so a
-                    // later open does not treat it as a valid sidecar via the
-                    // AlreadyExists branch — the next open then re-creates a complete one.
                     let copy_result = std::fs::File::open(&path).and_then(|mut source| {
                         std::io::copy(&mut source, &mut backup_file).map(|_| ())
                     });
                     if let Err(error) = copy_result {
                         drop(backup_file);
                         let _ = std::fs::remove_file(&backup_path);
-                        // On Windows a concurrent opener holding the redb file lock
-                        // surfaces here as a raw lock/sharing violation; promote it to
-                        // the typed, retryable DatabaseLocked (audit C2) rather than a
-                        // generic Io error the contention-retry loop cannot recognize.
                         return Err(migration_io_error(error));
                     }
                 }
@@ -1249,6 +1247,11 @@ impl RedbStorage {
                 // this, all experience blobs are v4-format; the codec re-encode
                 // below reads them cleanly as `Experience`.
                 if needs_v4_migration {
+                    // Ensure the new EXPERIENCES_BY_TAG_TABLE exists so a
+                    // tag-filtered search immediately after migration (before
+                    // any tagged write) opens cleanly instead of erroring on
+                    // a nonexistent table.
+                    let _ = write_txn.open_multimap_table(EXPERIENCES_BY_TAG_TABLE)?;
                     Self::migrate_experiences_v3_to_v4(&write_txn)?;
                     info!("Migrated experiences from schema v3 to v4");
                 }
@@ -2833,7 +2836,7 @@ impl StorageEngine for RedbStorage {
                 let mut tag_table = write_txn.open_multimap_table(EXPERIENCES_BY_TAG_TABLE)?;
                 for (key, value) in old_tags {
                     let tag_key = encode_tag_index_key(collective_id.as_bytes(), key, value);
-                    let _ = tag_table.remove(tag_key.as_slice(), id.as_bytes());
+                    tag_table.remove(tag_key.as_slice(), id.as_bytes())?;
                 }
                 for (key, value) in &experience.tags {
                     let tag_key = encode_tag_index_key(collective_id.as_bytes(), key, value);
@@ -2952,7 +2955,7 @@ impl StorageEngine for RedbStorage {
                 let mut tag_table = write_txn.open_multimap_table(EXPERIENCES_BY_TAG_TABLE)?;
                 for (key, value) in &tags {
                     let tag_key = encode_tag_index_key(collective_id.as_bytes(), key, value);
-                    let _ = tag_table.remove(tag_key.as_slice(), id.as_bytes());
+                    tag_table.remove(tag_key.as_slice(), id.as_bytes())?;
                 }
             }
         }

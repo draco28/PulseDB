@@ -2034,11 +2034,23 @@ impl PulseDB {
         // Resolve tag predicate → allowed set (filtered ANN, not post-filter).
         let allowed: Option<HashSet<ExperienceId>> = match &filter.tags_all {
             Some(tags) if !tags.is_empty() => {
-                let ids = self
+                let mut ids = self
                     .storage
                     .get_experience_ids_by_tags(collective_id, tags)?;
                 if ids.is_empty() {
                     return Ok(rerank::rerank(vec![], k));
+                }
+                if filter.exclude_archived {
+                    ids.retain(|id| {
+                        self.storage
+                            .get_experience(*id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|exp| !exp.archived)
+                    });
+                    if ids.is_empty() {
+                        return Ok(rerank::rerank(vec![], k));
+                    }
                 }
                 Some(ids)
             }
@@ -2171,11 +2183,27 @@ impl PulseDB {
         // the vector index's traversal work, not the post-recall truncate.
         let allowed: Option<HashSet<ExperienceId>> = match &filter.tags_all {
             Some(tags) if !tags.is_empty() => {
-                let ids = self
+                let mut ids = self
                     .storage
                     .get_experience_ids_by_tags(collective_id, tags)?;
                 if ids.is_empty() {
                     return Ok(vec![]); // no tagged experiences → empty result
+                }
+                // Exclude archived experiences from the traversal set when
+                // exclude_archived is set (the default). Archived experiences
+                // remain in the HNSW graph but should not consume over-fetch
+                // budget in the filtered-ANN path.
+                if filter.exclude_archived {
+                    ids.retain(|id| {
+                        self.storage
+                            .get_experience(*id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|exp| !exp.archived)
+                    });
+                    if ids.is_empty() {
+                        return Ok(vec![]);
+                    }
                 }
                 Some(ids)
             }
