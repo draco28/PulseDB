@@ -29,8 +29,7 @@ pub mod schema;
 pub use self::redb::RedbStorage;
 pub use schema::{DatabaseMetadata, SCHEMA_VERSION};
 
-#[cfg(feature = "sync")]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use crate::activity::Activity;
@@ -281,6 +280,22 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// Returns an error if the transaction or serialization fails.
     fn save_experience(&self, experience: &Experience) -> Result<()>;
+
+    /// Resolves the set of experience IDs in a collective that match ALL given
+    /// key=value tag pairs (AND / exact-match subset semantics).
+    ///
+    /// An empty predicate returns an empty set (no caller should use an empty
+    /// predicate — that means "no tag filter"). Used by the filtered-ANN search
+    /// path to bound HNSW traversal work via a native filter-during-traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read transaction fails.
+    fn get_experience_ids_by_tags(
+        &self,
+        collective_id: CollectiveId,
+        tags: &BTreeMap<String, String>,
+    ) -> Result<HashSet<ExperienceId>>;
 
     /// Retrieves an experience by ID, including its embedding.
     ///

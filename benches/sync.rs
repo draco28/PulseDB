@@ -41,6 +41,7 @@ fn make_test_experience(cid: CollectiveId, seed: u64) -> pulsedb::Experience {
         confidence: 0.8,
         applications: std::collections::BTreeMap::new(),
         domain: vec!["benchmark".to_string()],
+        tags: std::collections::BTreeMap::new(),
         related_files: vec![],
         source_agent: pulsedb::AgentId::new("bench"),
         source_task: None,

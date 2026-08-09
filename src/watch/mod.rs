@@ -297,6 +297,7 @@ mod tests {
             confidence: 1.0,
             applications: std::collections::BTreeMap::new(),
             domain: domains,
+            tags: std::collections::BTreeMap::new(),
             related_files: vec![],
             source_agent: AgentId::new("test-agent"),
             source_task: None,

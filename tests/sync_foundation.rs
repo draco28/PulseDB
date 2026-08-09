@@ -444,9 +444,9 @@ fn test_sync_config_postcard_roundtrip() {
 // ============================================================================
 
 #[test]
-fn test_protocol_version_is_three() {
-    // Bumped 2→3 in VS-4.0.3 work-1.03 (postcard wire + serializer-independent preamble).
-    assert_eq!(SYNC_PROTOCOL_VERSION, 3);
+fn test_protocol_version_is_four() {
+    // Bumped 3→4 in VS-4.3.2 work-1.04 (tags field on Experience + SerializableExperienceUpdate).
+    assert_eq!(SYNC_PROTOCOL_VERSION, 4);
 }
 
 // ============================================================================
@@ -604,6 +604,7 @@ fn test_echo_prevention_suppresses_wal() {
         confidence: 0.8,
         applications: std::collections::BTreeMap::new(),
         domain: vec![],
+        tags: std::collections::BTreeMap::new(),
         related_files: vec![],
         source_agent: pulsedb::AgentId::new("sync-test"),
         source_task: None,
@@ -642,6 +643,7 @@ fn test_apply_synced_experience_writes_data() {
         confidence: 0.9,
         applications: std::collections::BTreeMap::from([(pulsedb::InstanceId::new(), 5)]),
         domain: vec!["test".to_string()],
+        tags: std::collections::BTreeMap::new(),
         related_files: vec![],
         source_agent: pulsedb::AgentId::new("sync-test"),
         source_task: None,

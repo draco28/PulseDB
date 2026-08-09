@@ -53,10 +53,10 @@ use std::collections::BTreeMap;
 
 use super::{decode, LegacyBincodeError};
 use crate::collective::Collective;
-use crate::experience::{Experience, ExperienceType, Severity};
+use crate::experience::{ExperienceType, Severity};
 use crate::insight::{DerivedInsight, InsightType};
 use crate::relation::{ExperienceRelation, RelationType};
-use crate::storage::schema::{ExperienceV2, WatchEventRecord, WatchEventRecordV1};
+use crate::storage::schema::{ExperienceV2, ExperienceV3, WatchEventRecord, WatchEventRecordV1};
 use crate::types::{CollectiveId, ExperienceId, InstanceId, Timestamp};
 
 // ============================================================================
@@ -198,7 +198,10 @@ fn decode_collective_none_option() {
 
 #[test]
 fn decode_experience_gcounter_multi_entry() {
-    let e: Experience = decode(EXPERIENCE_GOLDEN).expect("experience decodes");
+    // These golden bytes encode the schema-v3 bincode layout (no `tags` field,
+    // which was added in v4). Decode into ExperienceV3 — the legacy struct
+    // matching the v3 wire format.
+    let e: ExperienceV3 = decode(EXPERIENCE_GOLDEN).expect("experience decodes");
     assert_eq!(e.id, ExperienceId::from_bytes([0x21; 16]));
     assert_eq!(e.collective_id, CollectiveId::from_bytes([0x11; 16]));
     assert_eq!(e.content, "hello");
@@ -212,7 +215,6 @@ fn decode_experience_gcounter_multi_entry() {
     expected.insert(InstanceId::from_bytes([0x01; 16]), 3);
     expected.insert(InstanceId::from_bytes([0x02; 16]), 7);
     assert_eq!(e.applications, expected);
-    assert_eq!(e.applications(), 10);
     assert_eq!(e.domain, vec!["a".to_string(), "bb".to_string()]);
     assert!(e.related_files.is_empty());
     assert_eq!(e.source_agent.as_str(), "agent");
@@ -224,7 +226,7 @@ fn decode_experience_gcounter_multi_entry() {
 
 #[test]
 fn decode_experience_adversarial_nan_empty_none() {
-    let e: Experience = decode(EXPERIENCE_ADVERSARIAL_GOLDEN).expect("adversarial decodes");
+    let e: ExperienceV3 = decode(EXPERIENCE_ADVERSARIAL_GOLDEN).expect("adversarial decodes");
     assert!(e.importance.is_nan(), "f32 NaN must round-trip");
     assert!(e.applications.is_empty());
     assert!(e.domain.is_empty());
@@ -239,7 +241,7 @@ fn decode_experience_adversarial_nan_empty_none() {
 
 #[test]
 fn decode_experience_difficulty_nested_enum() {
-    let e: Experience = decode(EXPERIENCE_DIFFICULTY_GOLDEN).expect("difficulty decodes");
+    let e: ExperienceV3 = decode(EXPERIENCE_DIFFICULTY_GOLDEN).expect("difficulty decodes");
     match e.experience_type {
         ExperienceType::Difficulty {
             description,
@@ -254,7 +256,7 @@ fn decode_experience_difficulty_nested_enum() {
 
 #[test]
 fn decode_experience_solution_some_ref_and_bool() {
-    let e: Experience = decode(EXPERIENCE_SOLUTION_GOLDEN).expect("solution decodes");
+    let e: ExperienceV3 = decode(EXPERIENCE_SOLUTION_GOLDEN).expect("solution decodes");
     match e.experience_type {
         ExperienceType::Solution {
             problem_ref,

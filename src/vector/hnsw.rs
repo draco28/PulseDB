@@ -204,6 +204,28 @@ impl HnswIndex {
         k: usize,
         ef_search: usize,
     ) -> Result<Vec<(ExperienceId, f32)>> {
+        self.search_experiences_with_allowed(query, k, ef_search, None)
+    }
+
+    /// Searches with an optional **allowed-set** constraint applied during
+    /// traversal (filtered ANN, not post-filter).
+    ///
+    /// When `allowed` is `Some(set)`, only experiences whose ExperienceId is in
+    /// `set` are considered — the HNSW graph traversal skips non-allowed nodes
+    /// entirely. This bounds the work done by the vector index, which is the
+    /// load-bearing requirement of VS-4.3.2: a search for `k` results among a
+    /// tagged subset returns exactly `k` tagged results, not `k′ < k` after a
+    /// post-recall truncate.
+    ///
+    /// When `allowed` is `None`, behavior is identical to
+    /// [`search_experiences`](Self::search_experiences).
+    pub fn search_experiences_with_allowed(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        allowed: Option<&HashSet<ExperienceId>>,
+    ) -> Result<Vec<(ExperienceId, f32)>> {
         if query.len() != self.dimension {
             return Err(PulseDBError::vector(format!(
                 "Query dimension mismatch: expected {}, got {}",
@@ -221,19 +243,44 @@ impl HnswIndex {
         if active_count == 0 {
             return Ok(vec![]);
         }
-        let effective_k = k.min(active_count);
+
+        // Convert the allowed ExperienceId set to internal IDs for the HNSW
+        // filter predicate. Unknown IDs (deleted or not in index) are silently
+        // dropped — the caller's allowed set is an over-approximation.
+        let allowed_internal: Option<HashSet<usize>> = allowed.map(|ids| {
+            ids.iter()
+                .filter_map(|exp_id| state.id_to_internal.get(exp_id).copied())
+                .collect()
+        });
+
+        // Cap effective_k to the searchable point count so the HNSW engine
+        // doesn't over-search when the allowed set is small.
+        let searchable = match &allowed_internal {
+            Some(internal) => active_count.min(internal.len()),
+            None => active_count,
+        };
+        if searchable == 0 {
+            return Ok(vec![]);
+        }
+        let effective_k = k.min(searchable);
 
         if active_count <= BRUTE_FORCE_THRESHOLD {
             // Linear scan: iterate all stored vectors and compute exact distances.
             // Guarantees 100% recall for small collections where HNSW's layer
             // fragmentation causes missed results.
             let dist_fn = DistCosine;
-            let mut all_distances: Vec<(ExperienceId, f32)> = Vec::with_capacity(active_count);
+            let mut all_distances: Vec<(ExperienceId, f32)> = Vec::with_capacity(searchable);
 
             for point in self.hnsw.get_point_indexation().into_iter() {
                 let origin_id = point.get_origin_id();
                 if state.deleted.contains(&origin_id) {
                     continue;
+                }
+                // Skip non-allowed points when an allowed set is provided.
+                if let Some(ref internal) = allowed_internal {
+                    if !internal.contains(&origin_id) {
+                        continue;
+                    }
                 }
                 let distance = dist_fn.eval(query, point.get_v());
                 if let Some(&exp_id) = state.internal_to_id.get(origin_id) {
@@ -247,15 +294,22 @@ impl HnswIndex {
             return Ok(all_distances);
         }
 
-        // HNSW graph search for larger collections
+        // HNSW graph search for larger collections.
         let effective_ef = ef_search.max(effective_k);
         let deleted_ref = &state.deleted;
-        let filter_fn = |id: &usize| -> bool { !deleted_ref.contains(id) };
-        let results = if state.deleted.is_empty() {
-            self.hnsw.search(query, effective_k, effective_ef)
-        } else {
+
+        // Combined predicate: not-deleted AND (allowed is None OR in allowed set).
+        let needs_filter = !state.deleted.is_empty() || allowed_internal.is_some();
+        let results = if needs_filter {
+            let allowed_ref = allowed_internal.as_ref();
+            let filter_fn = move |id: &usize| -> bool {
+                !deleted_ref.contains(id)
+                    && allowed_ref.is_none_or(|internal| internal.contains(id))
+            };
             self.hnsw
                 .search_filter(query, effective_k, effective_ef, Some(&filter_fn))
+        } else {
+            self.hnsw.search(query, effective_k, effective_ef)
         };
 
         // Map internal IDs back to ExperienceIds

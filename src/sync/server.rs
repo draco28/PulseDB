@@ -265,6 +265,7 @@ fn build_change_from_record(
                         importance: Some(exp.importance),
                         confidence: Some(exp.confidence),
                         domain: Some(exp.domain.clone()),
+                        tags: Some(exp.tags.clone()),
                         related_files: Some(exp.related_files.clone()),
                         archived: Some(exp.archived),
                         applications: Some(exp.applications.clone()),

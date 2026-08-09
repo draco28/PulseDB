@@ -502,3 +502,283 @@ fn test_search_collective_not_found() {
     assert!(result.is_err());
     assert!(result.unwrap_err().is_not_found());
 }
+
+// ============================================================================
+// Tag-Filtered ANN Search (VS-4.3.2 / issue #62)
+// ============================================================================
+
+/// The load-bearing requirement: **filtered ANN, not post-filter.**
+///
+/// A collective with N > k tagged records plus untagged records that are MORE
+/// similar to the query. `search_similar_filtered(k, tags = {that tag})` must
+/// return exactly k tagged results. If this were post-filtering, the over-fetch
+/// window would be consumed by the high-similarity untagged records and fewer
+/// than k tagged results would survive.
+#[test]
+fn test_filtered_ann_returns_exactly_k_tagged_results() {
+    use std::collections::BTreeMap;
+    let (db, cid, _dir) = open_db_with_collective();
+
+    // Query vector: [1.0, 0.0, 0.0, ...].
+    let mut query = vec![0.0f32; DIM];
+    query[0] = 1.0;
+
+    // Untagged experiences: identical to the query → cosine similarity = 1.0.
+    // These are MORE similar than the tagged ones. If the search post-filtered,
+    // they would consume the entire over-fetch window.
+    let mut untagged_emb = vec![0.0f32; DIM];
+    untagged_emb[0] = 1.0;
+    for i in 0..6u32 {
+        db.record_experience(NewExperience {
+            collective_id: cid,
+            content: format!("untagged-{i}"),
+            embedding: Some(untagged_emb.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    // Tagged experiences: orthogonal to the query → cosine similarity ≈ 0.0.
+    // There are 8 tagged > k=5, so the full tagged subset is available.
+    let mut tagged_emb = vec![0.0f32; DIM];
+    tagged_emb[1] = 1.0;
+    let tags = BTreeMap::from([("category".to_string(), "important".to_string())]);
+    for i in 0..8u32 {
+        db.record_experience(NewExperience {
+            collective_id: cid,
+            content: format!("tagged-{i}"),
+            embedding: Some(tagged_emb.clone()),
+            tags: tags.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    // Search for k=5 tagged results. If this were post-filter:
+    //   over_fetch = k*2 = 10; HNSW returns 10 closest = 6 untagged + 4 tagged.
+    //   After tag filter: 4 results. k' = 4 < 5. FAILS.
+    // With filtered ANN (filter-during-traversal):
+    //   Traversal skips untagged nodes, returns 5 tagged. k' = 5. PASSES.
+    let results = db
+        .search_similar_filtered(
+            cid,
+            &query,
+            5,
+            SearchFilter {
+                tags_all: Some(tags.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Core assertion: exactly k tagged results (not fewer).
+    assert_eq!(
+        results.len(),
+        5,
+        "filtered ANN must return exactly k=5 tagged results, got {} (post-filter would return ≤4)",
+        results.len()
+    );
+
+    // All results must carry the tag.
+    for r in &results {
+        assert_eq!(
+            r.experience.tags, tags,
+            "every filtered-ANN result must carry the tag"
+        );
+    }
+}
+
+/// Multi-pair tag predicate (AND semantics) + domain filtering still works.
+#[test]
+fn test_tag_and_domain_filters_combined() {
+    use std::collections::BTreeMap;
+    let (db, cid, _dir) = open_db_with_collective();
+
+    let mut query = vec![0.0f32; DIM];
+    query[0] = 1.0;
+
+    // Two tagged experiences: one matching domain, one not.
+    let tags = BTreeMap::from([("status".to_string(), "active".to_string())]);
+    for has_domain in [true, false] {
+        db.record_experience(NewExperience {
+            collective_id: cid,
+            content: format!("domain-{}", has_domain),
+            embedding: Some(query.clone()),
+            domain: if has_domain {
+                vec!["rust".into()]
+            } else {
+                vec![]
+            },
+            tags: tags.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    // One untagged with matching domain.
+    db.record_experience(NewExperience {
+        collective_id: cid,
+        content: "untagged-rust".into(),
+        embedding: Some(query.clone()),
+        domain: vec!["rust".into()],
+        ..Default::default()
+    })
+    .unwrap();
+
+    // Both filters must match: tag AND domain.
+    let results = db
+        .search_similar_filtered(
+            cid,
+            &query,
+            10,
+            SearchFilter {
+                tags_all: Some(tags),
+                domains: Some(vec!["rust".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        results.len(),
+        1,
+        "exactly 1 experience matches tag AND domain"
+    );
+    assert_eq!(results[0].experience.content, "domain-true");
+}
+
+/// Tags survive reopen (storage round-trip).
+#[test]
+fn test_tags_survive_reopen() {
+    use std::collections::BTreeMap;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("reopen.db");
+
+    let tags = BTreeMap::from([("entity.type".into(), "person".into())]);
+
+    let id = {
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        let cid = db.create_collective("test").unwrap();
+        let id = db
+            .record_experience(NewExperience {
+                collective_id: cid,
+                content: "tagged experience".into(),
+                embedding: Some(vec![0.5; DIM]),
+                tags: tags.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        // Verify tags are stored
+        let exp = db.get_experience(id).unwrap().unwrap();
+        assert_eq!(exp.tags, tags);
+        id
+    };
+
+    // Reopen and verify tags survived
+    let db = PulseDB::open(&path, Config::default()).unwrap();
+    let exp = db.get_experience(id).unwrap().unwrap();
+    assert_eq!(exp.tags, tags, "tags must survive reopen");
+}
+
+/// Empty tag predicate matches everything (vacuously true).
+#[test]
+fn test_empty_tags_predicate_matches_all() {
+    use std::collections::BTreeMap;
+    let (db, cid, _dir) = open_db_with_collective();
+
+    let query = vec![0.5f32; DIM];
+    for i in 0..3u32 {
+        db.record_experience(NewExperience {
+            collective_id: cid,
+            content: format!("exp-{i}"),
+            embedding: Some(query.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    // An empty tags_all predicate should match everything
+    let results = db
+        .search_similar_filtered(
+            cid,
+            &query,
+            10,
+            SearchFilter {
+                tags_all: Some(BTreeMap::new()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        results.len(),
+        3,
+        "empty tag predicate matches all 3 experiences"
+    );
+}
+
+/// No matching tag → empty result.
+#[test]
+fn test_tag_filter_no_matches_returns_empty() {
+    use std::collections::BTreeMap;
+    let (db, cid, _dir) = open_db_with_collective();
+
+    let query = vec![0.5f32; DIM];
+    db.record_experience(NewExperience {
+        collective_id: cid,
+        content: "untagged".into(),
+        embedding: Some(query.clone()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let results = db
+        .search_similar_filtered(
+            cid,
+            &query,
+            10,
+            SearchFilter {
+                tags_all: Some(BTreeMap::from([("nonexistent".into(), "value".into())])),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    assert!(results.is_empty(), "no tagged experiences → empty result");
+}
+
+/// Domain filtering continues to work unchanged (no tags).
+#[test]
+fn test_domain_filter_unchanged_without_tags() {
+    let (db, cid, _dir) = open_db_with_collective();
+
+    let query = vec![0.5f32; DIM];
+    for has_domain in [true, false] {
+        db.record_experience(NewExperience {
+            collective_id: cid,
+            content: format!("domain-{}", has_domain),
+            embedding: Some(query.clone()),
+            domain: if has_domain {
+                vec!["rust".into()]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    let results = db
+        .search_similar_filtered(
+            cid,
+            &query,
+            10,
+            SearchFilter {
+                domains: Some(vec!["rust".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].experience.domain, vec!["rust".to_string()]);
+}

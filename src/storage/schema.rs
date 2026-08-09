@@ -32,19 +32,21 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
+use std::collections::BTreeMap;
+
 use redb::{MultimapTableDefinition, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use crate::config::EmbeddingDimension;
 use crate::experience::ExperienceType;
-use crate::types::{AgentId, CollectiveId, ExperienceId, TaskId, Timestamp};
+use crate::types::{AgentId, CollectiveId, ExperienceId, InstanceId, TaskId, Timestamp};
 
 /// Current schema version.
 ///
 /// Increment this when making breaking changes to the schema.
 /// Version 2 adds `entity_type` to `WatchEventRecord` for sync protocol support.
 /// Version 3 reshapes `Experience` for temporal decay and G-counter applications.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 // ============================================================================
 // Substrate Format Marker (storage-format axis — distinct from SCHEMA_VERSION)
@@ -115,6 +117,15 @@ pub const MAX_DOMAIN_TAGS: usize = 50;
 
 /// Maximum length of a single domain tag.
 pub const MAX_TAG_LENGTH: usize = 100;
+
+/// Maximum number of key-value tags per experience.
+pub const MAX_KV_TAGS: usize = 50;
+
+/// Maximum length of a key-value tag key.
+pub const MAX_KV_TAG_KEY_LENGTH: usize = 100;
+
+/// Maximum length of a key-value tag value.
+pub const MAX_KV_TAG_VALUE_LENGTH: usize = 200;
 
 /// Maximum number of source files per experience.
 pub const MAX_SOURCE_FILES: usize = 100;
@@ -197,6 +208,37 @@ pub const EXPERIENCES_BY_COLLECTIVE_TABLE: MultimapTableDefinition<&[u8; 16], &[
 /// Using a multimap allows multiple experiences of the same type.
 pub const EXPERIENCES_BY_TYPE_TABLE: MultimapTableDefinition<&[u8; 17], &[u8; 16]> =
     MultimapTableDefinition::new("experiences_by_type");
+
+/// Index: Experiences by key-value tag (VS-4.3.2).
+///
+/// Enables substrate-native tag-filtered search without post-filtering. Key
+/// encodes `(collective_id, tag_key, tag_value)` as length-prefixed bytes; value
+/// is the ExperienceId. A multimap because many experiences can share the same
+/// key=value pair.
+///
+/// Key format: `[collective_id: 16 bytes][key_len: u32 BE][key bytes][value_len: u32 BE][value bytes]`
+///
+/// Note: the key is variable-length (`&[u8]`), not fixed. redb sorts multimap
+/// keys lexicographically, and the length-prefix ensures no ambiguity when two
+/// keys share a byte prefix.
+pub const EXPERIENCES_BY_TAG_TABLE: MultimapTableDefinition<&[u8], &[u8; 16]> =
+    MultimapTableDefinition::new("experiences_by_tag");
+
+/// Encodes a tag index key: `[collective_id: 16B][key_len: u32 BE][key][value_len: u32 BE][value]`.
+///
+/// The collective_id prefix scopes every tag entry to its collective so a single
+/// range scan per `(key, value)` pair suffices for tag-predicate resolution.
+pub fn encode_tag_index_key(collective_id: &[u8; 16], tag_key: &str, tag_value: &str) -> Vec<u8> {
+    let key_bytes = tag_key.as_bytes();
+    let value_bytes = tag_value.as_bytes();
+    let mut buf = Vec::with_capacity(16 + 4 + key_bytes.len() + 4 + value_bytes.len());
+    buf.extend_from_slice(collective_id);
+    buf.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(key_bytes);
+    buf.extend_from_slice(&(value_bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(value_bytes);
+    buf
+}
 
 /// Embeddings table.
 ///
@@ -416,6 +458,33 @@ pub(crate) struct ExperienceV2 {
     pub source_agent: AgentId,
     pub source_task: Option<TaskId>,
     pub timestamp: Timestamp,
+    pub archived: bool,
+}
+
+/// Schema v3 experience record (for migration deserialization only).
+///
+/// This mirrors the exact postcard layout of `Experience` at schema v3:
+/// everything the current struct has **except** the `tags` field added in
+/// schema v4. Used by `migrate_experiences_v3_to_v4` to decode v3 records
+/// (which lack the trailing `tags` bytes postcard cannot tolerate as
+/// absent) and re-serialize as v4 with an empty `BTreeMap`.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ExperienceV3 {
+    pub id: ExperienceId,
+    pub collective_id: CollectiveId,
+    pub content: String,
+    #[serde(skip)]
+    pub embedding: Vec<f32>,
+    pub experience_type: ExperienceType,
+    pub importance: f32,
+    pub confidence: f32,
+    pub applications: BTreeMap<InstanceId, u32>,
+    pub domain: Vec<String>,
+    pub related_files: Vec<String>,
+    pub source_agent: AgentId,
+    pub source_task: Option<TaskId>,
+    pub timestamp: Timestamp,
+    pub last_reinforced: Timestamp,
     pub archived: bool,
 }
 
@@ -747,7 +816,7 @@ mod tests {
 
     #[test]
     fn test_schema_version() {
-        assert_eq!(SCHEMA_VERSION, 3);
+        assert_eq!(SCHEMA_VERSION, 4);
     }
 
     #[test]

@@ -77,7 +77,7 @@ pulsehive-db = { version = "0.3", features = ["sync-http"] }
 
 - **Experience storage** — Record, retrieve, update, archive, and delete agent experiences with full CRUD operations
 - **Temporal lifecycle** — Experiences accrue/decay energy over time; `list_cold_experiences()` surfaces coldest-first prune-eligible candidates for human/agent-triggered review (read-only — auto-archive is OFF by default)
-- **Vector search** — HNSW approximate nearest neighbor search for semantic similarity (384-dimensional embeddings by default)
+- **Vector search** — HNSW approximate nearest neighbor search for semantic similarity (384-dimensional embeddings by default), with substrate-native tag-filtered ANN (filter-during-traversal, not post-filter)
 - **Knowledge graph** — Typed relations between experiences (Supports, Contradicts, Elaborates, Supersedes, Implies, RelatedTo)
 - **Real-time watch** — In-process notification streams via crossbeam channels and cross-process change detection via WAL sequence tracking
 - **Context assembly** — Single `get_context_candidates()` call retrieves similar experiences, recent activity, insights, relations, and active agents
