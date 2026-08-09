@@ -7,12 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-09
+
+> **Sprint 4.3 — Substrate API Seams.** Three slices unblocking downstream consumer PulseBase: an embedding injection seam so embedded-Rust consumers drive embed-on-write, a provider identity that prevents cross-provider vector mixing on local write paths, and key-value tags with substrate-native filtered ANN search. Plus batch dependency bumps (thiserror 2, sha2 0.11, reqwest 0.13, tokio-tungstenite 0.29, criterion 0.8).
+
 ### Added
 - **Key-value tags on experiences.** `NewExperience`/`Experience` now carry a `tags: BTreeMap<String,String>` field (default empty) for structured key-value filtering, orthogonal to the existing flat `domain: Vec<String>` categorical tags. Serialized in the postcard format; schema bumped v3→v4 with an on-open migration that appends an empty tags map to existing records. Closes #62.
 - **Substrate-native tag-filtered ANN search.** `SearchFilter::tags_all` (exact-match subset: experience must have all given key=value pairs) is pushed **into the HNSW graph traversal** (filter-during-traversal), not applied as a post-filter. A search for `k` results among a tagged subset returns exactly `k` tagged results — not `k′ < k` after a post-recall truncate. Backed by a new `EXPERIENCES_BY_TAG` multimap index for O(matches) predicate resolution.
 - **Embedding injection seam (`PulseDB::open_with_embedder`).** A downstream consumer can now drive embed-on-write through its own `impl EmbeddingService` instead of pre-computing vectors and passing `Some(vec)` on every write. Pass an `Arc<dyn EmbeddingService + Send + Sync>` at open; `record_experience`/`store_insight` with `embedding: None` route through it. The existing `PulseDB::open` path is unchanged. Unblocks embedded-Rust consumers (e.g. PulseBase). Closes #61.
 - **Provider identity travels with the manifold.** Every `EmbeddingService` now declares a `ProviderIdentity` (provider name + model id) via a required `identity()` trait method. `PulseDB::provider_identity()` returns the identity stamped into the store's persisted metadata — so the open database reports which provider embedded its contents.
 - **Cross-provider-mismatch prevention on local write paths.** Re-opening an existing manifold via `open_with_embedder` or `PulseDB::open` with an embedder whose persisted provider identity differs from the stored one is refused with a typed `PulseDBError::EmbeddingProviderMismatch`. This **prevents cross-provider mixing on the local write paths** (`record_experience`, `store_insight`) for distinct loaded model+tokenizer byte sets under `open_with_embedder` and `Builtin`-via-`open` stores. The identity is a construction-time full SHA-256 fingerprint of the loaded `model.onnx ‖ tokenizer.json` bytes (`onnx-<hash>`); the dimension is validated against the configured dimension before stamping. See Known Limitations for the honest scope.
+
+### Changed
+- **Batch dependency bumps** (PR #74): thiserror 1→2, sha2 0.10→0.11, reqwest 0.12→0.13, tokio-tungstenite 0.24→0.29, criterion 0.5→0.8, actions/cache 5→6, action-gh-release 2→3. Cargo-deny-action bumped 2.0.20→2.1.1 (PR #64).
+
+### Breaking
+- **Schema v3→v4 on-disk migration.** Experiences now carry a `tags: BTreeMap<String,String>` field; existing v3 stores migrate automatically on the first **writable** open (a `.pre-v4.bak` sidecar is claimed first). A read-only open of a not-yet-migrated store returns a typed error instead of migrating.
+- **`SYNC_PROTOCOL_VERSION` 3→4.** The `Experience` blob and `SerializableExperienceUpdate` now include the `tags` field. Mixed-version sync peers fail loud in both directions — upgrade all peers together (`sync` / `sync-http` features only).
+- **`EmbeddingService` trait gains a required `identity()` method.** Custom `impl EmbeddingService` must now implement `fn identity(&self) -> Result<ProviderIdentity>`. External-provider consumers using `Some(vec)` on every write are unaffected (the `External`-via-`open` path stays caller-controlled).
+- **`ManagedEmbedderPresent` replaces `InjectedEmbedderPresent`.** All managed embedders (`open_with_embedder` AND `Builtin`-via-`open`) now refuse `Some(vec)` with a typed error; only `External`-via-`open` retains the per-record vector API.
+- **New `PulseDBError` variants**: `EmbeddingProviderMismatch`, `ManagedEmbedderPresent`, `ProviderIdentityCorrupted` — exhaustive matches on `PulseDBError` must handle them.
 
 ### Known Limitations
 - **Pre-0.7.0 stores trigger a one-time lenient identity adoption on first open** (when both `PROVIDER_IDENTITY_KEY` and `PROVIDER_IDENTITY_STAMPED_AT_KEY` are absent). A post-0.7.0 store whose stamp was lost or corrupted (era marker present but identity absent) is refused with a typed corruption error rather than silently re-adopted (VS-4.3.3 1.01, `pulsedb-internal` #17).
