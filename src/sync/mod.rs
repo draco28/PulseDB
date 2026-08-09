@@ -73,9 +73,9 @@ pub mod types;
 /// Exchanged during handshake to ensure compatibility between peers.
 /// Increment when making breaking changes to the wire format.
 ///
-/// Bumped 2 → 3 in VS-4.0.3: the bincode→postcard serializer swap is *also* a
-/// wire-format change, so the protocol version moves in lockstep with
-/// [`WIRE_FORMAT_VERSION`].
+/// Bumped 2 → 3 in VS-4.0.3 (bincode→postcard serializer swap + wire preamble).
+/// Bumped 3 → 4 in VS-4.3.2 (key-value `tags` field on `Experience` +
+/// `SerializableExperienceUpdate`).
 pub const SYNC_PROTOCOL_VERSION: u32 = 4;
 
 /// Capability advertised by peers that sync reinforcement G-counter fields.

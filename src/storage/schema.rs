@@ -240,21 +240,6 @@ pub fn encode_tag_index_key(collective_id: &[u8; 16], tag_key: &str, tag_value: 
     buf
 }
 
-/// Builds a range-scan prefix for a given collective + tag key.
-///
-/// Returns the prefix `[collective_id: 16B][key_len: u32 BE][key]`. All tag
-/// entries for this collective+key start with these bytes, so a prefix-range
-/// scan over the multimap returns every value for that key (regardless of the
-/// value suffix).
-pub fn encode_tag_key_prefix(collective_id: &[u8; 16], tag_key: &str) -> Vec<u8> {
-    let key_bytes = tag_key.as_bytes();
-    let mut buf = Vec::with_capacity(16 + 4 + key_bytes.len());
-    buf.extend_from_slice(collective_id);
-    buf.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
-    buf.extend_from_slice(key_bytes);
-    buf
-}
-
 /// Embeddings table.
 ///
 /// Stored separately from experiences to keep the main table compact.
