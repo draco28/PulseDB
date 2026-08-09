@@ -209,6 +209,56 @@ pub const EXPERIENCES_BY_COLLECTIVE_TABLE: MultimapTableDefinition<&[u8; 16], &[
 pub const EXPERIENCES_BY_TYPE_TABLE: MultimapTableDefinition<&[u8; 17], &[u8; 16]> =
     MultimapTableDefinition::new("experiences_by_type");
 
+/// Index: Experiences by key-value tag (VS-4.3.2).
+///
+/// Enables substrate-native tag-filtered search without post-filtering. Key
+/// encodes `(collective_id, tag_key, tag_value)` as length-prefixed bytes; value
+/// is the ExperienceId. A multimap because many experiences can share the same
+/// key=value pair.
+///
+/// Key format: `[collective_id: 16 bytes][key_len: u32 BE][key bytes][value_len: u32 BE][value bytes]`
+///
+/// Note: the key is variable-length (`&[u8]`), not fixed. redb sorts multimap
+/// keys lexicographically, and the length-prefix ensures no ambiguity when two
+/// keys share a byte prefix.
+pub const EXPERIENCES_BY_TAG_TABLE: MultimapTableDefinition<&[u8], &[u8; 16]> =
+    MultimapTableDefinition::new("experiences_by_tag");
+
+/// Encodes a tag index key: `[collective_id: 16B][key_len: u32 BE][key][value_len: u32 BE][value]`.
+///
+/// The collective_id prefix scopes every tag entry to its collective so a single
+/// range scan per `(key, value)` pair suffices for tag-predicate resolution.
+pub fn encode_tag_index_key(
+    collective_id: &[u8; 16],
+    tag_key: &str,
+    tag_value: &str,
+) -> Vec<u8> {
+    let key_bytes = tag_key.as_bytes();
+    let value_bytes = tag_value.as_bytes();
+    let mut buf = Vec::with_capacity(16 + 4 + key_bytes.len() + 4 + value_bytes.len());
+    buf.extend_from_slice(collective_id);
+    buf.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(key_bytes);
+    buf.extend_from_slice(&(value_bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(value_bytes);
+    buf
+}
+
+/// Builds a range-scan prefix for a given collective + tag key.
+///
+/// Returns the prefix `[collective_id: 16B][key_len: u32 BE][key]`. All tag
+/// entries for this collective+key start with these bytes, so a prefix-range
+/// scan over the multimap returns every value for that key (regardless of the
+/// value suffix).
+pub fn encode_tag_key_prefix(collective_id: &[u8; 16], tag_key: &str) -> Vec<u8> {
+    let key_bytes = tag_key.as_bytes();
+    let mut buf = Vec::with_capacity(16 + 4 + key_bytes.len());
+    buf.extend_from_slice(collective_id);
+    buf.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(key_bytes);
+    buf
+}
+
 /// Embeddings table.
 ///
 /// Stored separately from experiences to keep the main table compact.

@@ -16,7 +16,7 @@
 //! - `./pulse.db` - Main database file
 //! - `./pulse.db.lock` - Lock file for writer coordination (may not be visible)
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use ::redb::{Database, ReadableTable};
@@ -42,12 +42,12 @@ use super::schema::{
     DatabaseMetadata, EntityTypeTag, ExperienceTypeTag, ExperienceV2, ExperienceV3,
     WatchEventRecord, WatchEventTypeTag, ACTIVITIES_TABLE, COLLECTIVES_TABLE,
     CURRENT_SUBSTRATE_FORMAT, DECAY_CONFIGS_TABLE, EMBEDDINGS_TABLE,
-    EXPERIENCES_BY_COLLECTIVE_TABLE, EXPERIENCES_BY_TYPE_TABLE, EXPERIENCES_TABLE,
-    INSIGHTS_BY_COLLECTIVE_TABLE, INSIGHTS_TABLE, INSTANCE_ID_KEY, LEGACY_SUBSTRATE_FORMAT,
-    METADATA_TABLE, PROVIDER_IDENTITY_KEY, PROVIDER_IDENTITY_STAMPED_AT_KEY,
-    RELATIONS_BY_SOURCE_TABLE, RELATIONS_BY_TARGET_TABLE, RELATIONS_TABLE, SCHEMA_VERSION,
-    SUBSTRATE_FORMAT_KEY, SUBSTRATE_MAGIC, SUBSTRATE_MARKER_LEN, WAL_SEQUENCE_KEY,
-    WATCH_EVENTS_TABLE,
+    EXPERIENCES_BY_COLLECTIVE_TABLE, EXPERIENCES_BY_TAG_TABLE, EXPERIENCES_BY_TYPE_TABLE,
+    EXPERIENCES_TABLE, INSIGHTS_BY_COLLECTIVE_TABLE, INSIGHTS_TABLE, INSTANCE_ID_KEY,
+    LEGACY_SUBSTRATE_FORMAT, METADATA_TABLE, PROVIDER_IDENTITY_KEY,
+    PROVIDER_IDENTITY_STAMPED_AT_KEY, RELATIONS_BY_SOURCE_TABLE, RELATIONS_BY_TARGET_TABLE,
+    RELATIONS_TABLE, SCHEMA_VERSION, SUBSTRATE_FORMAT_KEY, SUBSTRATE_MAGIC,
+    SUBSTRATE_MARKER_LEN, WAL_SEQUENCE_KEY, WATCH_EVENTS_TABLE, encode_tag_index_key,
 };
 use super::StorageEngine;
 use crate::config::{Config, EmbeddingDimension, RecallWeights};
@@ -975,6 +975,7 @@ impl RedbStorage {
             let _ = write_txn.open_table(EMBEDDINGS_TABLE)?;
             let _ = write_txn.open_multimap_table(EXPERIENCES_BY_COLLECTIVE_TABLE)?;
             let _ = write_txn.open_multimap_table(EXPERIENCES_BY_TYPE_TABLE)?;
+            let _ = write_txn.open_multimap_table(EXPERIENCES_BY_TAG_TABLE)?;
             let _ = write_txn.open_table(RELATIONS_TABLE)?;
             let _ = write_txn.open_multimap_table(RELATIONS_BY_SOURCE_TABLE)?;
             let _ = write_txn.open_multimap_table(RELATIONS_BY_TARGET_TABLE)?;
@@ -2637,6 +2638,46 @@ impl StorageEngine for RedbStorage {
     // Experience Storage Operations
     // =========================================================================
 
+    fn get_experience_ids_by_tags(
+        &self,
+        collective_id: CollectiveId,
+        tags: &BTreeMap<String, String>,
+    ) -> Result<HashSet<ExperienceId>> {
+        if tags.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let tag_table = read_txn.open_multimap_table(EXPERIENCES_BY_TAG_TABLE)?;
+
+        // For each (key, value) pair, range-scan the multimap and collect IDs.
+        // Intersect across pairs (AND semantics). Start with the first pair's
+        // set and narrow it down.
+        let mut result: Option<HashSet<ExperienceId>> = None;
+
+        for (tag_key, tag_value) in tags {
+            let encoded_key =
+                encode_tag_index_key(collective_id.as_bytes(), tag_key, tag_value);
+            let mut pair_ids: HashSet<ExperienceId> = HashSet::new();
+
+            for entry in tag_table.get(encoded_key.as_slice())? {
+                let value = entry.map_err(StorageError::from)?;
+                pair_ids.insert(ExperienceId::from_bytes(*value.value()));
+            }
+
+            match &mut result {
+                None => {
+                    result = Some(pair_ids);
+                }
+                Some(current) => {
+                    current.retain(|id| pair_ids.contains(id));
+                }
+            }
+        }
+
+        Ok(result.unwrap_or_default())
+    }
+
     fn save_experience(&self, experience: &Experience) -> Result<()> {
         // Serialize experience (embedding is #[serde(skip)], excluded automatically)
         let exp_bytes = postcard::to_stdvec(experience)
@@ -2676,6 +2717,20 @@ impl StorageEngine for RedbStorage {
             // By-type index: key=collective_id+type_tag, value=experience_id
             let mut type_table = write_txn.open_multimap_table(EXPERIENCES_BY_TYPE_TABLE)?;
             type_table.insert(&type_key, experience.id.as_bytes())?;
+        }
+        {
+            // Tag index (VS-4.3.2): one entry per key=value pair.
+            if !experience.tags.is_empty() {
+                let mut tag_table = write_txn.open_multimap_table(EXPERIENCES_BY_TAG_TABLE)?;
+                for (key, value) in &experience.tags {
+                    let tag_key = encode_tag_index_key(
+                        experience.collective_id.as_bytes(),
+                        key,
+                        value,
+                    );
+                    tag_table.insert(tag_key.as_slice(), experience.id.as_bytes())?;
+                }
+            }
         }
         // Record WAL event for cross-process change detection
         self.increment_wal_and_record(
@@ -2743,6 +2798,13 @@ impl StorageEngine for RedbStorage {
             timestamp = experience.timestamp;
             is_archive = update.archived == Some(true);
 
+            // Capture old tags BEFORE applying the update (for tag index maintenance)
+            let old_tags = if update.tags.is_some() {
+                Some(experience.tags.clone())
+            } else {
+                None
+            };
+
             // Apply updates (only Some fields)
             if let Some(importance) = update.importance {
                 experience.importance = importance;
@@ -2767,6 +2829,31 @@ impl StorageEngine for RedbStorage {
             let bytes = postcard::to_stdvec(&experience)
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             exp_table.insert(id.as_bytes(), bytes.as_slice())?;
+
+            // Tag index maintenance (VS-4.3.2): when tags change, remove old
+            // entries and insert new ones. A full diff (remove-all-old +
+            // insert-all-new) is simpler and correct; the multimap's `remove`
+            // is O(log n) per entry.
+            if let Some(ref old_tags) = old_tags {
+                let mut tag_table =
+                    write_txn.open_multimap_table(EXPERIENCES_BY_TAG_TABLE)?;
+                for (key, value) in old_tags {
+                    let tag_key = encode_tag_index_key(
+                        collective_id.as_bytes(),
+                        key,
+                        value,
+                    );
+                    let _ = tag_table.remove(tag_key.as_slice(), id.as_bytes());
+                }
+                for (key, value) in &experience.tags {
+                    let tag_key = encode_tag_index_key(
+                        collective_id.as_bytes(),
+                        key,
+                        value,
+                    );
+                    tag_table.insert(tag_key.as_slice(), id.as_bytes())?;
+                }
+            }
         }
         // Record WAL event for cross-process change detection
         let event_type = if is_archive {
@@ -2828,9 +2915,9 @@ impl StorageEngine for RedbStorage {
     }
 
     fn delete_experience(&self, id: ExperienceId) -> Result<bool> {
-        // First read the experience to get collective_id, timestamp, and type_tag
-        // (needed for cleaning up secondary indices and WAL event)
-        let (collective_id, timestamp, type_tag) = {
+        // First read the experience to get collective_id, timestamp, type_tag,
+        // and tags (needed for cleaning up secondary indices and WAL event)
+        let (collective_id, timestamp, type_tag, tags) = {
             let read_txn = self.db.begin_read().map_err(StorageError::from)?;
             let exp_table = read_txn.open_table(EXPERIENCES_TABLE)?;
 
@@ -2842,6 +2929,7 @@ impl StorageEngine for RedbStorage {
                         exp.collective_id,
                         exp.timestamp,
                         exp.experience_type.type_tag(),
+                        exp.tags,
                     )
                 }
                 None => return Ok(false),
@@ -2871,6 +2959,20 @@ impl StorageEngine for RedbStorage {
             let mut type_table = write_txn.open_multimap_table(EXPERIENCES_BY_TYPE_TABLE)?;
             let type_key = encode_type_index_key(collective_id.as_bytes(), type_tag);
             type_table.remove(&type_key, id.as_bytes())?;
+        }
+        {
+            // Remove all tag entries for this experience (VS-4.3.2)
+            if !tags.is_empty() {
+                let mut tag_table = write_txn.open_multimap_table(EXPERIENCES_BY_TAG_TABLE)?;
+                for (key, value) in &tags {
+                    let tag_key = encode_tag_index_key(
+                        collective_id.as_bytes(),
+                        key,
+                        value,
+                    );
+                    let _ = tag_table.remove(tag_key.as_slice(), id.as_bytes());
+                }
+            }
         }
         // Record WAL event for cross-process change detection
         self.increment_wal_and_record(
@@ -7582,6 +7684,7 @@ mod tests {
                 (EMBEDDINGS_TABLE.name(), false),
                 (EXPERIENCES_BY_COLLECTIVE_TABLE.name(), false),
                 (EXPERIENCES_BY_TYPE_TABLE.name(), false),
+                (EXPERIENCES_BY_TAG_TABLE.name(), false),
                 (RELATIONS_BY_SOURCE_TABLE.name(), false),
                 (RELATIONS_BY_TARGET_TABLE.name(), false),
                 (INSIGHTS_BY_COLLECTIVE_TABLE.name(), false),
@@ -7599,9 +7702,9 @@ mod tests {
         /// fails. 14 tables without `sync`, 15 with (the +`sync_cursors`).
         const fn expected_table_count() -> usize {
             if cfg!(feature = "sync") {
-                15
+                16
             } else {
-                14
+                15
             }
         }
 
