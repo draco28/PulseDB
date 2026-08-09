@@ -228,11 +228,7 @@ pub const EXPERIENCES_BY_TAG_TABLE: MultimapTableDefinition<&[u8], &[u8; 16]> =
 ///
 /// The collective_id prefix scopes every tag entry to its collective so a single
 /// range scan per `(key, value)` pair suffices for tag-predicate resolution.
-pub fn encode_tag_index_key(
-    collective_id: &[u8; 16],
-    tag_key: &str,
-    tag_value: &str,
-) -> Vec<u8> {
+pub fn encode_tag_index_key(collective_id: &[u8; 16], tag_key: &str, tag_value: &str) -> Vec<u8> {
     let key_bytes = tag_key.as_bytes();
     let value_bytes = tag_value.as_bytes();
     let mut buf = Vec::with_capacity(16 + 4 + key_bytes.len() + 4 + value_bytes.len());

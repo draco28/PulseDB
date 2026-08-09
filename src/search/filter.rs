@@ -293,9 +293,10 @@ mod tests {
 
         // Experience has all required key=value pairs → matches
         let filter = SearchFilter {
-            tags_all: Some(std::collections::BTreeMap::from([
-                ("entity.type".to_string(), "person".to_string()),
-            ])),
+            tags_all: Some(std::collections::BTreeMap::from([(
+                "entity.type".to_string(),
+                "person".to_string(),
+            )])),
             ..SearchFilter::default()
         };
         assert!(filter.matches(&exp));
@@ -314,24 +315,25 @@ mod tests {
     #[test]
     fn test_tags_all_filter_rejects_mismatch() {
         let mut exp = test_experience();
-        exp.tags = std::collections::BTreeMap::from([
-            ("entity.type".to_string(), "person".to_string()),
-        ]);
+        exp.tags =
+            std::collections::BTreeMap::from([("entity.type".to_string(), "person".to_string())]);
 
         // Wrong value → no match
         let filter = SearchFilter {
-            tags_all: Some(std::collections::BTreeMap::from([
-                ("entity.type".to_string(), "organization".to_string()),
-            ])),
+            tags_all: Some(std::collections::BTreeMap::from([(
+                "entity.type".to_string(),
+                "organization".to_string(),
+            )])),
             ..SearchFilter::default()
         };
         assert!(!filter.matches(&exp));
 
         // Missing key entirely → no match
         let filter_missing = SearchFilter {
-            tags_all: Some(std::collections::BTreeMap::from([
-                ("entity.id".to_string(), "u-42".to_string()),
-            ])),
+            tags_all: Some(std::collections::BTreeMap::from([(
+                "entity.id".to_string(),
+                "u-42".to_string(),
+            )])),
             ..SearchFilter::default()
         };
         assert!(!filter_missing.matches(&exp));
@@ -362,16 +364,15 @@ mod tests {
     #[test]
     fn test_tags_and_domain_combined() {
         let mut exp = test_experience();
-        exp.tags = std::collections::BTreeMap::from([
-            ("status".to_string(), "active".to_string()),
-        ]);
+        exp.tags = std::collections::BTreeMap::from([("status".to_string(), "active".to_string())]);
 
         // Both domain and tags must match
         let filter = SearchFilter {
             domains: Some(vec!["rust".to_string()]),
-            tags_all: Some(std::collections::BTreeMap::from([
-                ("status".to_string(), "active".to_string()),
-            ])),
+            tags_all: Some(std::collections::BTreeMap::from([(
+                "status".to_string(),
+                "active".to_string(),
+            )])),
             ..SearchFilter::default()
         };
         assert!(filter.matches(&exp));
@@ -379,9 +380,10 @@ mod tests {
         // Domain matches but tag does not
         let filter_tag_fail = SearchFilter {
             domains: Some(vec!["rust".to_string()]),
-            tags_all: Some(std::collections::BTreeMap::from([
-                ("status".to_string(), "archived".to_string()),
-            ])),
+            tags_all: Some(std::collections::BTreeMap::from([(
+                "status".to_string(),
+                "archived".to_string(),
+            )])),
             ..SearchFilter::default()
         };
         assert!(!filter_tag_fail.matches(&exp));

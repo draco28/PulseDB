@@ -415,7 +415,10 @@ mod tests {
             importance: Some(0.7),
             confidence: Some(0.9),
             domain: Some(vec!["test".to_string()]),
-            tags: Some(BTreeMap::from([("entity.type".to_string(), "person".to_string())])),
+            tags: Some(BTreeMap::from([(
+                "entity.type".to_string(),
+                "person".to_string(),
+            )])),
             related_files: None,
             archived: Some(true),
             applications: Some(std::collections::BTreeMap::from([(InstanceId::new(), 2)])),

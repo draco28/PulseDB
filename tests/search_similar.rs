@@ -604,7 +604,11 @@ fn test_tag_and_domain_filters_combined() {
             collective_id: cid,
             content: format!("domain-{}", has_domain),
             embedding: Some(query.clone()),
-            domain: if has_domain { vec!["rust".into()] } else { vec![] },
+            domain: if has_domain {
+                vec!["rust".into()]
+            } else {
+                vec![]
+            },
             tags: tags.clone(),
             ..Default::default()
         })
@@ -634,7 +638,11 @@ fn test_tag_and_domain_filters_combined() {
         )
         .unwrap();
 
-    assert_eq!(results.len(), 1, "exactly 1 experience matches tag AND domain");
+    assert_eq!(
+        results.len(),
+        1,
+        "exactly 1 experience matches tag AND domain"
+    );
     assert_eq!(results[0].experience.content, "domain-true");
 }
 
@@ -701,7 +709,11 @@ fn test_empty_tags_predicate_matches_all() {
         )
         .unwrap();
 
-    assert_eq!(results.len(), 3, "empty tag predicate matches all 3 experiences");
+    assert_eq!(
+        results.len(),
+        3,
+        "empty tag predicate matches all 3 experiences"
+    );
 }
 
 /// No matching tag → empty result.
@@ -725,10 +737,7 @@ fn test_tag_filter_no_matches_returns_empty() {
             &query,
             10,
             SearchFilter {
-                tags_all: Some(BTreeMap::from([(
-                    "nonexistent".into(),
-                    "value".into(),
-                )])),
+                tags_all: Some(BTreeMap::from([("nonexistent".into(), "value".into())])),
                 ..Default::default()
             },
         )
@@ -748,7 +757,11 @@ fn test_domain_filter_unchanged_without_tags() {
             collective_id: cid,
             content: format!("domain-{}", has_domain),
             embedding: Some(query.clone()),
-            domain: if has_domain { vec!["rust".into()] } else { vec![] },
+            domain: if has_domain {
+                vec!["rust".into()]
+            } else {
+                vec![]
+            },
             ..Default::default()
         })
         .unwrap();

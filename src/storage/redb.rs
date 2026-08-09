@@ -38,16 +38,16 @@ use super::legacy_bincode;
 #[cfg(feature = "sync")]
 use super::schema::SYNC_CURSORS_TABLE;
 use super::schema::{
-    decode_collective_from_activity_key, encode_activity_key, encode_type_index_key,
-    DatabaseMetadata, EntityTypeTag, ExperienceTypeTag, ExperienceV2, ExperienceV3,
-    WatchEventRecord, WatchEventTypeTag, ACTIVITIES_TABLE, COLLECTIVES_TABLE,
+    decode_collective_from_activity_key, encode_activity_key, encode_tag_index_key,
+    encode_type_index_key, DatabaseMetadata, EntityTypeTag, ExperienceTypeTag, ExperienceV2,
+    ExperienceV3, WatchEventRecord, WatchEventTypeTag, ACTIVITIES_TABLE, COLLECTIVES_TABLE,
     CURRENT_SUBSTRATE_FORMAT, DECAY_CONFIGS_TABLE, EMBEDDINGS_TABLE,
     EXPERIENCES_BY_COLLECTIVE_TABLE, EXPERIENCES_BY_TAG_TABLE, EXPERIENCES_BY_TYPE_TABLE,
     EXPERIENCES_TABLE, INSIGHTS_BY_COLLECTIVE_TABLE, INSIGHTS_TABLE, INSTANCE_ID_KEY,
     LEGACY_SUBSTRATE_FORMAT, METADATA_TABLE, PROVIDER_IDENTITY_KEY,
     PROVIDER_IDENTITY_STAMPED_AT_KEY, RELATIONS_BY_SOURCE_TABLE, RELATIONS_BY_TARGET_TABLE,
-    RELATIONS_TABLE, SCHEMA_VERSION, SUBSTRATE_FORMAT_KEY, SUBSTRATE_MAGIC,
-    SUBSTRATE_MARKER_LEN, WAL_SEQUENCE_KEY, WATCH_EVENTS_TABLE, encode_tag_index_key,
+    RELATIONS_TABLE, SCHEMA_VERSION, SUBSTRATE_FORMAT_KEY, SUBSTRATE_MAGIC, SUBSTRATE_MARKER_LEN,
+    WAL_SEQUENCE_KEY, WATCH_EVENTS_TABLE,
 };
 use super::StorageEngine;
 use crate::config::{Config, EmbeddingDimension, RecallWeights};
@@ -1533,7 +1533,8 @@ impl RedbStorage {
             // bincode). This handles both postcard-v3 stores (marker=Current) and
             // bincode-v3 stores (marker=Older). The v2→v3 migrator above wrote
             // postcard-v3 format, which decodes cleanly here.
-            let v3: ExperienceV3 = Self::decode_blob_legacy_or_postcard(entry.value(), "v3 experience record")?;
+            let v3: ExperienceV3 =
+                Self::decode_blob_legacy_or_postcard(entry.value(), "v3 experience record")?;
             drop(entry);
 
             let v4 = Experience {
@@ -2042,10 +2043,8 @@ impl RedbStorage {
                                 archived: v3.archived,
                             },
                             Err(_) => {
-                                let v2: ExperienceV2 = Self::decode_blob_legacy_or_postcard(
-                                    &bytes,
-                                    "experience_v2",
-                                )?;
+                                let v2: ExperienceV2 =
+                                    Self::decode_blob_legacy_or_postcard(&bytes, "experience_v2")?;
                                 let mut applications = BTreeMap::new();
                                 applications
                                     .insert(legacy_applications_instance_id(), v2.applications);
@@ -2656,8 +2655,7 @@ impl StorageEngine for RedbStorage {
         let mut result: Option<HashSet<ExperienceId>> = None;
 
         for (tag_key, tag_value) in tags {
-            let encoded_key =
-                encode_tag_index_key(collective_id.as_bytes(), tag_key, tag_value);
+            let encoded_key = encode_tag_index_key(collective_id.as_bytes(), tag_key, tag_value);
             let mut pair_ids: HashSet<ExperienceId> = HashSet::new();
 
             for entry in tag_table.get(encoded_key.as_slice())? {
@@ -2723,11 +2721,8 @@ impl StorageEngine for RedbStorage {
             if !experience.tags.is_empty() {
                 let mut tag_table = write_txn.open_multimap_table(EXPERIENCES_BY_TAG_TABLE)?;
                 for (key, value) in &experience.tags {
-                    let tag_key = encode_tag_index_key(
-                        experience.collective_id.as_bytes(),
-                        key,
-                        value,
-                    );
+                    let tag_key =
+                        encode_tag_index_key(experience.collective_id.as_bytes(), key, value);
                     tag_table.insert(tag_key.as_slice(), experience.id.as_bytes())?;
                 }
             }
@@ -2835,22 +2830,13 @@ impl StorageEngine for RedbStorage {
             // insert-all-new) is simpler and correct; the multimap's `remove`
             // is O(log n) per entry.
             if let Some(ref old_tags) = old_tags {
-                let mut tag_table =
-                    write_txn.open_multimap_table(EXPERIENCES_BY_TAG_TABLE)?;
+                let mut tag_table = write_txn.open_multimap_table(EXPERIENCES_BY_TAG_TABLE)?;
                 for (key, value) in old_tags {
-                    let tag_key = encode_tag_index_key(
-                        collective_id.as_bytes(),
-                        key,
-                        value,
-                    );
+                    let tag_key = encode_tag_index_key(collective_id.as_bytes(), key, value);
                     let _ = tag_table.remove(tag_key.as_slice(), id.as_bytes());
                 }
                 for (key, value) in &experience.tags {
-                    let tag_key = encode_tag_index_key(
-                        collective_id.as_bytes(),
-                        key,
-                        value,
-                    );
+                    let tag_key = encode_tag_index_key(collective_id.as_bytes(), key, value);
                     tag_table.insert(tag_key.as_slice(), id.as_bytes())?;
                 }
             }
@@ -2965,11 +2951,7 @@ impl StorageEngine for RedbStorage {
             if !tags.is_empty() {
                 let mut tag_table = write_txn.open_multimap_table(EXPERIENCES_BY_TAG_TABLE)?;
                 for (key, value) in &tags {
-                    let tag_key = encode_tag_index_key(
-                        collective_id.as_bytes(),
-                        key,
-                        value,
-                    );
+                    let tag_key = encode_tag_index_key(collective_id.as_bytes(), key, value);
                     let _ = tag_table.remove(tag_key.as_slice(), id.as_bytes());
                 }
             }

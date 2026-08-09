@@ -299,8 +299,7 @@ impl HnswIndex {
         let deleted_ref = &state.deleted;
 
         // Combined predicate: not-deleted AND (allowed is None OR in allowed set).
-        let needs_filter =
-            !state.deleted.is_empty() || allowed_internal.is_some();
+        let needs_filter = !state.deleted.is_empty() || allowed_internal.is_some();
         let results = if needs_filter {
             let allowed_ref = allowed_internal.as_ref();
             let filter_fn = move |id: &usize| -> bool {

@@ -16,8 +16,8 @@
 use crate::error::{PulseDBError, ValidationError};
 use crate::experience::types::{ExperienceType, ExperienceUpdate, NewExperience};
 use crate::storage::schema::{
-    MAX_CONTENT_SIZE, MAX_DOMAIN_TAGS, MAX_FILE_PATH_LENGTH, MAX_KV_TAG_KEY_LENGTH,
-    MAX_KV_TAG_VALUE_LENGTH, MAX_KV_TAGS, MAX_SOURCE_AGENT_LENGTH, MAX_SOURCE_FILES, MAX_TAG_LENGTH,
+    MAX_CONTENT_SIZE, MAX_DOMAIN_TAGS, MAX_FILE_PATH_LENGTH, MAX_KV_TAGS, MAX_KV_TAG_KEY_LENGTH,
+    MAX_KV_TAG_VALUE_LENGTH, MAX_SOURCE_AGENT_LENGTH, MAX_SOURCE_FILES, MAX_TAG_LENGTH,
 };
 
 /// Validates a [`NewExperience`] before storage.
