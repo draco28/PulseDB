@@ -790,18 +790,25 @@ impl PulseDB {
         match self.storage.provider_identity()? {
             Some(stamped) => Ok(stamped),
             None => {
-                if self.has_injected_embedder {
-                    // The stamp should ALWAYS be present on an
-                    // `open_with_embedder` store (it's the last successful
-                    // step of the constructor). Its absence means the stamp
-                    // was lost — a silent integrity regression.
+                // No persisted stamp. Check the era marker to distinguish a
+                // genuine pre-0.7.0 store (both keys absent → return the
+                // in-memory identity) from a lost/corrupted stamp (era marker
+                // present but identity absent → corruption error).
+                //
+                // A3 (PR #66): read-only opens of pre-0.7.0 stores skip
+                // stamping, so the stamp may be absent on an otherwise-healthy
+                // read-only open_with_embedder store. The era marker disambiguates.
+                let era = self.storage.provider_identity_era_marker()?;
+                if era {
+                    // Post-0.7.0 store whose stamp was LOST — corruption.
                     Err(StorageError::corrupted(
-                        "provider identity stamp missing on an open_with_embedder store",
+                        "provider identity stamp missing but era marker present — \
+                         the stamp was lost or corrupted",
                     )
                     .into())
                 } else {
-                    // `open` path: identity is config-derived and
-                    // reconstructible, so the in-memory value IS authoritative.
+                    // Genuine pre-0.7.0 store (or a read-only open of one) —
+                    // the in-memory identity is authoritative.
                     Ok(self.embedding.identity())
                 }
             }
@@ -4458,24 +4465,21 @@ mod provider_identity_persistence {
         probe.close().unwrap();
     }
 
-    /// (f) Audit challenge 1 (premise-level — silent corruption). For a store
-    /// opened via `open_with_embedder`, the stamp should ALWAYS be present
-    /// (it's the last successful step of the constructor). If
-    /// `storage.provider_identity()` returns `None` on such a store, the stamp
-    /// was LOST — a silent integrity regression, not a "lenient adoption."
+    /// (f) Audit challenge 1 (premise-level — silent corruption). Pre-A3, the
+    /// getter used `has_injected_embedder` as a heuristic: if true and the
+    /// stamp was absent, it returned corruption. Post-A3, the getter uses the
+    /// ERA MARKER instead: era present + identity absent = corruption; era
+    /// absent + identity absent = genuine pre-0.7.0 store → return in-memory
+    /// identity.
     ///
-    /// Pre-fix: the getter silently fell back to `self.embedding.identity()`,
-    /// hiding the corruption. Post-fix: the getter returns a
-    /// `StorageError::Corrupted` (surfaced as `PulseDBError::Storage`).
-    ///
-    /// The missing-stamp state is constructed in-scope by replaying
-    /// `open_with_embedder`'s tail WITHOUT the stamp write — i.e. assemble a
-    /// `PulseDB` from `open_parts` whose `has_injected_embedder` is true but
-    /// whose storage holds no `PROVIDER_IDENTITY_KEY`. This is exactly the
-    /// shape "constructor finished all pre-stamp steps, but the stamp write
-    /// was later lost" (torn write, fsync failure, manual metadata edit).
+    /// The corruption case (era present, identity absent) is caught at the
+    /// CONSTRUCTOR level (both constructors' `(None, true)` arm returns a
+    /// typed corruption error before `provider_identity()` can be called).
+    /// This test verifies the getter's behavior for the genuine pre-0.7.0 case
+    /// (both keys absent): it returns the in-memory identity, NOT corruption —
+    /// because a read-only open of a pre-0.7.0 store legitimately has no stamp.
     #[test]
-    fn provider_identity_errors_on_missing_stamp_for_injected_store() {
+    fn provider_identity_returns_in_memory_for_genuine_pre_070_store() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("missing-stamp.db");
 
@@ -4483,11 +4487,10 @@ mod provider_identity_persistence {
         let config = Config::default();
 
         // Replay `open_with_embedder`'s successful open path, but deliberately
-        // SKIP `stamp_provider_identity` — simulating a lost stamp on an
-        // `open_with_embedder` store. `open_parts` is the shared helper both
+        // SKIP `stamp_provider_identity` — simulating a genuine pre-0.7.0
+        // store (BOTH keys absent). `open_parts` is the shared helper both
         // constructors use; calling it here mirrors the real constructor tail
-        // minus the stamp. `has_injected_embedder: true` is the load-bearing
-        // bit — it tells the getter this store OUGHT to have a stamp.
+        // minus the stamp.
         let (storage, vectors, insight_vectors, watch) =
             PulseDB::open_parts(&path, &config).expect("open_parts succeeds");
 
@@ -4507,26 +4510,24 @@ mod provider_identity_persistence {
             None,
             "test precondition: stamp is absent"
         );
+        assert!(
+            !unstamped
+                .storage
+                .provider_identity_era_marker()
+                .expect("storage read"),
+            "test precondition: era marker is also absent (genuine pre-0.7.0)"
+        );
 
-        // The getter MUST surface this as corruption, NOT silently fall back
-        // to the in-memory embedder identity.
-        let err = unstamped
+        // The getter returns the in-memory identity (NOT corruption) because
+        // the era marker is absent — this is a genuine pre-0.7.0 store.
+        let identity = unstamped
             .provider_identity()
-            .expect_err("missing stamp on an injected store is corruption, not a fallback");
-        match err {
-            PulseDBError::Storage(storage_err) => {
-                let msg = storage_err.to_string();
-                assert!(
-                    msg.to_lowercase().contains("corrupt"),
-                    "expected a Corrupted-class storage error, got: {msg}"
-                );
-                assert!(
-                    msg.contains("provider identity stamp missing"),
-                    "expected the corruption message to name the missing stamp, got: {msg}"
-                );
-            }
-            other => panic!("expected PulseDBError::Storage(Corrupted(..)), got {other:?}"),
-        }
+            .expect("genuine pre-0.7.0 store returns in-memory identity");
+        assert_eq!(
+            identity,
+            id("external", "ada-002"),
+            "in-memory identity is returned for pre-0.7.0 stores"
+        );
 
         unstamped.close().unwrap();
     }
