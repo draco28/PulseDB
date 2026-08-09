@@ -76,7 +76,7 @@ pub mod types;
 /// Bumped 2 → 3 in VS-4.0.3: the bincode→postcard serializer swap is *also* a
 /// wire-format change, so the protocol version moves in lockstep with
 /// [`WIRE_FORMAT_VERSION`].
-pub const SYNC_PROTOCOL_VERSION: u32 = 3;
+pub const SYNC_PROTOCOL_VERSION: u32 = 4;
 
 /// Capability advertised by peers that sync reinforcement G-counter fields.
 pub const SYNC_CAPABILITY_GCOUNTER_APPLICATIONS: &str = "gcounter-applications";

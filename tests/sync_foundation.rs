@@ -444,9 +444,9 @@ fn test_sync_config_postcard_roundtrip() {
 // ============================================================================
 
 #[test]
-fn test_protocol_version_is_three() {
-    // Bumped 2→3 in VS-4.0.3 work-1.03 (postcard wire + serializer-independent preamble).
-    assert_eq!(SYNC_PROTOCOL_VERSION, 3);
+fn test_protocol_version_is_four() {
+    // Bumped 3→4 in VS-4.3.2 work-1.04 (tags field on Experience + SerializableExperienceUpdate).
+    assert_eq!(SYNC_PROTOCOL_VERSION, 4);
 }
 
 // ============================================================================

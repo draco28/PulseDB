@@ -82,6 +82,9 @@ pub struct SerializableExperienceUpdate {
     /// Replace domain tags entirely.
     pub domain: Option<Vec<String>>,
 
+    /// Replace key-value tags entirely (VS-4.3.2).
+    pub tags: Option<BTreeMap<String, String>>,
+
     /// Replace related files entirely.
     pub related_files: Option<Vec<String>>,
 
@@ -101,6 +104,7 @@ impl From<crate::experience::ExperienceUpdate> for SerializableExperienceUpdate 
             importance: update.importance,
             confidence: update.confidence,
             domain: update.domain,
+            tags: update.tags,
             related_files: update.related_files,
             archived: update.archived,
             applications: None,
@@ -115,7 +119,7 @@ impl From<SerializableExperienceUpdate> for crate::experience::ExperienceUpdate 
             importance: update.importance,
             confidence: update.confidence,
             domain: update.domain,
-            tags: None,
+            tags: update.tags,
             related_files: update.related_files,
             archived: update.archived,
         }
@@ -393,6 +397,7 @@ mod tests {
             importance: Some(0.5),
             confidence: Some(0.8),
             domain: None,
+            tags: None,
             related_files: Some(vec!["main.rs".to_string()]),
             archived: None,
             applications: None,
@@ -410,6 +415,7 @@ mod tests {
             importance: Some(0.7),
             confidence: Some(0.9),
             domain: Some(vec!["test".to_string()]),
+            tags: Some(BTreeMap::from([("entity.type".to_string(), "person".to_string())])),
             related_files: None,
             archived: Some(true),
             applications: Some(std::collections::BTreeMap::from([(InstanceId::new(), 2)])),
