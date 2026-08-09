@@ -8,13 +8,11 @@
 //! - WAL poll (10K events) < 10ms
 //! - WAL compaction (10K events) — baseline measurement
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use pulsedb::storage::StorageEngine;
+use criterion::{criterion_group, criterion_main, Criterion};
 use pulsedb::sync::guard::{is_sync_applying, SyncApplyGuard};
 use pulsedb::sync::types::{InstanceId, SyncChange, SyncCursor, SyncEntityType, SyncPayload};
-use pulsedb::{
-    Collective, CollectiveId, Config, ExperienceType, NewExperience, PulseDB, Timestamp,
-};
+use pulsedb::{CollectiveId, Config, ExperienceType, NewExperience, PulseDB, Timestamp};
+use std::hint::black_box;
 use tempfile::tempdir;
 
 const DIM: usize = 384;

@@ -4184,6 +4184,7 @@ mod provider_identity_persistence {
     use crate::embedding::{EmbeddingService, ProviderIdentity};
     use crate::error::{PulseDBError, ValidationError};
     use crate::Embedding;
+    #[cfg(feature = "builtin-embeddings")]
     use crate::InsightType;
     use std::sync::Arc;
     use tempfile::tempdir;

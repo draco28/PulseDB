@@ -8,8 +8,9 @@
 //! - `get_context_candidates` < 100ms
 //! - `get_experience` — baseline measurement
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use pulsedb::{CollectiveId, Config, ContextRequest, NewExperience, PulseDB};
+use std::hint::black_box;
 use tempfile::tempdir;
 
 /// Default embedding dimension (D384, matches Config::default()).
