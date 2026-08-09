@@ -292,8 +292,11 @@ pub const INSTANCE_ID_KEY: &str = "instance_id";
 /// VS-4.3.3 work 1.01, **both** constructors stamp: `open_with_embedder`
 /// writes the injected embedder's identity, and `open` writes the
 /// config-derived identity. The stamp is the **last successful step** of each
-/// constructor — a failure in any prior step leaves the store unstamped
-/// (zero writes from that open).
+/// constructor, so a failure in any prior step leaves the store unstamped (no
+/// provider-identity metadata keys are written). Note: `open_parts` may still
+/// touch storage metadata (e.g. `last_opened_at`) or run schema migration
+/// before the stamp step — "unstamped" means no provider-identity keys, not
+/// zero writes to the store.
 ///
 /// Co-stamped atomically with [`PROVIDER_IDENTITY_STAMPED_AT_KEY`] in the same
 /// write transaction (see [`PROVIDER_IDENTITY_STAMPED_AT_KEY`] for the

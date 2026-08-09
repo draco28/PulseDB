@@ -244,22 +244,30 @@ impl PulseDB {
         let should_stamp: Option<crate::embedding::ProviderIdentity> = match (persisted, era) {
             (None, false) => {
                 // Genuine pre-0.7.0 store: BOTH keys absent. Lenient adoption.
+                // Read-only opens skip stamping and open the store as-is
+                // (A3: read-only consumers must not be forced to stamp).
                 tracing::debug!(
                     "open: no provider-identity stamp and no era marker — \
                      lenient adoption (genuine pre-0.7.0 store)"
                 );
-                Some(requested.clone())
+                if config.read_only {
+                    None
+                } else {
+                    Some(requested.clone())
+                }
             }
             (None, true) => {
                 // Post-0.7.0 store whose stamp was LOST/CORRUPTED (era marker
                 // present, identity absent). NOT silent re-adoption — typed
-                // corruption error (closes `pulsedb-internal` #17).
+                // corruption error (closes `pulsedb-internal` #17). This fires
+                // even for read-only opens — corruption detection is not
+                // gated on writability.
                 return Err(PulseDBError::Storage(StorageError::corrupted(
                     "provider identity stamp missing but era marker present — \
                      the stamp was lost or corrupted; refusing silent re-adoption",
                 )));
             }
-            (Some(persisted), _) => {
+            (Some(persisted), era_present) => {
                 // A stamp exists. Check for the VS-4.3.1-era
                 // {builtin-onnx, main_graph} legacy marker FIRST (one-time
                 // migration), then the mismatch guard.
@@ -277,26 +285,69 @@ impl PulseDB {
                     // Re-stamp with whatever the LOADED model actually is
                     // (requested), not an assumed fingerprint — feature-agnostic
                     // and correct even if a non-MiniLM builtin is loaded.
-                    Some(requested.clone())
+                    if config.read_only {
+                        None
+                    } else {
+                        Some(requested.clone())
+                    }
                 } else if persisted.provider != requested.provider
                     || persisted.model_id != requested.model_id
                 {
-                    return Err(PulseDBError::EmbeddingProviderMismatch {
-                        persisted,
-                        requested,
-                    });
+                    // A3: read-only consumers (e.g. PulseVision) must inspect
+                    // stores without instantiating the exact stamping provider.
+                    // Skip the mismatch refusal for read-only opens; mutations
+                    // are already blocked by check_writable (Codex PR #66, P1).
+                    if config.read_only {
+                        None
+                    } else {
+                        return Err(PulseDBError::EmbeddingProviderMismatch {
+                            persisted,
+                            requested,
+                        });
+                    }
                 } else {
-                    // Match — the existing stamp is authoritative; skip the
-                    // redundant re-stamp (mirrors the open_with_embedder
-                    // audit-challenge-3 optimization).
-                    None
+                    // Match — the existing stamp is authoritative.
+                    // A6: if the era marker is absent (VS-4.3.1-era store
+                    // created before era markers were co-stamped), backfill it
+                    // so a future lost-stamp is detected rather than silently
+                    // re-adopted. Only for writable opens (Codex PR #66, P2).
+                    if !era_present && !config.read_only {
+                        Some(requested.clone())
+                    } else {
+                        None
+                    }
                 }
             }
         };
 
-        // STAMP — last successful step (mirrors open_with_embedder). Read-only
-        // guard: the lenient-adoption/migration path (a write) must not fire
-        // under a read-only config.
+        // A2: Dimension validation runs unconditionally (both stamping and
+        // matching-reopen paths). An embedder retaining its identity string
+        // while changing dimension (384d→768d) must be caught even on a
+        // matching reopen where should_stamp is None (Codex PR #66, P1).
+        // For the `open` path this is defense-in-depth — the embedder is
+        // config-derived so dimensions match by construction — but it keeps
+        // both constructors' validation symmetric.
+        let expected = config.embedding_dimension.size();
+        let actual = embedding.dimension();
+        if actual != expected {
+            return Err(PulseDBError::Validation(
+                ValidationError::dimension_mismatch(expected, actual),
+            ));
+        }
+
+        // STAMP — last successful step (mirrors open_with_embedder). For
+        // read-only opens, should_stamp is always None (adoption/migration/
+        // mismatch-skip/backfill are gated on !read_only), so the stamp write
+        // is skipped. The read_only guard below is defense-in-depth.
+        //
+        // A5 (Codex PR #66, P2): the stamp comparison runs AFTER open_parts,
+        // which opens storage and may touch metadata (last_opened_at) or run
+        // schema migration for writable stores. A mismatched writable reopen
+        // therefore errors only after a benign metadata touch. Preflighting
+        // the stamp before open_parts would require a separate read-only
+        // storage peek (architecturally significant); documented here as
+        // accepted behavior — the mutation is a timestamp touch, not a data
+        // change.
         //
         // Concurrency (pulsedb-internal #11): the check-then-set shape (read
         // `provider_identity` + era marker → compare → stamp) is safe under
@@ -311,17 +362,6 @@ impl PulseDB {
         if let Some(to_stamp) = should_stamp {
             if config.read_only {
                 return Err(PulseDBError::ReadOnly);
-            }
-            // VS-4.3.3/1.05 (#10): validate the embedder's dimension matches
-            // the configured dimension BEFORE stamping. Catches a 384-config +
-            // 768-embedder mismatch that would stamp successfully then corrupt
-            // the HNSW on the first record.
-            let expected = config.embedding_dimension.size();
-            let actual = embedding.dimension();
-            if actual != expected {
-                return Err(PulseDBError::Validation(
-                    ValidationError::dimension_mismatch(expected, actual),
-                ));
             }
             storage.stamp_provider_identity(&to_stamp)?;
         }
@@ -501,12 +541,13 @@ impl PulseDB {
         let should_stamp: bool = match (persisted_identity, era) {
             (None, false) => {
                 // Genuine pre-0.7.0 store: BOTH keys absent. Lenient adoption.
+                // Read-only opens skip stamping (A3).
                 tracing::debug!(
                     provider = %injected.provider,
                     model_id = %injected.model_id,
                     "No persisted provider identity; adopting injected (lenient path)"
                 );
-                true
+                !config.read_only
             }
             (None, true) => {
                 // Post-0.7.0 store whose stamp was LOST/CORRUPTED (era marker
@@ -517,7 +558,7 @@ impl PulseDB {
                      the stamp was lost or corrupted; refusing silent re-adoption",
                 )));
             }
-            (Some(persisted), _) => {
+            (Some(persisted), era_present) => {
                 // Check for the VS-4.3.1-era {builtin-onnx, main_graph}
                 // legacy marker FIRST (one-time migration), then the mismatch
                 // guard. Mirrors the `open` path's migration — both
@@ -534,19 +575,27 @@ impl PulseDB {
                          stamp to the injected model's onnx-<hash> identity"
                     );
                     // Re-stamp with the injected identity (the loaded MiniLM).
-                    true
+                    !config.read_only
                 } else if persisted.provider != injected.provider
                     || persisted.model_id != injected.model_id
                 {
-                    return Err(PulseDBError::EmbeddingProviderMismatch {
-                        persisted,
-                        requested: injected,
-                    });
+                    // A3: read-only consumers must inspect stores without the
+                    // exact provider. Skip the mismatch refusal for read-only
+                    // opens (Codex PR #66, P1).
+                    if config.read_only {
+                        false
+                    } else {
+                        return Err(PulseDBError::EmbeddingProviderMismatch {
+                            persisted,
+                            requested: injected,
+                        });
+                    }
                 } else {
                     // Match — the persisted stamp already records this identity.
-                    // No stamp write needed: re-stamping identical bytes is a
-                    // write txn + fsync for no semantic gain (audit challenge 3).
-                    false
+                    // A6: if the era marker is absent (VS-4.3.1-era store),
+                    // backfill it so a future lost-stamp is detected. Only for
+                    // writable opens (Codex PR #66, P2).
+                    !era_present && !config.read_only
                 }
             }
         };
@@ -556,16 +605,31 @@ impl PulseDB {
         // assembly, so a stamp written here survives. Any failure above (config
         // validation, storage open, HNSW load, mismatch refusal) returned
         // before reaching this line — leaving the store unstamped. Guarded by
+        // A2: Dimension validation runs unconditionally (both stamping and
+        // matching-reopen paths). An embedder retaining its identity string
+        // while changing dimension (384d→768d) must be caught even on a
+        // matching reopen where should_stamp is false (Codex PR #66, P1).
+        let expected = config.embedding_dimension.size();
+        let actual = embedder.dimension();
+        if actual != expected {
+            return Err(PulseDBError::Validation(
+                ValidationError::dimension_mismatch(expected, actual),
+            ));
+        }
+
+        // STAMP — last successful step (audit challenge 4). After this point
+        // the only remaining work is the zero-failure `PulseDB` struct
+        // assembly, so a stamp written here survives. Any failure above (config
+        // validation, storage open, HNSW load, mismatch refusal) returned
+        // before reaching this line — leaving the store unstamped. Guarded by
         // `should_stamp` so a matching reopen skips the redundant write.
+        // For read-only opens, should_stamp is always false (adoption/migration/
+        // mismatch-skip/backfill are gated on !read_only). The read_only guard
+        // below is defense-in-depth.
         //
-        // Read-only guard (Codex review): the lenient-adoption path (no prior
-        // stamp → `should_stamp = true`) must NOT write under a read-only
-        // config. `open_parts` respects read-only (storage opens read-only,
-        // no schema migration), but the stamp write is a separate write txn
-        // that would violate the read-only contract, contend with a writer,
-        // and mutate stores used by read-only observers. Refuse the unstamped
-        // adoption in read-only mode — the caller can reopen writable to
-        // stamp, then reopen read-only.
+        // A5 (Codex PR #66, P2): like `open`, the stamp comparison runs AFTER
+        // open_parts, so a mismatched writable reopen may touch metadata
+        // (last_opened_at) before erroring. Documented as accepted behavior.
         //
         // Concurrency (pulsedb-internal #11): the check-then-set shape (read
         // `provider_identity` → compare → stamp) is safe under redb 4.1's
@@ -580,17 +644,6 @@ impl PulseDB {
         if should_stamp {
             if config.read_only {
                 return Err(PulseDBError::ReadOnly);
-            }
-            // VS-4.3.3/1.05 (#10): validate the injected embedder's dimension
-            // against the configured dimension BEFORE stamping. Catches a
-            // 384-config + 768-embedder mismatch that would stamp successfully
-            // then corrupt the HNSW on the first record.
-            let expected = config.embedding_dimension.size();
-            let actual = embedder.dimension();
-            if actual != expected {
-                return Err(PulseDBError::Validation(
-                    ValidationError::dimension_mismatch(expected, actual),
-                ));
             }
             storage.stamp_provider_identity(&injected)?;
         }
@@ -709,31 +762,21 @@ impl PulseDB {
     }
 
     /// Returns the persistable identity of this database's embedding provider
-    /// (VS-4.3.1 — embedding injection seam).
+    /// (VS-4.3.1 — embedding injection seam; VS-4.3.3 — both constructors stamp).
     ///
     /// Reads the **persisted** identity stamped into redb metadata by
-    /// [`open_with_embedder`] (work item 1.03), so the value reflects whatever
-    /// provider *actually* embedded the store's contents and survives a
-    /// process restart — not whatever embedder happens to be wired this
-    /// session. The signature is stable across the 1.02→1.03 swap; only the
-    /// read site changed (1.02 read the in-memory embedder, 1.03 reads the
-    /// persisted stamp).
-    ///
-    /// For a database opened via [`open`] (which does NOT stamp, per audit
-    /// challenge 5), this falls back to the in-memory embedder's identity —
-    /// `open`'s provider is config-derived and reconstructible, so the
-    /// in-memory value IS the authoritative identity in that case.
+    /// [`open_with_embedder`] (work item 1.03) and [`open`] (work item 1.01),
+    /// so the value reflects whatever provider *actually* embedded the store's
+    /// contents and survives a process restart — not whatever embedder happens
+    /// to be wired this session. The signature is stable across the 1.02→1.03
+    /// swap; only the read site changed (1.02 read the in-memory embedder, 1.03
+    /// reads the persisted stamp).
     ///
     /// # Errors
     ///
-    /// Returns the provider identity recorded for this store.
-    ///
-    /// For a store opened via [`open`], no stamp is written, so the in-memory
-    /// identity (config-derived, reconstructible) is authoritative.
-    ///
-    /// For a store opened via [`open_with_embedder`], the persisted stamp is
-    /// the source of truth and SHOULD always be present (it's the last
-    /// successful step of the constructor). A missing stamp on such a store
+    /// For both constructors the persisted stamp is the source of truth and
+    /// SHOULD always be present (it's the last successful step of each
+    /// constructor). A missing stamp on a store whose era marker IS present
     /// means the stamp was LOST — a silent integrity regression — and is
     /// surfaced as a `StorageError::Corrupted` rather than silently falling
     /// back to the in-memory embedder identity. Failing loud here prevents a
@@ -1260,17 +1303,18 @@ impl PulseDB {
         let is_external = !self.has_injected_embedder
             && matches!(self.config.embedding_provider, EmbeddingProvider::External);
 
-        // VS-4.3.3/1.03 (pulsedb-internal #8): refuse `embedding: Some(vec)`
-        // under `open_with_embedder`. The injected embedder's contract is "I
-        // embed everything"; a caller-supplied vector bypasses it, so the
-        // stamped identity could no longer truthfully describe who embedded the
-        // stored vectors. The `open` + `Some(vec)` legacy API stays legal (its
-        // identity is config-derived; `External`-via-`open` is the
-        // caller-controlled path). Placed before the collective fetch + dim
-        // validation so the gate fires first — catches `Some(vec![])` as
-        // misuse, not as a dim-0 error.
-        if self.has_injected_embedder && exp.embedding.is_some() {
-            return Err(PulseDBError::InjectedEmbedderPresent {
+        // VS-4.3.3/1.03 + PR #66 A1: refuse `embedding: Some(vec)` for ALL
+        // managed embedders (injected via `open_with_embedder` AND Builtin via
+        // `open`). A managed embedder's contract is "I embed everything"; a
+        // caller-supplied vector bypasses it, so any dimension-correct vector
+        // from another model could be persisted under the store's stamped
+        // identity — directly bypassing the cross-provider-mixing guarantee.
+        // Only `External`-via-`open` retains the per-record vector API (its
+        // identity is caller-controlled by design). Placed before the
+        // collective fetch + dim validation so the gate fires first — catches
+        // `Some(vec![])` as misuse, not as a dim-0 error.
+        if exp.embedding.is_some() && !is_external {
+            return Err(PulseDBError::ManagedEmbedderPresent {
                 record_kind: "experience",
             });
         }
@@ -2380,14 +2424,13 @@ impl PulseDB {
         let is_external = !self.has_injected_embedder
             && matches!(self.config.embedding_provider, EmbeddingProvider::External);
 
-        // VS-4.3.3/1.03 (pulsedb-internal #8): refuse `embedding: Some(vec)`
-        // under `open_with_embedder`. Same gate as `record_experience` above
-        // (the asymmetry comment just above explains why the *external-embedder*
-        // gate is shaped differently here; THIS gate is identical at both sites
-        // — same condition, different `record_kind`). Placed before the
-        // collective fetch + dim validation so the gate fires first.
-        if self.has_injected_embedder && insight.embedding.is_some() {
-            return Err(PulseDBError::InjectedEmbedderPresent {
+        // VS-4.3.3/1.03 + PR #66 A1: refuse `embedding: Some(vec)` for ALL
+        // managed embedders (injected AND Builtin). Same gate as
+        // `record_experience` above — same condition, different `record_kind`.
+        // Only `External`-via-`open` retains the per-record vector API. Placed
+        // before the collective fetch + dim validation so the gate fires first.
+        if insight.embedding.is_some() && !is_external {
+            return Err(PulseDBError::ManagedEmbedderPresent {
                 record_kind: "insight",
             });
         }
@@ -3970,7 +4013,7 @@ mod open_with_embedder {
     }
 
     /// AC-1 (a): `record_experience { embedding: Some(vec) }` under
-    /// `open_with_embedder` is refused with `InjectedEmbedderPresent {
+    /// `open_with_embedder` is refused with `ManagedEmbedderPresent {
     /// record_kind: "experience" }`.
     #[test]
     fn record_experience_with_some_vec_under_injected_is_refused() {
@@ -3984,11 +4027,11 @@ mod open_with_embedder {
             ..Default::default()
         };
         match db.record_experience(exp) {
-            Err(PulseDBError::InjectedEmbedderPresent {
+            Err(PulseDBError::ManagedEmbedderPresent {
                 record_kind: "experience",
             }) => {}
             other => panic!(
-                "expected InjectedEmbedderPresent{{record_kind: \"experience\"}}, got {other:?}"
+                "expected ManagedEmbedderPresent{{record_kind: \"experience\"}}, got {other:?}"
             ),
         }
 
@@ -3996,7 +4039,7 @@ mod open_with_embedder {
     }
 
     /// AC-1 (b): `store_insight { embedding: Some(vec) }` under
-    /// `open_with_embedder` is refused with `InjectedEmbedderPresent {
+    /// `open_with_embedder` is refused with `ManagedEmbedderPresent {
     /// record_kind: "insight" }`. The source experience is created first via
     /// `record_experience { embedding: None }` (which succeeds — the injected
     /// embedder embeds it).
@@ -4028,12 +4071,12 @@ mod open_with_embedder {
             domain: Vec::new(),
         };
         match db.store_insight(insight) {
-            Err(PulseDBError::InjectedEmbedderPresent {
+            Err(PulseDBError::ManagedEmbedderPresent {
                 record_kind: "insight",
             }) => {}
-            other => panic!(
-                "expected InjectedEmbedderPresent{{record_kind: \"insight\"}}, got {other:?}"
-            ),
+            other => {
+                panic!("expected ManagedEmbedderPresent{{record_kind: \"insight\"}}, got {other:?}")
+            }
         }
 
         db.close().unwrap();
@@ -4114,10 +4157,10 @@ mod open_with_embedder {
             ..Default::default()
         };
         match db.record_experience(exp) {
-            Err(PulseDBError::InjectedEmbedderPresent {
+            Err(PulseDBError::ManagedEmbedderPresent {
                 record_kind: "experience",
             }) => {}
-            other => panic!("expected InjectedEmbedderPresent (gate-before-dim), got {other:?}"),
+            other => panic!("expected ManagedEmbedderPresent (gate-before-dim), got {other:?}"),
         }
 
         db.close().unwrap();
@@ -4134,6 +4177,7 @@ mod provider_identity_persistence {
     use crate::embedding::{EmbeddingService, ProviderIdentity};
     use crate::error::{PulseDBError, ValidationError};
     use crate::Embedding;
+    use crate::InsightType;
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -4293,11 +4337,12 @@ mod provider_identity_persistence {
         db2.close().unwrap();
     }
 
-    /// (g) Read-only guard (Codex review): a read-only `open_with_embedder` of
-    /// an unstamped store must NOT stamp — the lenient-adoption path requires
-    /// a write, which violates the read-only contract. Refuse with the typed
-    /// `ReadOnly` error. The caller can reopen writable to stamp, then reopen
-    /// read-only. Regression guard for the db.rs:419 read-only bug.
+    /// (g) Read-only guard (Codex review + PR #66 A3): a read-only
+    /// `open_with_embedder` of an unstamped store must NOT stamp. After A3,
+    /// read-only opens skip stamping and succeed — read-only consumers
+    /// should not be forced to stamp. The test verifies the store opens
+    /// read-only without stamping, and a subsequent writable reopen still
+    /// sees the unstamped state (lenient adoption path fires).
     #[test]
     fn read_only_open_with_embedder_does_not_stamp_unstamped_store() {
         let dir = tempdir().unwrap();
@@ -4308,21 +4353,21 @@ mod provider_identity_persistence {
         // state via `open_parts` (which performs no stamping).
         unstamped_store(&path);
 
-        // Reopen via `open_with_embedder` in READ-ONLY mode. The lenient
-        // adoption path would stamp, but read-only must refuse the write.
+        // Reopen via `open_with_embedder` in READ-ONLY mode. A3: the open
+        // succeeds without stamping (should_stamp is false under read-only).
         let read_only_config = Config {
             read_only: true,
             ..Config::default()
         };
-        let err = PulseDB::open_with_embedder(
+        let db = PulseDB::open_with_embedder(
             &path,
             read_only_config,
             injected(id("external", "ada-002")),
         )
-        .expect_err("read-only + unstamped + injected must refuse the stamp write");
-        assert!(err.is_read_only(), "expected ReadOnly error, got {err:?}");
+        .expect("read-only + unstamped opens without stamping (A3)");
+        db.close().unwrap();
 
-        // The refused read-only open wrote nothing. Reopen WRITABLE with the
+        // The read-only open wrote nothing. Reopen WRITABLE with the
         // same identity to confirm the lenient path still works (the store
         // remained unstamped, so writable adoption stamps now).
         let db2 = PulseDB::open_with_embedder(
@@ -4864,6 +4909,151 @@ mod provider_identity_persistence {
             original,
             "stamp carries the injected identity"
         );
+        db.close().unwrap();
+    }
+
+    /// PR #66 A2: dimension validation runs on matching reopens, not just
+    /// stamping paths. An embedder retaining the same identity string while
+    /// changing dimension (384d→768d) must be caught even when should_stamp
+    /// is false (identity matches the persisted stamp).
+    #[test]
+    fn open_with_embedder_matching_identity_dim_change_refused() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dim-change-reopen.db");
+
+        // Stamp with a 384-dim embedder.
+        let original = id("external", "ada-002");
+        let db = PulseDB::open_with_embedder(&path, Config::default(), injected(original.clone()))
+            .expect("first open stamps");
+        db.close().unwrap();
+
+        // Reopen with the SAME identity but 768-dim. The identity matches
+        // (should_stamp is false), but the dimension changed.
+        let wrong_dim = Arc::new(StubEmbedder::new(768, original));
+        let err = PulseDB::open_with_embedder(&path, Config::default(), wrong_dim)
+            .expect_err("matching identity but wrong dim must be refused (A2)");
+
+        match err {
+            PulseDBError::Validation(ValidationError::DimensionMismatch { expected, got }) => {
+                assert_eq!(expected, 384, "expected the configured D384");
+                assert_eq!(got, 768, "got the injected 768");
+            }
+            other => panic!("expected DimensionMismatch, got {other:?}"),
+        }
+    }
+
+    /// PR #66 A3: read-only open of a mismatched store succeeds. A store
+    /// stamped by one provider can be inspected read-only via a different
+    /// provider without requiring the exact stamping embedder.
+    #[test]
+    fn read_only_open_skips_mismatch_guard() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("readonly-mismatch.db");
+
+        // Stamp with identity A.
+        let db = PulseDB::open_with_embedder(
+            &path,
+            Config::default(),
+            injected(id("external", "ada-002")),
+        )
+        .expect("first open stamps identity A");
+        db.close().unwrap();
+
+        // Reopen read-only via open_with_embedder with a DIFFERENT identity B.
+        // A3: the mismatch guard is skipped for read-only opens.
+        let read_only_config = Config {
+            read_only: true,
+            ..Config::default()
+        };
+        let db2 = PulseDB::open_with_embedder(
+            &path,
+            read_only_config,
+            injected(id("external", "cohere-embed-v3")),
+        )
+        .expect("read-only open skips mismatch guard (A3)");
+
+        // The store still reports the originally stamped identity A.
+        assert_eq!(
+            db2.provider_identity().expect("stamp readable"),
+            id("external", "ada-002"),
+            "read-only open did not re-stamp"
+        );
+        db2.close().unwrap();
+    }
+
+    /// PR #66 A1: a Builtin-via-open store rejects `embedding: Some(vec)` in
+    /// record_experience. The managed-embedder gate covers Builtin stores,
+    /// not just injected embedders. Feature-gated: requires the ONNX model.
+    #[test]
+    #[cfg(feature = "builtin-embeddings")]
+    fn builtin_store_rejects_supplied_vector_record_experience() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("builtin-reject-vec.db");
+
+        let db = PulseDB::open(&path, Config::with_builtin_embeddings())
+            .expect("open with Builtin config");
+        let collective_id = db
+            .create_collective("builtin-reject")
+            .expect("create collective");
+
+        let exp = NewExperience {
+            collective_id,
+            content: "caller-supplied vector under Builtin embedder".to_string(),
+            embedding: Some(vec![0.5f32; 384]),
+            ..Default::default()
+        };
+        match db.record_experience(exp) {
+            Err(PulseDBError::ManagedEmbedderPresent {
+                record_kind: "experience",
+            }) => {}
+            other => panic!(
+                "expected ManagedEmbedderPresent{{record_kind: \"experience\"}} for Builtin, got {other:?}"
+            ),
+        }
+        db.close().unwrap();
+    }
+
+    /// PR #66 A1: a Builtin-via-open store rejects `embedding: Some(vec)` in
+    /// store_insight. Feature-gated.
+    #[test]
+    #[cfg(feature = "builtin-embeddings")]
+    fn builtin_store_rejects_supplied_vector_store_insight() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("builtin-reject-insight.db");
+
+        let db = PulseDB::open(&path, Config::with_builtin_embeddings())
+            .expect("open with Builtin config");
+        let collective_id = db
+            .create_collective("builtin-reject-insight")
+            .expect("create collective");
+
+        // Record an experience normally (Builtin embedder generates the vector).
+        let exp_id = db
+            .record_experience(NewExperience {
+                collective_id,
+                content: "source experience for insight".to_string(),
+                ..Default::default()
+            })
+            .expect("record_experience with embedding: None succeeds");
+
+        // Try to store an insight with a supplied vector → must be rejected.
+        let insight = NewDerivedInsight {
+            collective_id,
+            content: "caller-supplied insight vector under Builtin embedder".to_string(),
+            embedding: Some(vec![0.5f32; 384]),
+            source_experience_ids: vec![exp_id],
+            insight_type: InsightType::Pattern,
+            confidence: 0.8,
+            domain: Vec::new(),
+        };
+        match db.store_insight(insight) {
+            Err(PulseDBError::ManagedEmbedderPresent {
+                record_kind: "insight",
+            }) => {}
+            other => panic!(
+                "expected ManagedEmbedderPresent{{record_kind: \"insight\"}} for Builtin, got {other:?}"
+            ),
+        }
         db.close().unwrap();
     }
 }

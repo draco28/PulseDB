@@ -50,7 +50,7 @@ across reopen → mismatch refusal with different identity.
 
 Exercises the cross-provider-mismatch guard on BOTH constructors: stamp identity A →
 reopen with different config → refused with EmbeddingProviderMismatch; Some(vec) under
-open_with_embedder → refused with InjectedEmbedderPresent; era-marker-present +
+open_with_embedder → refused with ManagedEmbedderPresent; era-marker-present +
 identity-absent → corruption error on both constructors.
 
 ### Flow 4: Search + Ranking

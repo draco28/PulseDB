@@ -62,13 +62,14 @@ pub enum PulseDBError {
     Embedding(String),
 
     /// Refusing to reopen a database whose persisted provider identity does not
-    /// match the injected embedder (VS-4.3.1 work 1.03 — the cross-provider-mixing
-    /// safety guard for `pulseai-labs/PulseDB#61`).
+    /// match the requesting embedder (VS-4.3.1 work 1.03 + VS-4.3.3 work 1.01 —
+    /// the cross-provider-mixing safety guard).
     ///
     /// The substrate persists the identity that *actually* embedded the store's
     /// vectors under `PROVIDER_IDENTITY_KEY` (redb metadata). On reopen via
-    /// [`open_with_embedder`](crate::PulseDB::open_with_embedder), that persisted
-    /// identity is compared against the injected embedder's identity on
+    /// either [`open_with_embedder`](crate::PulseDB::open_with_embedder) or
+    /// [`open`](crate::PulseDB::open), that persisted identity is compared
+    /// against the requesting embedder's identity on
     /// `(provider, model_id)` only — `ProviderIdentity` carries no `dimension`
     /// field (dimension mismatch is caught separately by `validate_embedding`).
     /// A mismatch is refused with this typed error rather than silently mixing
@@ -79,35 +80,40 @@ pub enum PulseDBError {
     /// refusal *detectable*, which this typed variant satisfies.
     #[error(
         "embedding provider mismatch: the database was embedded by {persisted:?} \
-         (provider + model_id), but the injected embedder is {requested:?}; \
+         (provider + model_id), but the requesting embedder is {requested:?}; \
          reopen with the original provider or run the re-embed migration"
     )]
     EmbeddingProviderMismatch {
         /// The persisted identity read from `PROVIDER_IDENTITY_KEY`.
         persisted: ProviderIdentity,
-        /// The injected embedder's identity that mismatched it.
+        /// The requesting embedder's identity that mismatched it. This may be
+        /// the config-derived identity (from `PulseDB::open`) or the injected
+        /// embedder's identity (from `open_with_embedder`).
         requested: ProviderIdentity,
     },
 
-    /// Refusing `embedding: Some(vec)` under `open_with_embedder`
-    /// (VS-4.3.3 work 1.03 — cross-provider-mixing safety, API-surface half).
+    /// Refusing `embedding: Some(vec)` when the store has a managed embedder
+    /// (VS-4.3.3 — cross-provider-mixing safety, API-surface half).
     ///
-    /// The injected-embedder constructor's contract is "I embed everything":
-    /// every record is embedded through the injected service. A caller-supplied
-    /// vector bypasses that service, so the store's stamped identity can no
-    /// longer truthfully describe who embedded its vectors. Refused with this
-    /// typed error.
+    /// A managed embedder controls its own model identity: this covers both
+    /// `open_with_embedder` (the injected service) and `Builtin`-via-`open`
+    /// (the ONNX model). A caller-supplied vector bypasses the managed
+    /// embedder, so any dimension-correct vector from another model could be
+    /// persisted and indexed under the store's stamped identity — directly
+    /// bypassing the cross-provider-mixing guarantee. Refused with this typed
+    /// error.
     ///
-    /// The `PulseDB::open` + `Some(vec)` legacy API (since v0.1.0) stays legal —
-    /// its identity is config-derived, and `External`-via-`open` is explicitly
-    /// the caller-controlled path. Use `open` if you need the per-record vector
-    /// API.
+    /// The `PulseDB::open` + `EmbeddingProvider::External` + `Some(vec)`
+    /// legacy API (since v0.1.0) stays legal — its identity is
+    /// caller-controlled by design.
     #[error(
-        "cannot pass embedding: Some(vector) to {record_kind} under open_with_embedder \
-         (the injected embedder must embed everything); pass embedding: None to route \
-         through it, or use PulseDB::open to retain the per-record vector API"
+        "cannot pass embedding: Some(vector) to {record_kind} when the store has a \
+         managed embedder (injected via open_with_embedder or Builtin via open); \
+         the embedder must embed everything — pass embedding: None to route through \
+         it, or use PulseDB::open with EmbeddingProvider::External to retain the \
+         per-record vector API"
     )]
-    InjectedEmbedderPresent {
+    ManagedEmbedderPresent {
         /// `"experience"` or `"insight"` — which write path was refused.
         record_kind: &'static str,
     },

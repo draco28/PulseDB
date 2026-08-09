@@ -280,19 +280,25 @@ impl OnnxEmbedding {
             )));
         }
 
-        let session = create_session(&model_path)?;
-        let tokenizer = load_tokenizer(&tokenizer_path, max_length)?;
+        let model_bytes = std::fs::read(&model_path)
+            .map_err(|e| PulseDBError::embedding(format!("Failed to read model bytes: {e}")))?;
+        let tokenizer_bytes = std::fs::read(&tokenizer_path)
+            .map_err(|e| PulseDBError::embedding(format!("Failed to read tokenizer bytes: {e}")))?;
+
+        // A7 (Codex PR #66, P2): Load the session and tokenizer from the SAME
+        // in-memory byte slices that are hashed below. This closes the TOCTOU
+        // where a file replacement between the session/tokenizer load and the
+        // hash read could make the persisted identity describe different bytes
+        // than what inference actually uses.
+        let session = create_session(&model_bytes, &model_path)?;
+        let tokenizer = load_tokenizer(&tokenizer_bytes, max_length, &tokenizer_path)?;
 
         // Construction-time fingerprint: full SHA-256 of length-framed
         // model+tokenizer bytes. Computed once here so `identity()` is infallible
         // and the retained hash describes the exact artifacts loaded at construction
         // (not whatever the file path points at later — closes the file-replacement
-        // attack, Codex #14). The file is read twice (once by `create_session`,
-        // once here for the hash); that is an acceptable one-time construction cost.
-        let model_bytes = std::fs::read(&model_path)
-            .map_err(|e| PulseDBError::embedding(format!("Failed to read model bytes: {e}")))?;
-        let tokenizer_bytes = std::fs::read(&tokenizer_path)
-            .map_err(|e| PulseDBError::embedding(format!("Failed to read tokenizer bytes: {e}")))?;
+        // attack, Codex #14). The bytes are the same ones loaded for inference
+        // above, so the hash and the runtime artifacts cannot diverge.
         let identity_hash = compute_fingerprint(&model_bytes, &tokenizer_bytes);
 
         debug!(dimension, max_length, "ONNX embedding model loaded");
@@ -486,13 +492,15 @@ impl EmbeddingService for OnnxEmbedding {
 // ---------------------------------------------------------------------------
 
 /// Creates an ONNX Runtime session with optimized settings.
-fn create_session(model_path: &Path) -> Result<Session> {
+/// Takes pre-loaded bytes so the fingerprint hashes the exact bytes used for
+/// inference (A7 — closes the TOCTOU file-replacement window).
+fn create_session(model_bytes: &[u8], model_path: &Path) -> Result<Session> {
     Session::builder()
         .map_err(|e| PulseDBError::embedding(format!("Failed to create session builder: {e}")))?
         // Level3: all optimizations (operator fusion, constant folding, etc.)
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .map_err(|e| PulseDBError::embedding(format!("Failed to set optimization level: {e}")))?
-        .commit_from_file(model_path)
+        .commit_from_memory(model_bytes)
         .map_err(|e| {
             PulseDBError::embedding(format!(
                 "Failed to load ONNX model from {}: {e}",
@@ -501,9 +509,15 @@ fn create_session(model_path: &Path) -> Result<Session> {
         })
 }
 
-/// Loads a HuggingFace tokenizer from a tokenizer.json file.
-fn load_tokenizer(tokenizer_path: &Path, max_length: usize) -> Result<Tokenizer> {
-    let mut tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| {
+/// Loads a HuggingFace tokenizer from pre-loaded bytes.
+/// Takes bytes (not a path) so the fingerprint hashes the exact tokenizer
+/// bytes used at runtime (A7).
+fn load_tokenizer(
+    tokenizer_bytes: &[u8],
+    max_length: usize,
+    tokenizer_path: &Path,
+) -> Result<Tokenizer> {
+    let mut tokenizer = Tokenizer::from_bytes(tokenizer_bytes).map_err(|e| {
         PulseDBError::embedding(format!(
             "Failed to load tokenizer from {}: {e}",
             tokenizer_path.display()

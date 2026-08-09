@@ -12,12 +12,17 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
-  id-token: write
   actions: read
 
 jobs:
   qa:
-    if: github.event.pull_request.draft == false
+    # B2: same-repo PRs only — fork and Dependabot PRs don't receive
+    # FACTORY_API_KEY, so the QA runner can't authenticate. This also
+    # prevents PR-controlled code from inheriting the secret on untrusted
+    # checkouts (Codex PR #66, P1).
+    if: |
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -41,6 +46,11 @@ jobs:
 
       - name: Run Droid QA
         id: qa
+        # B8: This step is intentionally informational, not a merge gate.
+        # continue-on-error + the || true mean a green check does NOT mean
+        # "QA passed" — it means "QA ran." Review the uploaded qa-results/
+        # artifacts for the actual verdict. If QA should gate merges, remove
+        # both continue-on-error and || true, and add `set -o pipefail`.
         continue-on-error: true
         timeout-minutes: 18
         env:
