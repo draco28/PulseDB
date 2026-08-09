@@ -39,14 +39,15 @@ use super::legacy_bincode;
 use super::schema::SYNC_CURSORS_TABLE;
 use super::schema::{
     decode_collective_from_activity_key, encode_activity_key, encode_type_index_key,
-    DatabaseMetadata, EntityTypeTag, ExperienceTypeTag, ExperienceV2, WatchEventRecord,
-    WatchEventTypeTag, ACTIVITIES_TABLE, COLLECTIVES_TABLE, CURRENT_SUBSTRATE_FORMAT,
-    DECAY_CONFIGS_TABLE, EMBEDDINGS_TABLE, EXPERIENCES_BY_COLLECTIVE_TABLE,
-    EXPERIENCES_BY_TYPE_TABLE, EXPERIENCES_TABLE, INSIGHTS_BY_COLLECTIVE_TABLE, INSIGHTS_TABLE,
-    INSTANCE_ID_KEY, LEGACY_SUBSTRATE_FORMAT, METADATA_TABLE, PROVIDER_IDENTITY_KEY,
-    PROVIDER_IDENTITY_STAMPED_AT_KEY, RELATIONS_BY_SOURCE_TABLE, RELATIONS_BY_TARGET_TABLE,
-    RELATIONS_TABLE, SCHEMA_VERSION, SUBSTRATE_FORMAT_KEY, SUBSTRATE_MAGIC, SUBSTRATE_MARKER_LEN,
-    WAL_SEQUENCE_KEY, WATCH_EVENTS_TABLE,
+    DatabaseMetadata, EntityTypeTag, ExperienceTypeTag, ExperienceV2, ExperienceV3,
+    WatchEventRecord, WatchEventTypeTag, ACTIVITIES_TABLE, COLLECTIVES_TABLE,
+    CURRENT_SUBSTRATE_FORMAT, DECAY_CONFIGS_TABLE, EMBEDDINGS_TABLE,
+    EXPERIENCES_BY_COLLECTIVE_TABLE, EXPERIENCES_BY_TYPE_TABLE, EXPERIENCES_TABLE,
+    INSIGHTS_BY_COLLECTIVE_TABLE, INSIGHTS_TABLE, INSTANCE_ID_KEY, LEGACY_SUBSTRATE_FORMAT,
+    METADATA_TABLE, PROVIDER_IDENTITY_KEY, PROVIDER_IDENTITY_STAMPED_AT_KEY,
+    RELATIONS_BY_SOURCE_TABLE, RELATIONS_BY_TARGET_TABLE, RELATIONS_TABLE, SCHEMA_VERSION,
+    SUBSTRATE_FORMAT_KEY, SUBSTRATE_MAGIC, SUBSTRATE_MARKER_LEN, WAL_SEQUENCE_KEY,
+    WATCH_EVENTS_TABLE,
 };
 use super::StorageEngine;
 use crate::config::{Config, EmbeddingDimension, RecallWeights};
@@ -187,6 +188,23 @@ fn pre_v3_backup_path(path: &Path) -> PathBuf {
         .map(|name| name.to_string_lossy())
         .unwrap_or_else(|| "pulsedb.redb".into());
     backup.set_file_name(format!("{file_name}.pre-v3.bak"));
+    backup
+}
+
+/// Deterministic sibling path for the pre-v4 backup (schema v3→v4 migration:
+/// adds the `tags: BTreeMap<String,String>` field to experience records).
+///
+/// Distinct from [`pre_v3_backup_path`] (`.pre-v3.bak`): a schema-3 store never
+/// took a pre-v3 backup, so the v4 reshape (which rewrites every experience
+/// blob to append the trailing `tags` field) gets its own belt-and-suspenders
+/// copy. Schema ≤ 2 stores already have `.pre-v3.bak`.
+fn pre_v4_backup_path(path: &Path) -> PathBuf {
+    let mut backup = path.to_path_buf();
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "pulsedb.redb".into());
+    backup.set_file_name(format!("{file_name}.pre-v4.bak"));
     backup
 }
 
@@ -1018,28 +1036,37 @@ impl RedbStorage {
         Self::validate_existing_metadata(&metadata, config)?;
         let mut needs_v2_migration = metadata.schema_version == 1;
         let mut needs_v3_migration = metadata.schema_version <= 2;
+        let mut needs_v4_migration = metadata.schema_version <= 3;
 
-        if needs_v3_migration && config.read_only {
+        if (needs_v3_migration || needs_v4_migration) && config.read_only {
             return Err(PulseDBError::ReadOnly);
         }
 
-        // The pre-v3 backup is a plain file copy of the on-disk database. On
-        // Windows the live redb handle holds an OS file lock, so `fs::copy` fails
-        // with a lock violation (error 33) while `db` is open. Drop the handle to
-        // release the lock, copy, then re-open. Only runs on the one-time v3
-        // migration path; `db` has had read-only access (metadata read) up to here,
-        // so dropping and reopening loses no state.
-        let db = if needs_v3_migration {
+        // The pre-v3 / pre-v4 backup is a plain file copy of the on-disk
+        // database. On Windows the live redb handle holds an OS file lock, so
+        // `fs::copy` fails with a lock violation (error 33) while `db` is open.
+        // Drop the handle to release the lock, copy, then re-open. Only runs on
+        // the one-time migration path; `db` has had read-only access (metadata
+        // read) up to here, so dropping and reopening loses no state.
+        //
+        // Schema ≤ 2 stores take `.pre-v3.bak` (they run the v2→v3 reshape).
+        // Schema == 3 stores take `.pre-v4.bak` (v3→v4 tag-field append — no
+        // v3 backup exists for them).
+        let db = if needs_v3_migration || needs_v4_migration {
             drop(db);
-            // Don't clobber an existing pre-v3 backup. The copy happens in the
+            // Don't clobber an existing backup. The copy happens in the
             // lock-release window before the re-read below can confirm migration is
             // still needed; if a concurrent upgrader already migrated the file and
-            // wrote the backup, copying now would overwrite the genuine pre-v3
-            // sidecar with already-migrated v3 data. Atomically claim the backup
-            // path (create_new / O_EXCL) so only the first writer creates it — a
+            // wrote the backup, copying now would overwrite the genuine sidecar
+            // with already-migrated data. Atomically claim the backup path
+            // (create_new / O_EXCL) so only the first writer creates it — a
             // concurrent upgrader that lost the race sees AlreadyExists and leaves
             // the genuine sidecar untouched (no TOCTOU between exists() and copy()).
-            let backup_path = pre_v3_backup_path(&path);
+            let backup_path = if needs_v3_migration {
+                pre_v3_backup_path(&path)
+            } else {
+                pre_v4_backup_path(&path)
+            };
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -1048,7 +1075,7 @@ impl RedbStorage {
                 Ok(mut backup_file) => {
                     // If the copy fails after we claimed the path (disk full, short
                     // write, interruption), remove the partial/empty backup so a
-                    // later open does not treat it as a valid pre-v3 sidecar via the
+                    // later open does not treat it as a valid sidecar via the
                     // AlreadyExists branch — the next open then re-creates a complete one.
                     let copy_result = std::fs::File::open(&path).and_then(|mut source| {
                         std::io::copy(&mut source, &mut backup_file).map(|_| ())
@@ -1064,7 +1091,7 @@ impl RedbStorage {
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    debug!("pre-v3 backup already exists; preserving it");
+                    debug!("pre-migration backup already exists; preserving it");
                 }
                 Err(error) => return Err(migration_io_error(error)),
             }
@@ -1074,6 +1101,7 @@ impl RedbStorage {
             metadata = reopened_metadata;
             needs_v2_migration = metadata.schema_version == 1;
             needs_v3_migration = metadata.schema_version <= 2;
+            needs_v4_migration = metadata.schema_version <= 3;
             reopened
         } else {
             db
@@ -1171,7 +1199,7 @@ impl RedbStorage {
         if !config.read_only {
             // Update last_opened_at timestamp and bump schema version if migrating.
             metadata.touch();
-            if needs_v2_migration || needs_v3_migration {
+            if needs_v2_migration || needs_v3_migration || needs_v4_migration {
                 metadata.schema_version = SCHEMA_VERSION;
             }
 
@@ -1205,17 +1233,30 @@ impl RedbStorage {
                 drop(meta_table);
 
                 // Schema reshape v2→v3 (READ side decodes legacy bincode; rewrite is
-                // current schema). Orthogonal to the codec axis below.
+                // v3-format postcard — ExperienceV3, no tags). Orthogonal to the
+                // codec axis below.
                 if needs_v3_migration {
                     Self::migrate_experiences_v2_to_v3(&write_txn)?;
                     info!("Migrated experiences from schema v2 to v3");
+                }
+
+                // Schema v3→v4: append the `tags: BTreeMap<String,String>` field to
+                // experience records (VS-4.3.2). Runs BEFORE the codec re-encode so
+                // it reads v3-format data (from the v2→v3 migrator or from a real
+                // schema-3 store). The v3→v4 migrator uses the dual-format reader
+                // (postcard + legacy bincode) and writes v4-format postcard. After
+                // this, all experience blobs are v4-format; the codec re-encode
+                // below reads them cleanly as `Experience`.
+                if needs_v4_migration {
+                    Self::migrate_experiences_v3_to_v4(&write_txn)?;
+                    info!("Migrated experiences from schema v3 to v4");
                 }
 
                 // DECOUPLED CODEC RE-ENCODE (design §2.3 / grill Q1): driven SOLELY
                 // by the substrate marker (`needs_marker_write` ⇒ Absent|Older),
                 // re-encode EVERY serde-blob table bincode→postcard, unconditionally
                 // — no table is covered only by a reshape migrator. A `{redb-v3,
-                // bincode}` store hits NO-OP reshape above yet has every row
+                // bincode}` store hits NO-OP reshape above yet still gets every row
                 // re-encoded here. Copy-through tables (EMBEDDINGS, the 5 multimaps,
                 // raw metadata keys) are NEVER touched → byte-identical.
                 if needs_marker_write {
@@ -1429,7 +1470,10 @@ impl RedbStorage {
             let mut applications = BTreeMap::new();
             applications.insert(legacy_applications_instance_id(), v2.applications);
 
-            let v3 = Experience {
+            // Write v3-format data (no `tags` field). The v3→v4 migrator (which
+            // runs next) adds the tags field. Writing Experience (v4) here would
+            // break the v3→v4 decode due to postcard field misalignment.
+            let v3 = ExperienceV3 {
                 id: v2.id,
                 collective_id: v2.collective_id,
                 content: v2.content,
@@ -1452,6 +1496,69 @@ impl RedbStorage {
         }
 
         debug!("Migrated experience records to v3");
+        Ok(())
+    }
+
+    // ========================================================================
+    // Schema v3 → v4: add key-value tags (VS-4.3.2 / work-1.01)
+    // ========================================================================
+
+    /// Reshapes experience records from schema v3 to v4 by decoding each record
+    /// as the legacy `ExperienceV3` struct (which lacks the `tags` field) and
+    /// re-serializing as a current `Experience` with `tags: BTreeMap::new()`.
+    ///
+    /// Postcard is not self-describing, so adding a serialized field to the
+    /// experience blob is a structural change — existing v3 stores cannot be
+    /// deserialized as v4 directly (the trailing `tags` bytes are absent). This
+    /// migrator runs AFTER the v2→v3 reshape and the codec re-encode pass, so it
+    /// always reads postcard-v3 format. The `tags` field defaults to empty; no
+    /// data is invented.
+    fn migrate_experiences_v3_to_v4(write_txn: &::redb::WriteTransaction) -> Result<()> {
+        let experiences_table = write_txn.open_table(EXPERIENCES_TABLE)?;
+
+        let mut experience_ids: Vec<[u8; 16]> = Vec::new();
+        for entry in experiences_table.iter()? {
+            let (key, _) = entry.map_err(StorageError::from)?;
+            experience_ids.push(*key.value());
+        }
+        drop(experiences_table);
+
+        let mut experiences_table = write_txn.open_table(EXPERIENCES_TABLE)?;
+        for experience_id in experience_ids {
+            let entry = experiences_table.get(&experience_id)?.ok_or_else(|| {
+                StorageError::corrupted("experience disappeared during v3→v4 migration")
+            })?;
+            // Decode via the dual-format reader (postcard first, then legacy
+            // bincode). This handles both postcard-v3 stores (marker=Current) and
+            // bincode-v3 stores (marker=Older). The v2→v3 migrator above wrote
+            // postcard-v3 format, which decodes cleanly here.
+            let v3: ExperienceV3 = Self::decode_blob_legacy_or_postcard(entry.value(), "v3 experience record")?;
+            drop(entry);
+
+            let v4 = Experience {
+                id: v3.id,
+                collective_id: v3.collective_id,
+                content: v3.content,
+                embedding: v3.embedding,
+                experience_type: v3.experience_type,
+                importance: v3.importance,
+                confidence: v3.confidence,
+                applications: v3.applications,
+                domain: v3.domain,
+                tags: std::collections::BTreeMap::new(),
+                related_files: v3.related_files,
+                source_agent: v3.source_agent,
+                source_task: v3.source_task,
+                timestamp: v3.timestamp,
+                last_reinforced: v3.last_reinforced,
+                archived: v3.archived,
+            };
+            let bytes =
+                postcard::to_stdvec(&v4).map_err(|e| StorageError::serialization(e.to_string()))?;
+            experiences_table.insert(&experience_id, bytes.as_slice())?;
+        }
+
+        debug!("Migrated experience records from v3 to v4");
         Ok(())
     }
 
@@ -1907,26 +2014,59 @@ impl RedbStorage {
                 ) {
                     Ok(v) => v,
                     Err(_) => {
-                        let v2: ExperienceV2 =
-                            Self::decode_blob_legacy_or_postcard(&bytes, "experience_v2")?;
-                        let mut applications = BTreeMap::new();
-                        applications.insert(legacy_applications_instance_id(), v2.applications);
-                        Experience {
-                            id: v2.id,
-                            collective_id: v2.collective_id,
-                            content: v2.content,
-                            embedding: v2.embedding,
-                            experience_type: v2.experience_type,
-                            importance: v2.importance,
-                            confidence: v2.confidence,
-                            applications,
-                            domain: v2.domain,
-                            related_files: v2.related_files,
-                            source_agent: v2.source_agent,
-                            source_task: v2.source_task,
-                            timestamp: v2.timestamp,
-                            last_reinforced: v2.timestamp,
-                            archived: v2.archived,
+                        // Schema-3 bincode stores (postcard-1-era marker but
+                        // pre-tags): try ExperienceV3 (same fields as Experience
+                        // minus the v4 `tags` field). If that also fails, fall
+                        // through to the v2 path (scalar applications).
+                        match Self::decode_blob_legacy_or_postcard::<ExperienceV3>(
+                            &bytes,
+                            "experience_v3",
+                        ) {
+                            Ok(v3) => Experience {
+                                id: v3.id,
+                                collective_id: v3.collective_id,
+                                content: v3.content,
+                                embedding: v3.embedding,
+                                experience_type: v3.experience_type,
+                                importance: v3.importance,
+                                confidence: v3.confidence,
+                                applications: v3.applications,
+                                domain: v3.domain,
+                                tags: BTreeMap::new(),
+                                related_files: v3.related_files,
+                                source_agent: v3.source_agent,
+                                source_task: v3.source_task,
+                                timestamp: v3.timestamp,
+                                last_reinforced: v3.last_reinforced,
+                                archived: v3.archived,
+                            },
+                            Err(_) => {
+                                let v2: ExperienceV2 = Self::decode_blob_legacy_or_postcard(
+                                    &bytes,
+                                    "experience_v2",
+                                )?;
+                                let mut applications = BTreeMap::new();
+                                applications
+                                    .insert(legacy_applications_instance_id(), v2.applications);
+                                Experience {
+                                    id: v2.id,
+                                    collective_id: v2.collective_id,
+                                    content: v2.content,
+                                    embedding: v2.embedding,
+                                    experience_type: v2.experience_type,
+                                    importance: v2.importance,
+                                    confidence: v2.confidence,
+                                    applications,
+                                    domain: v2.domain,
+                                    tags: BTreeMap::new(),
+                                    related_files: v2.related_files,
+                                    source_agent: v2.source_agent,
+                                    source_task: v2.source_task,
+                                    timestamp: v2.timestamp,
+                                    last_reinforced: v2.timestamp,
+                                    archived: v2.archived,
+                                }
+                            }
                         }
                     }
                 };
@@ -2612,6 +2752,9 @@ impl StorageEngine for RedbStorage {
             }
             if let Some(ref domain) = update.domain {
                 experience.domain = domain.clone();
+            }
+            if let Some(ref tags) = update.tags {
+                experience.tags = tags.clone();
             }
             if let Some(ref related_files) = update.related_files {
                 experience.related_files = related_files.clone();
@@ -3739,6 +3882,7 @@ mod tests {
             confidence: 0.25,
             applications,
             domain: vec!["a".into(), "bb".into()],
+            tags: BTreeMap::new(),
             related_files: Vec::new(),
             source_agent: AgentId::new("agent"),
             source_task: Some(crate::types::TaskId::new("task")),
@@ -4703,6 +4847,7 @@ mod tests {
             confidence: 0.7,
             applications: BTreeMap::new(),
             domain: vec!["rust".into(), "databases".into()],
+            tags: BTreeMap::new(),
             related_files: vec!["src/storage/redb.rs".into()],
             source_agent: AgentId::new("test-agent"),
             source_task: None,
@@ -7132,9 +7277,28 @@ mod tests {
                 postcard_is_rejected_by_legacy_bincode(&sample_decay_config()),
                 "decay_config: postcard must be rejected (disjoint) by legacy bincode"
             );
-            // experience (golden-anchored)
-            let experience: Experience =
+            // experience (golden-anchored) — golden bytes are schema-v3 (no tags);
+            // decode as ExperienceV3, then construct an Experience for the postcard check.
+            let v3: ExperienceV3 =
                 legacy_bincode::decode(EXPERIENCE_GOLDEN).expect("experience golden decodes");
+            let experience = Experience {
+                id: v3.id,
+                collective_id: v3.collective_id,
+                content: v3.content,
+                embedding: v3.embedding,
+                experience_type: v3.experience_type,
+                importance: v3.importance,
+                confidence: v3.confidence,
+                applications: v3.applications,
+                domain: v3.domain,
+                tags: BTreeMap::new(),
+                related_files: v3.related_files,
+                source_agent: v3.source_agent,
+                source_task: v3.source_task,
+                timestamp: v3.timestamp,
+                last_reinforced: v3.last_reinforced,
+                archived: v3.archived,
+            };
             assert!(
                 postcard_is_rejected_by_legacy_bincode(&experience),
                 "experience: postcard must be rejected (disjoint) by legacy bincode"
@@ -7214,6 +7378,7 @@ mod tests {
                     confidence: 0.25,
                     applications,
                     domain,
+                    tags: BTreeMap::new(),
                     related_files: Vec::new(),
                     source_agent: AgentId::new("agent"),
                     source_task: None,
@@ -7322,6 +7487,7 @@ mod tests {
                 confidence: 0.0,
                 applications: BTreeMap::new(),
                 domain: Vec::new(),
+                tags: BTreeMap::new(),
                 related_files: Vec::new(),
                 source_agent: AgentId::new(""),
                 source_task: None,

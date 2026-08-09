@@ -114,6 +114,7 @@ mod tests {
                 confidence: 0.8,
                 applications: std::collections::BTreeMap::new(),
                 domain: vec!["test".to_string()],
+                tags: std::collections::BTreeMap::new(),
                 related_files: vec![],
                 source_agent: AgentId::new("agent-1"),
                 source_task: None,

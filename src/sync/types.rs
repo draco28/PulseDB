@@ -115,6 +115,7 @@ impl From<SerializableExperienceUpdate> for crate::experience::ExperienceUpdate 
             importance: update.importance,
             confidence: update.confidence,
             domain: update.domain,
+            tags: None,
             related_files: update.related_files,
             archived: update.archived,
         }
@@ -375,6 +376,7 @@ mod tests {
             importance: Some(0.9),
             confidence: None,
             domain: Some(vec!["rust".to_string()]),
+            tags: None,
             related_files: None,
             archived: Some(false),
         };

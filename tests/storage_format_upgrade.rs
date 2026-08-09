@@ -239,8 +239,8 @@ fn verify_fixture(fx: &Fixture) {
         .unwrap_or_else(|e| panic!("{}: migrate+open failed: {e:?}", fx.redb));
     assert_eq!(
         db.metadata().schema_version,
-        3,
-        "{}: expected schema v3 post-migration",
+        4,
+        "{}: expected schema v4 post-migration",
         fx.redb
     );
 

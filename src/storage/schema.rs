@@ -32,19 +32,21 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
+use std::collections::BTreeMap;
+
 use redb::{MultimapTableDefinition, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use crate::config::EmbeddingDimension;
 use crate::experience::ExperienceType;
-use crate::types::{AgentId, CollectiveId, ExperienceId, TaskId, Timestamp};
+use crate::types::{AgentId, CollectiveId, ExperienceId, InstanceId, TaskId, Timestamp};
 
 /// Current schema version.
 ///
 /// Increment this when making breaking changes to the schema.
 /// Version 2 adds `entity_type` to `WatchEventRecord` for sync protocol support.
 /// Version 3 reshapes `Experience` for temporal decay and G-counter applications.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 // ============================================================================
 // Substrate Format Marker (storage-format axis — distinct from SCHEMA_VERSION)
@@ -115,6 +117,15 @@ pub const MAX_DOMAIN_TAGS: usize = 50;
 
 /// Maximum length of a single domain tag.
 pub const MAX_TAG_LENGTH: usize = 100;
+
+/// Maximum number of key-value tags per experience.
+pub const MAX_KV_TAGS: usize = 50;
+
+/// Maximum length of a key-value tag key.
+pub const MAX_KV_TAG_KEY_LENGTH: usize = 100;
+
+/// Maximum length of a key-value tag value.
+pub const MAX_KV_TAG_VALUE_LENGTH: usize = 200;
 
 /// Maximum number of source files per experience.
 pub const MAX_SOURCE_FILES: usize = 100;
@@ -416,6 +427,33 @@ pub(crate) struct ExperienceV2 {
     pub source_agent: AgentId,
     pub source_task: Option<TaskId>,
     pub timestamp: Timestamp,
+    pub archived: bool,
+}
+
+/// Schema v3 experience record (for migration deserialization only).
+///
+/// This mirrors the exact postcard layout of `Experience` at schema v3:
+/// everything the current struct has **except** the `tags` field added in
+/// schema v4. Used by `migrate_experiences_v3_to_v4` to decode v3 records
+/// (which lack the trailing `tags` bytes postcard cannot tolerate as
+/// absent) and re-serialize as v4 with an empty `BTreeMap`.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ExperienceV3 {
+    pub id: ExperienceId,
+    pub collective_id: CollectiveId,
+    pub content: String,
+    #[serde(skip)]
+    pub embedding: Vec<f32>,
+    pub experience_type: ExperienceType,
+    pub importance: f32,
+    pub confidence: f32,
+    pub applications: BTreeMap<InstanceId, u32>,
+    pub domain: Vec<String>,
+    pub related_files: Vec<String>,
+    pub source_agent: AgentId,
+    pub source_task: Option<TaskId>,
+    pub timestamp: Timestamp,
+    pub last_reinforced: Timestamp,
     pub archived: bool,
 }
 
@@ -747,7 +785,7 @@ mod tests {
 
     #[test]
     fn test_schema_version() {
-        assert_eq!(SCHEMA_VERSION, 3);
+        assert_eq!(SCHEMA_VERSION, 4);
     }
 
     #[test]

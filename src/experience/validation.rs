@@ -16,8 +16,8 @@
 use crate::error::{PulseDBError, ValidationError};
 use crate::experience::types::{ExperienceType, ExperienceUpdate, NewExperience};
 use crate::storage::schema::{
-    MAX_CONTENT_SIZE, MAX_DOMAIN_TAGS, MAX_FILE_PATH_LENGTH, MAX_SOURCE_AGENT_LENGTH,
-    MAX_SOURCE_FILES, MAX_TAG_LENGTH,
+    MAX_CONTENT_SIZE, MAX_DOMAIN_TAGS, MAX_FILE_PATH_LENGTH, MAX_KV_TAG_KEY_LENGTH,
+    MAX_KV_TAG_VALUE_LENGTH, MAX_KV_TAGS, MAX_SOURCE_AGENT_LENGTH, MAX_SOURCE_FILES, MAX_TAG_LENGTH,
 };
 
 /// Validates a [`NewExperience`] before storage.
@@ -84,6 +84,39 @@ pub(crate) fn validate_new_experience(
                     i,
                     MAX_TAG_LENGTH,
                     tag.len()
+                ),
+            )
+            .into());
+        }
+    }
+
+    // Key-value tags: count limit
+    if exp.tags.len() > MAX_KV_TAGS {
+        return Err(ValidationError::too_many_items("tags", exp.tags.len(), MAX_KV_TAGS).into());
+    }
+
+    // Key-value tags: key and value length limits
+    for (key, value) in &exp.tags {
+        if key.len() > MAX_KV_TAG_KEY_LENGTH {
+            return Err(ValidationError::invalid_field(
+                "tags",
+                format!(
+                    "key {:?} exceeds max length of {} chars (got {})",
+                    key,
+                    MAX_KV_TAG_KEY_LENGTH,
+                    key.len()
+                ),
+            )
+            .into());
+        }
+        if value.len() > MAX_KV_TAG_VALUE_LENGTH {
+            return Err(ValidationError::invalid_field(
+                "tags",
+                format!(
+                    "value for key {:?} exceeds max length of {} chars (got {})",
+                    key,
+                    MAX_KV_TAG_VALUE_LENGTH,
+                    value.len()
                 ),
             )
             .into());
@@ -208,6 +241,39 @@ pub(crate) fn validate_experience_update(update: &ExperienceUpdate) -> Result<()
         }
     }
 
+    // Key-value tags
+    if let Some(ref tags) = update.tags {
+        if tags.len() > MAX_KV_TAGS {
+            return Err(ValidationError::too_many_items("tags", tags.len(), MAX_KV_TAGS).into());
+        }
+        for (key, value) in tags {
+            if key.len() > MAX_KV_TAG_KEY_LENGTH {
+                return Err(ValidationError::invalid_field(
+                    "tags",
+                    format!(
+                        "key {:?} exceeds max length of {} chars (got {})",
+                        key,
+                        MAX_KV_TAG_KEY_LENGTH,
+                        key.len()
+                    ),
+                )
+                .into());
+            }
+            if value.len() > MAX_KV_TAG_VALUE_LENGTH {
+                return Err(ValidationError::invalid_field(
+                    "tags",
+                    format!(
+                        "value for key {:?} exceeds max length of {} chars (got {})",
+                        key,
+                        MAX_KV_TAG_VALUE_LENGTH,
+                        value.len()
+                    ),
+                )
+                .into());
+            }
+        }
+    }
+
     // Related files
     if let Some(ref files) = update.related_files {
         if files.len() > MAX_SOURCE_FILES {
@@ -283,6 +349,7 @@ mod tests {
             importance: 0.5,
             confidence: 0.5,
             domain: vec!["rust".into()],
+            tags: std::collections::BTreeMap::new(),
             related_files: vec!["src/main.rs".into()],
             source_agent: AgentId::new("agent-1"),
             source_task: None,

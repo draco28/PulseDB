@@ -218,6 +218,13 @@ pub struct Experience {
     /// Domain tags for categorical filtering (e.g., ["rust", "async"]).
     pub domain: Vec<String>,
 
+    /// Key-value tags for structured filtering (e.g., {"entity.type": "person"}).
+    ///
+    /// Orthogonal to `domain` — flat categorical filtering stays; key-value
+    /// tags are additive and enable exact-match subset predicates in
+    /// [`SearchFilter`](crate::SearchFilter).
+    pub tags: BTreeMap<String, String>,
+
     /// Related source file paths.
     pub related_files: Vec<String>,
 
@@ -286,6 +293,9 @@ pub struct NewExperience {
     /// Domain tags for categorical filtering.
     pub domain: Vec<String>,
 
+    /// Key-value tags for structured filtering (default empty).
+    pub tags: BTreeMap<String, String>,
+
     /// Related source file paths.
     pub related_files: Vec<String>,
 
@@ -306,6 +316,7 @@ impl Default for NewExperience {
             importance: 0.5,
             confidence: 0.5,
             domain: Vec::new(),
+            tags: BTreeMap::new(),
             related_files: Vec::new(),
             source_agent: AgentId::new("anonymous"),
             source_task: None,
@@ -331,6 +342,9 @@ pub struct ExperienceUpdate {
 
     /// Replace domain tags entirely.
     pub domain: Option<Vec<String>>,
+
+    /// Replace key-value tags entirely.
+    pub tags: Option<BTreeMap<String, String>>,
 
     /// Replace related files entirely.
     pub related_files: Option<Vec<String>>,
@@ -522,6 +536,7 @@ mod tests {
             confidence: 0.9,
             applications: BTreeMap::from([(InstanceId::new(), 5)]),
             domain: vec!["rust".into(), "safety".into()],
+            tags: BTreeMap::from([("entity.type".into(), "person".into())]),
             related_files: vec!["src/main.rs".into()],
             source_agent: AgentId::new("agent-1"),
             source_task: Some(TaskId::new("task-42")),
@@ -547,6 +562,7 @@ mod tests {
         assert_eq!(exp.applications, restored.applications);
         assert_eq!(exp.applications(), restored.applications());
         assert_eq!(exp.domain, restored.domain);
+        assert_eq!(exp.tags, restored.tags);
         assert_eq!(exp.related_files, restored.related_files);
         assert_eq!(exp.source_agent, restored.source_agent);
         assert_eq!(exp.source_task, restored.source_task);
@@ -567,6 +583,7 @@ mod tests {
             confidence: 0.5,
             applications: BTreeMap::new(),
             domain: vec![],
+            tags: BTreeMap::new(),
             related_files: vec![],
             source_agent: AgentId::new("a"),
             source_task: None,
@@ -602,6 +619,7 @@ mod tests {
         assert_eq!(ne.importance, 0.5);
         assert_eq!(ne.confidence, 0.5);
         assert!(ne.domain.is_empty());
+        assert!(ne.tags.is_empty());
         assert!(ne.related_files.is_empty());
         assert_eq!(ne.source_agent.as_str(), "anonymous");
         assert!(ne.source_task.is_none());
@@ -617,6 +635,7 @@ mod tests {
         assert!(update.importance.is_none());
         assert!(update.confidence.is_none());
         assert!(update.domain.is_none());
+        assert!(update.tags.is_none());
         assert!(update.related_files.is_none());
         assert!(update.archived.is_none());
     }

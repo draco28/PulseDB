@@ -3,10 +3,12 @@
 //! [`SearchFilter`] provides a composable way to filter experiences across
 //! different query types (recent, similarity, context candidates). Filters
 //! are applied as post-filters after the primary retrieval (timestamp scan
-//! or HNSW search).
+//! or HNSW search), except `tags_all` which — when supported — is pushed
+//! into the vector index as a native traversal filter (filtered ANN).
 
 use crate::experience::{Experience, ExperienceType};
 use crate::types::Timestamp;
+use std::collections::BTreeMap;
 
 /// Filter criteria for experience search operations.
 ///
@@ -37,6 +39,14 @@ pub struct SearchFilter {
     /// `None` means no domain filtering. An empty `Some(vec![])` matches nothing.
     pub domains: Option<Vec<String>>,
 
+    /// Only include experiences whose key-value tags contain **all** the given
+    /// key=value pairs (exact-match subset).
+    ///
+    /// `None` means no tag filtering. An empty `Some(map)` matches everything
+    /// (vacuously true — no pairs to require). Orthogonal to `domains`:
+    /// flat categorical filtering stays; key-value tags are additive.
+    pub tags_all: Option<BTreeMap<String, String>>,
+
     /// Only include experiences of these types.
     ///
     /// Matching is done on the type discriminant (tag), not the associated data.
@@ -60,6 +70,7 @@ impl Default for SearchFilter {
     fn default() -> Self {
         Self {
             domains: None,
+            tags_all: None,
             experience_types: None,
             min_importance: None,
             min_confidence: None,
@@ -84,6 +95,17 @@ impl SearchFilter {
                 .iter()
                 .any(|d| domains.iter().any(|f| f == d));
             if !has_match {
+                return false;
+            }
+        }
+
+        // Check key-value tags (exact-match subset: experience must have all
+        // given key=value pairs). An empty predicate matches everything.
+        if let Some(ref required) = self.tags_all {
+            let has_all = required
+                .iter()
+                .all(|(k, v)| experience.tags.get(k) == Some(v));
+            if !has_all {
                 return false;
             }
         }
@@ -143,6 +165,7 @@ mod tests {
             confidence: 0.8,
             applications: std::collections::BTreeMap::new(),
             domain: vec!["rust".to_string(), "testing".to_string()],
+            tags: std::collections::BTreeMap::new(),
             related_files: vec![],
             source_agent: AgentId::new("agent-1"),
             source_task: None,
@@ -258,5 +281,109 @@ mod tests {
 
         let exp = test_experience(); // domain: ["rust", "testing"], importance: 0.5, confidence: 0.8
         assert!(filter.matches(&exp));
+    }
+
+    #[test]
+    fn test_tags_all_filter_matches_subset() {
+        let mut exp = test_experience();
+        exp.tags = std::collections::BTreeMap::from([
+            ("entity.type".to_string(), "person".to_string()),
+            ("entity.id".to_string(), "u-42".to_string()),
+        ]);
+
+        // Experience has all required key=value pairs → matches
+        let filter = SearchFilter {
+            tags_all: Some(std::collections::BTreeMap::from([
+                ("entity.type".to_string(), "person".to_string()),
+            ])),
+            ..SearchFilter::default()
+        };
+        assert!(filter.matches(&exp));
+
+        // Multiple pairs, all present → matches
+        let filter_multi = SearchFilter {
+            tags_all: Some(std::collections::BTreeMap::from([
+                ("entity.type".to_string(), "person".to_string()),
+                ("entity.id".to_string(), "u-42".to_string()),
+            ])),
+            ..SearchFilter::default()
+        };
+        assert!(filter_multi.matches(&exp));
+    }
+
+    #[test]
+    fn test_tags_all_filter_rejects_mismatch() {
+        let mut exp = test_experience();
+        exp.tags = std::collections::BTreeMap::from([
+            ("entity.type".to_string(), "person".to_string()),
+        ]);
+
+        // Wrong value → no match
+        let filter = SearchFilter {
+            tags_all: Some(std::collections::BTreeMap::from([
+                ("entity.type".to_string(), "organization".to_string()),
+            ])),
+            ..SearchFilter::default()
+        };
+        assert!(!filter.matches(&exp));
+
+        // Missing key entirely → no match
+        let filter_missing = SearchFilter {
+            tags_all: Some(std::collections::BTreeMap::from([
+                ("entity.id".to_string(), "u-42".to_string()),
+            ])),
+            ..SearchFilter::default()
+        };
+        assert!(!filter_missing.matches(&exp));
+    }
+
+    #[test]
+    fn test_tags_all_empty_predicate_matches_all() {
+        let exp = test_experience(); // no tags
+
+        // An empty tags_all predicate vacuously matches everything
+        let filter = SearchFilter {
+            tags_all: Some(std::collections::BTreeMap::new()),
+            ..SearchFilter::default()
+        };
+        assert!(filter.matches(&exp));
+    }
+
+    #[test]
+    fn test_tags_all_none_means_no_filter() {
+        let exp = test_experience(); // no tags
+        let filter = SearchFilter {
+            tags_all: None,
+            ..SearchFilter::default()
+        };
+        assert!(filter.matches(&exp));
+    }
+
+    #[test]
+    fn test_tags_and_domain_combined() {
+        let mut exp = test_experience();
+        exp.tags = std::collections::BTreeMap::from([
+            ("status".to_string(), "active".to_string()),
+        ]);
+
+        // Both domain and tags must match
+        let filter = SearchFilter {
+            domains: Some(vec!["rust".to_string()]),
+            tags_all: Some(std::collections::BTreeMap::from([
+                ("status".to_string(), "active".to_string()),
+            ])),
+            ..SearchFilter::default()
+        };
+        assert!(filter.matches(&exp));
+
+        // Domain matches but tag does not
+        let filter_tag_fail = SearchFilter {
+            domains: Some(vec!["rust".to_string()]),
+            tags_all: Some(std::collections::BTreeMap::from([
+                ("status".to_string(), "archived".to_string()),
+            ])),
+            ..SearchFilter::default()
+        };
+        assert!(!filter_tag_fail.matches(&exp));
     }
 }
