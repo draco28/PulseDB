@@ -55,13 +55,14 @@
 //! - Over-fetch is expected to dominate added cost; energy exp() is isolated in
 //!   rerank_microbench to confirm it is negligible beside vector retrieval.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use pulsedb::{
     CollectiveId, Config, NewExperience, PulseDB, RecallWeights, SearchFilter, SearchOptions,
     Timestamp,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;

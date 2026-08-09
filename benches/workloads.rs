@@ -5,9 +5,10 @@
 //! Simulates mixed read/write workloads typical of agentic AI systems:
 //! - 80% reads (search_similar) / 20% writes (record_experience)
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use pulsedb::{CollectiveId, Config, NewExperience, PulseDB};
 use std::cell::Cell;
+use std::hint::black_box;
 use tempfile::tempdir;
 
 /// Default embedding dimension (D384).
