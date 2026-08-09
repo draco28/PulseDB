@@ -658,7 +658,7 @@ fn compute_fingerprint(model_bytes: &[u8], tokenizer_bytes: &[u8]) -> String {
     hasher.update(model_bytes);
     hasher.update((tokenizer_bytes.len() as u64).to_be_bytes());
     hasher.update(tokenizer_bytes);
-    format!("{:x}", hasher.finalize())
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Downloads a file from a URL to a local path.
