@@ -1,0 +1,64 @@
+project: PulseDB
+platform: github
+imagemagick: true
+video_evidence: false
+
+environments:
+  local:
+    url: "in-process (embedded library — no URL; tests run via cargo test)"
+    restrictions: []
+
+default_target: local
+
+auth:
+  method: none
+  provider: none
+
+personas:
+  - name: consumer
+    description: 'A downstream consumer (e.g. PulseHive) using the pulsedb crate as a library'
+    email: n/a
+    credentials_source: none
+    test_focus: ['core-lifecycle', 'embedding-injection', 'cross-provider-prevention', 'insights', 'search', 'decay', 'sync']
+    cannot_do: []
+  - name: read-only
+    description: 'A read-only consumer (e.g. PulseVision) opening a store without write intent'
+    email: n/a
+    credentials_source: none
+    test_focus: ['read-only-open', 'search', 'metadata']
+    cannot_do: ['write', 'record', 'stamp']
+
+apps:
+  library:
+    path_patterns:
+      - "src/**"
+      - "Cargo.toml"
+      - "tests/**"
+    skill: qa-library
+    test_tool: cargo-test
+    build_command: "cargo build"
+    features:
+      - name: default
+        flag: ""
+      - name: builtin-embeddings
+        flag: "--features builtin-embeddings"
+      - name: sync
+        flag: "--features sync"
+      - name: sync-http
+        flag: "--features sync-http"
+      - name: sync-websocket
+        flag: "--features sync-websocket"
+
+feature_flags:
+  provider: none
+  dashboard_url: none
+  how_to_override: 'N/A — Cargo features only'
+
+integrations: {}
+
+cleanup:
+  auto_cleanup: true
+  strategy: none
+  instructions: 'Tests use tempfile::TempDir which is auto-cleaned on drop'
+
+failure_learning: suggest_in_report
