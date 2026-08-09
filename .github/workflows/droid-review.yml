@@ -30,6 +30,9 @@ jobs:
           fetch-depth: 1
 
       - name: Run Droid Auto Review + Security Review
+        # Skip for Dependabot PRs: the droid-action blocks bot-initiated
+        # workflows, and Dependabot PRs are version bumps (no code to review).
+        if: github.event.pull_request.user.login != 'dependabot[bot]'
         uses: Factory-AI/droid-action@e5ae50268211d2e9ac85edb57c28bf253b6627f7 # v6
         with:
           factory_api_key: ${{ secrets.FACTORY_API_KEY }}
@@ -37,3 +40,7 @@ jobs:
           automatic_security_review: true
           review_model: glm-5.2
           reasoning_effort: high
+
+      - name: Skip review for Dependabot
+        if: github.event.pull_request.user.login == 'dependabot[bot]'
+        run: echo "Skipping code review for Dependabot PR — version bumps only, no code changes to review."
