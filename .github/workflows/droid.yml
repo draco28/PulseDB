@@ -6,11 +6,15 @@ on:
   pull_request_review_comment:
     types: [created]
   issues:
-    types: [opened, assigned]
+    types: [opened]
   pull_request_review:
     types: [submitted]
   pull_request:
     types: [opened, edited]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.issue.number || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   droid:
