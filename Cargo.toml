@@ -113,7 +113,7 @@ sha2 = "0.10"
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "gzip"] }
 
 # Optional: WebSocket transport for sync protocol
-tokio-tungstenite = { version = "0.24", optional = true }
+tokio-tungstenite = { version = "0.30", optional = true }
 
 [dev-dependencies]
 # Testing utilities
