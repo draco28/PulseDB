@@ -841,3 +841,5 @@ mod tests {
         assert!(err.is_storage());
     }
 }
+
+// trace-probe: exercise the review agent end-to-end (langfuse acceptance)
