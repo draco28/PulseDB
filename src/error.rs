@@ -841,3 +841,5 @@ mod tests {
         assert!(err.is_storage());
     }
 }
+
+// pricing-probe: verify custom model pricing on traced CI runs
