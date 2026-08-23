@@ -102,3 +102,14 @@ The losing candidates each fail a hard requirement: **bitcode** disqualifies its
 - postcard crate — https://crates.io/crates/postcard (1.1.3)
 - Code: `src/storage/redb.rs` (storage codec) · `src/storage/legacy_bincode.rs` (vendored decode) · `src/sync/transport_http.rs` + `src/sync/server.rs` (sync wire)
 - Prior storage ADR: [ADR-001-redb-for-storage.md](ADR-001-redb-for-storage.md)
+
+### Verified claims
+
+- On-disk + wire format claims: verified by the golden-fixture upgrade tests (`tests/storage_format_upgrade.rs`) against real v0.5.1 / v0.4.0 stores.
+- postcard `=1.1.3` resolves in the shipped dependency set; `cargo deny` green with bincode dropped.
+
+### Unverified claims
+
+- Maintenance/census figures in the alternatives table (download counts, 0-RUSTSEC status, release cadence) are research facts as of 2026-06, not re-verified at adoption 2026-08-23.
+
+<!-- Appended at ossify adoption smoke pass, 2026-08-23 -->

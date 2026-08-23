@@ -1,6 +1,6 @@
 # Public Boundary
 
-This repository (`pulseai-labs/PulseDB`) is the **public, open-source** home of the `pulsehive-db` crate. This document states what belongs in public and what must stay internal, so contributors and AI tooling never leak private material into a published artifact.
+This repository (`pulseai-labs/PulseDB`) is the **public, open-source** home of the `pulsehive-db` crate (posture: **fully-open**, ADR-013 — planning and internal docs stay in the private AI workspace). This document states what belongs in public and what must stay internal, so contributors and AI tooling never leak private material into a published artifact.
 
 ## What is public (intentionally)
 
@@ -28,3 +28,19 @@ PulseDB is designed as a substrate that other systems build on. The only downstr
 ## If something leaked
 
 Treat any secret that reached git history as **compromised**: rotate it immediately (do not rely on a force-push to erase it). For an accidental disclosure of private material, open a private report per [SECURITY.md](SECURITY.md).
+
+## Machine-checkable rules
+<!-- Executed by the release-close boundary audit at every release close. -->
+never-tracked: **/.env, **/.env.*, **/*.pem, **/*.key, **/id_rsa*
+never-tracked: **/secrets/**, **/credentials.json
+never-tracked: **/SPEC.md, docs/planning/**
+never-tracked: **/CLAUDE.md, **/AGENTS.md
+fixtures-must-be: synthetic
+
+## Working-tree hygiene allowlist
+<!-- Classes of untracked sensitive files known to exist in local clones,
+     named by PATTERN only — never by content description. -->
+- `SPEC.md` (untracked, gitignored)
+- `.env*` (untracked, gitignored)
+
+<!-- Blocks appended at ossify adoption (posture block §6), 2026-08-23 -->

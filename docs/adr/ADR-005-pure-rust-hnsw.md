@@ -96,3 +96,15 @@ For MVP: scalar-only (no SIMD feature flags). At 100K vectors with M=16, search 
 - [hnsw_rs on crates.io](https://crates.io/crates/hnsw_rs) — Crate page
 - [hnsw_rs on GitHub](https://github.com/jean-pierreBoth/hnswlib-rs) — Source with benchmarks
 - [ann-benchmarks](https://github.com/erikbern/ann-benchmarks) — Standard ANN evaluation methodology
+
+### Verified claims
+
+- hnsw_rs 0.3 in the shipped dependency set; filtered traversal (`search_filter`) exercised by the tag-filtered ANN tests (v0.7.0).
+- ANN latency at PulseDB's own scale: measured by the NFR-018 bench at literal 1M (P99 8.7–9.35 ms ≤ 50 ms).
+
+### Unverified claims
+
+- The SIFT1M / Fashion-MNIST throughput and recall tables above are vendor-reported figures, not reproduced locally. The project's own 1M measurement supersedes them for the load-bearing claim.
+- The NFR-018 `<50 ms P99 @1M` budget is measured but has **no CI enforcement** (printed marker, not an assert — tracked as tech-debt #19).
+
+<!-- Appended at ossify adoption smoke pass, 2026-08-23 -->
