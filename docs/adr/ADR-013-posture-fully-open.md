@@ -9,7 +9,7 @@ PulseDB is public (crates.io `pulsehive-db`, public GitHub repo) under AGPL-3.0-
 
 ## Decision
 
-**Posture: fully-open.** All code open; **no functionality moat** — the moat inventory is deliberately empty. What is private is *doc routing*, which is artifact routing, not a moat: planning, specs and the memory bank live in the private AI workspace; this ADR series and user-facing docs are the public exception. Revenue intent `license` rides the existing AGPL + commercial dual-license; the license is the revenue mechanism, no private channel required.
+**Posture: fully-open.** All code open; **no functionality moat** — the moat inventory is deliberately empty. What is private is *doc routing*, which is artifact routing, not a moat: internal planning (specs-in-progress, sprint slices, the memory bank) lives in the private AI workspace; this ADR series, user-facing docs, and the public product-facing roadmap (`ROADMAP.md`, indexed from `docs/README.md`) are the public exception. Revenue intent `license` rides the existing AGPL + commercial dual-license; the license is the revenue mechanism, no private channel required.
 
 Channel: **none** (inventory empty, C0). The gitignored `SPEC.md` pattern in the public working tree stays covered by `.gitignore` + the `PUBLIC_BOUNDARY.md` never-tracked rules — hygiene, not a moat.
 
