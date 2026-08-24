@@ -3844,8 +3844,10 @@ fn f32_slice_to_bytes(data: &[f32]) -> Vec<u8> {
 /// Converts raw little-endian bytes back to a Vec<f32>.
 #[inline]
 fn bytes_to_f32_vec(data: &[u8]) -> Vec<f32> {
-    data.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    data.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
