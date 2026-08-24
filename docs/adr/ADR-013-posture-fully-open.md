@@ -5,11 +5,11 @@
 
 ## Context
 
-PulseDB is public (crates.io `pulsehive-db`, public GitHub repo) under AGPL-3.0-only + commercial dual-license. The operator's settled position: **PulseDB is infrastructure, not the product** — the products built on it (PulseHive, PulseBase, …) are the main products. PulseDB therefore stays open source on its current license and keeps publishing to crates.io; the **planning and internal docs always stay private** in the AI-workspace repo.
+PulseDB is public (crates.io `pulsehive-db`, public GitHub repo) under AGPL-3.0-only + commercial dual-license. The operator's settled position: **PulseDB is infrastructure, not a product line** — what downstream systems build on it is where productization happens. PulseDB therefore stays open source on its current license and keeps publishing to crates.io; the **planning and internal docs always stay private** in the AI-workspace repo.
 
 ## Decision
 
-**Posture: fully-open.** All code open; **no functionality moat** — the moat inventory is deliberately empty. What is private is *doc routing*, which is artifact routing, not a moat: planning, specs, memory bank and decision records live in the private AI workspace; only user-facing docs publish. Revenue intent `license` rides the existing AGPL + commercial dual-license; the license is the revenue mechanism, no private channel required.
+**Posture: fully-open.** All code open; **no functionality moat** — the moat inventory is deliberately empty. What is private is *doc routing*, which is artifact routing, not a moat: planning, specs and the memory bank live in the private AI workspace; this ADR series and user-facing docs are the public exception. Revenue intent `license` rides the existing AGPL + commercial dual-license; the license is the revenue mechanism, no private channel required.
 
 Channel: **none** (inventory empty, C0). The gitignored `SPEC.md` pattern in the public working tree stays covered by `.gitignore` + the `PUBLIC_BOUNDARY.md` never-tracked rules — hygiene, not a moat.
 
@@ -25,7 +25,7 @@ Revisit when the first commercial license is negotiated, or if a revenue intent 
 
 ### Verified claims
 
-- Operator intent stated 2026-08-23 (recorded in `ADOPTION.md`): keep public + crates.io, current license, planning docs private.
+- Operator intent stated 2026-08-23 at the adoption review: keep public + crates.io, current license, planning docs private.
 - License: AGPL-3.0-only + commercial (`LICENSING.md`, `Cargo.toml`).
 - `SPEC.md` gitignored-but-present in the public working tree (verified 2026-08-23).
 

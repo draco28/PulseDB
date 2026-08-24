@@ -9,7 +9,7 @@ PulseDB's guiding principle is "Storage, not Intelligence" with a "sync core, as
 
 ## Decision
 
-The crate is a layered library: **public API** (`lib.rs`, `db.rs`) → **core services** (experience, search, relation, insight, activity, watch, substrate, sync) → **storage** (redb) and **vector index** (hnsw_rs), both behind internal port traits (`StorageBackend`, `VectorIndex`). The interior is synchronous; async exists only at the edges — the watch streams and the `#[async_trait] SubstrateProvider`. Dependency direction points inward: services never depend on a concrete engine, only on the ports.
+The crate is a layered library: **public API** (`lib.rs`, `db.rs`) → **core services** (experience, search, relation, insight, activity, watch, substrate, sync) → **storage** (redb) and **vector index** (hnsw_rs), both behind internal port traits (`StorageEngine`; `VectorIndex` for the index). The interior is synchronous; async exists only at the edges — the watch streams, the `#[async_trait] SubstrateProvider`, and the (feature-gated, off-by-default) `sync` transport/manager, which is async end to end and counts as an edge when enabled. Dependency direction points inward: services never depend on a concrete **storage** engine, only on the port. (The vector index is *currently* wired concretely — `PulseDB` holds `HnswIndex` directly rather than `dyn VectorIndex`; the port exists but full dyn wiring is an aspiration, not shipped.).
 
 ## Consequences
 
@@ -23,7 +23,8 @@ Revisit when a second consumer runtime (bindings or server) forces a seam rethin
 
 ### Verified claims
 
-- Port traits and layering exist in the shipped crate (`src/storage`, `src/vector`, `src/substrate`); async confined to watch + substrate surfaces.
+- `StorageEngine` port and layering exist in the shipped crate (`src/storage`, `src/substrate`).
+- Known gap (honest record): vector access is concrete today (`HnswIndex` held directly in `src/db.rs`), and the `sync` feature is an async edge — see Decision.
 
 ### Unverified claims
 

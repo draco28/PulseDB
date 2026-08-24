@@ -31,10 +31,10 @@ Treat any secret that reached git history as **compromised**: rotate it immediat
 
 ## Machine-checkable rules
 <!-- Executed by the release-close boundary audit at every release close. -->
-never-tracked: **/.env, **/.env.*, **/*.pem, **/*.key, **/id_rsa*
+never-tracked: **/.env, **/.env.*, **/*.pem, **/*.key, **/*.p12, **/*.pfx, **/*.secret, **/secrets.*, **/id_rsa*, **/id_ed25519*, **/.secrets/**
 never-tracked: **/secrets/**, **/credentials.json
 never-tracked: **/SPEC.md, docs/planning/**
-never-tracked: **/CLAUDE.md, **/AGENTS.md
+never-tracked: **/CLAUDE.md, **/AGENTS.md, **/.claude/**, **/.mcp.json, **/.opencode/**
 fixtures-must-be: synthetic
 
 ## Working-tree hygiene allowlist
