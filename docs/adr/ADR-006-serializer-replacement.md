@@ -14,6 +14,8 @@
 > decision remains provisional until **VS-4.0.4's real-v0.5.1 golden-fixture** test passes against a real
 > prior-release on-disk store; a vendored-decoder defect surfaced there blocks the sprint→main PR.
 >
+> **Update (2026-08-24): the provisional gate has PASSED** — `tests/storage_format_upgrade.rs` runs against the checked-in real v0.5.1 and v0.4.0 stores on `main`. The gate is discharged; this ADR is unconditionally Accepted.
+>
 > **Provenance:** decision produced by a per-serializer research fan-out (postcard / bitcode / rkyv + a
 > cross-cutting RUSTSEC pass) and **adversarially verified** — a skeptic tried to refute postcard on every
 > gating axis and each refutation failed (`refuted=false`, confidence **HIGH**). Scores: postcard **9**,
@@ -105,7 +107,7 @@ The losing candidates each fail a hard requirement: **bitcode** disqualifies its
 
 ### Verified claims
 
-- On-disk format claims: verified by the golden-fixture upgrade tests (`tests/storage_format_upgrade.rs`) against real v0.5.1 / v0.4.0 stores.
+- On-disk format claims: verified by the golden-fixture upgrade tests (`tests/storage_format_upgrade.rs`) against real v0.5.1 / v0.4.0 stores, for the axes those fixtures cover (v0.5.1: collective + experience + embeddings + indices, schema-v3; v0.4.0: all three axes). Entity kinds outside the fixtures (activities, decay configs, sync cursors) are covered by representative synthetic-store migration tests, not by the real fixtures.
 - postcard `=1.1.3` resolves in the shipped dependency set; `cargo deny` green with bincode dropped.
 
 ### Unverified claims

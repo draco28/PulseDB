@@ -27,7 +27,7 @@ Revisit when the first commercial license is negotiated, or if a revenue intent 
 
 - Operator intent stated 2026-08-23 at the adoption review: keep public + crates.io, current license, planning docs private.
 - License: AGPL-3.0-only + commercial (`LICENSING.md`, `Cargo.toml`).
-- `SPEC.md` gitignored-but-present in the public working tree (verified 2026-08-23).
+- `SPEC.md` is covered by a `.gitignore` pattern plus the `never-tracked: **/SPEC.md` machine rule (presence in any given working tree is a local state, not a repo claim).
 
 ### Unverified claims
 

@@ -17,7 +17,7 @@ This directory contains Architecture Decision Records (ADRs) documenting key tec
 | [ADR-009](ADR-009-trust-boundary-file-system-only.md) | Trust boundary: FS + public API | Accepted | 2026-08-23 | FS-only on default builds; sync-http adds a wire boundary |
 | [ADR-010](ADR-010-failure-visibility-via-tracing-crate.md) | Failure visibility via tracing | Accepted | 2026-08-23 | Instrumented spans; error-level events not systematic |
 | [ADR-011](ADR-011-rollback-via-semver-major-bumps-and-backup-before-migrate.md) | Rollback via backup-before-migrate | Accepted | 2026-08-23 | Format changes back up first; codec-leg exception documented |
-| [ADR-012](ADR-012-privacy-posture-no-consumer-data-collected.md) | No telemetry / consumer data | Accepted | 2026-08-23 | No phone-home; model auto-download is the one exception |
+| [ADR-012](ADR-012-privacy-posture-no-consumer-data-collected.md) | No telemetry / consumer data | Accepted | 2026-08-23 | No phone-home; two consumer-configured outbound paths (model download, sync egress) |
 | [ADR-013](ADR-013-posture-fully-open.md) | Posture: fully-open, private doc routing | Accepted | 2026-08-23 | No moat; planning docs stay in the private AI workspace |
 | [ADR-014](ADR-014-layered-sync-core-with-port-traits.md) | Layered sync core, port traits | Accepted | 2026-08-23 | StorageEngine port; vector wiring concrete today (recorded gap) |
 

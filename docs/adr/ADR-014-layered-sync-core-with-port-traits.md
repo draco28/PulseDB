@@ -13,7 +13,7 @@ The crate is a layered library: **public API** (`lib.rs`, `db.rs`) → **core se
 
 ## Consequences
 
-- Engine swaps (a second storage backend, a different HNSW) are interior changes; the public API and `SubstrateProvider` contract hold.
+- Storage-engine swaps are interior changes (the `StorageEngine` port is fully dyn-wired); a vector-engine swap additionally requires reworking the concrete `HnswIndex` wiring in `src/db.rs` (see Decision gap). The public API and `SubstrateProvider` contract hold either way.
 - Adding a second consumer runtime (Python bindings, a server) extends an edge rather than piercing the core.
 - Any new async in the interior is a boundary violation, not a convenience.
 
