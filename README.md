@@ -6,7 +6,7 @@ An embedded database purpose-built for agentic AI systems.
 [![Crates.io](https://img.shields.io/crates/v/pulsehive-db)](https://crates.io/crates/pulsehive-db)
 [![docs.rs](https://docs.rs/pulsehive-db/badge.svg)](https://docs.rs/pulsehive-db)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.89-blue)](Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.90-blue)](Cargo.toml)
 
 **Collective memory for AI agents.** Not message passing. Not RAG. A purpose-built embedded database for multi-agent coordination.
 
@@ -201,7 +201,7 @@ It is a **read-only review tool** — it never archives anything. Auto-archive i
 
 ## Minimum Supported Rust Version
 
-The current MSRV is **1.89**. This is verified in CI on every commit.
+The current MSRV is **1.90**. This is verified in CI on every commit.
 
 ## Contributing
 

@@ -2,7 +2,7 @@
 name = "pulsehive-db"
 version = "0.7.0"
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.90"
 authors = ["PulseDB Team"]
 description = "Embedded database for agentic AI systems — collective memory for multi-agent coordination"
 license = "AGPL-3.0-only"

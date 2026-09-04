@@ -135,10 +135,12 @@ jobs:
         run: cargo test --features fault-injection --test storage_migration_fault_injection -- --test-threads=1
 
   # ─────────────────────────────────────────────
-  # Job 3: MSRV verification (Rust 1.89)
+  # Job 3: MSRV verification — toolchain below must match `rust-version` in
+  # Cargo.toml. The job name is version-agnostic so bumps need no branch-
+  # protection edit.
   # ─────────────────────────────────────────────
   test-msrv:
-    name: MSRV (Rust 1.89)
+    name: MSRV
     needs: lint
     runs-on: ubuntu-latest
     steps:
@@ -146,7 +148,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.89"
+          toolchain: "1.90"
 
       - uses: Swatinem/rust-cache@v2
         with:

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **MSRV 1.89 → 1.90.** Required by redb 4.2 (`rust-version = "1.90"`); the CI job is now named `MSRV` (version-agnostic). Recorded in ADR-008.
+
 ## [0.7.0] - 2026-08-09
 
 > **Sprint 4.3 — Substrate API Seams.** Three slices unblocking downstream consumer PulseBase: an embedding injection seam so embedded-Rust consumers drive embed-on-write, a provider identity that prevents cross-provider vector mixing on local write paths, and key-value tags with substrate-native filtered ANN search. Plus batch dependency bumps (thiserror 2, sha2 0.11, reqwest 0.13, tokio-tungstenite 0.29, criterion 0.8).
