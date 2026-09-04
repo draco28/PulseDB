@@ -35,3 +35,10 @@ PulseDB is pre-1.0; security fixes target the **latest published `0.x` release**
 ## Scope
 
 In scope: the `pulsehive-db` crate (storage, vector search, sync, embeddings) and its build/release pipeline. Out of scope: downstream products built on PulseDB, and issues requiring a compromised host or physical access.
+
+## Privacy posture
+
+PulseDB collects no telemetry and no consumer data. Two consumer-configured
+outbound paths exist (neither is automatic telemetry): the `builtin-embeddings`
+first-use model download from Hugging Face, and `sync-http` egress to a peer
+you configure. See ADR-012.

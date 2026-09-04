@@ -32,6 +32,8 @@ Thumbs.db
 /benches/results/
 
 # Secrets & credentials (never commit — push protection + gitleaks also guard these)
+secrets/
+docs/planning/
 *.pem
 *.key
 *.crt
