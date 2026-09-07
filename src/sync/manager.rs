@@ -218,15 +218,22 @@ impl SyncManager {
 
             let response = self.transport.pull_changes(pull_request).await?;
             let batch_size = response.changes.len();
+            let requested = position.sequence;
 
-            if batch_size > 0 {
-                applier
-                    .apply_batch(response.changes)?
-                    .record_into(&self.stats);
-            }
+            // Advance only as far as the applier actually got. `apply_batch`
+            // records a per-change failure instead of returning an error, so
+            // storing the server's position would step over a change that was
+            // never applied and never pull it again.
+            let next = if batch_size > 0 {
+                let result = applier.apply_batch(response.changes)?;
+                result.record_into(&self.stats);
+                result.safe_through.unwrap_or(requested)
+            } else {
+                response.new_cursor.sequence
+            };
 
             total_pulled += batch_size;
-            position = response.new_cursor;
+            position = SyncPosition::new(response.new_cursor.instance_id, next);
 
             // Save the pull position after each batch (crash-safe). Pull side
             // only — the push position is never touched here.
@@ -234,6 +241,18 @@ impl SyncManager {
 
             if let Some(ref cb) = progress {
                 cb.on_progress(batch_size, total_pulled, response.has_more);
+            }
+
+            // A batch whose first change failed leaves the position where it
+            // was. Re-requesting it would spin forever, so stop and let the
+            // next sync retry it.
+            if batch_size > 0 && next <= requested {
+                warn!(
+                    peer = %peer_id,
+                    position = requested,
+                    "Initial sync stopped: the batch could not be applied past its first change"
+                );
+                break;
             }
 
             if !response.has_more {
@@ -356,17 +375,22 @@ impl SyncManager {
         let response = self.transport.pull_changes(pull_request).await?;
         let count = response.changes.len();
 
-        if count > 0 {
-            applier
-                .apply_batch(response.changes)?
-                .record_into(&self.stats);
-        }
+        // Advance only as far as the applier got (see `initial_sync`): a change
+        // that failed to apply must stay ahead of the stored position so the
+        // next pull fetches it again.
+        let next = if count > 0 {
+            let result = applier.apply_batch(response.changes)?;
+            result.record_into(&self.stats);
+            result.safe_through.unwrap_or(pull_seq)
+        } else {
+            response.new_cursor.sequence
+        };
         // Persist on EVERY successful pull, empty batches included. The record
         // is what represents this peer in the cursor store, and `compact_wal`
         // needs to see its `push_sequence == 0` to stay blocked; a PullOnly
         // peer that never returns changes would otherwise have no record at
         // all, and compaction would delete events it has never been sent.
-        self.save_pull_position(peer_id, response.new_cursor.sequence)?;
+        self.save_pull_position(peer_id, next)?;
 
         Ok(count)
     }
@@ -500,14 +524,19 @@ impl SyncManager {
             let response = transport.pull_changes(pull_request).await?;
             let count = response.changes.len();
 
-            if count > 0 {
-                applier.apply_batch(response.changes)?.record_into(stats);
-            }
+            // Advance only as far as the applier got — see `pull_and_apply`.
+            let next = if count > 0 {
+                let result = applier.apply_batch(response.changes)?;
+                result.record_into(stats);
+                result.safe_through.unwrap_or(pull_seq)
+            } else {
+                response.new_cursor.sequence
+            };
             // Persist on every successful pull, empty included — see
             // `pull_and_apply`. Pull side only; the pusher owns the push
             // position.
             db.storage_for_test()
-                .update_pull_cursor(&peer_id, response.new_cursor.sequence)
+                .update_pull_cursor(&peer_id, next)
                 .map_err(|e| SyncError::transport(format!("cursor save: {}", e)))?;
         }
 

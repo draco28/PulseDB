@@ -941,3 +941,78 @@ async fn empty_pull_still_registers_the_peer_and_blocks_compaction() {
         "a peer at push_sequence 0 blocks compaction"
     );
 }
+
+/// The pull side must not step over a change that failed to apply. `apply_batch`
+/// records per-change failures rather than returning an error, so persisting the
+/// server's reported position would skip the failed sequence permanently.
+#[tokio::test]
+async fn pull_position_does_not_advance_past_a_change_that_failed_to_apply() {
+    use std::collections::BTreeMap;
+
+    use pulsedb::sync::transport::SyncTransport;
+    use pulsedb::sync::types::{
+        SerializableExperienceUpdate, SyncChange, SyncEntityType, SyncPayload,
+    };
+
+    let (db_a, _dir_a) = open_db();
+    let (transport_a, transport_b) = InMemorySyncTransport::new_pair();
+    let peer_of_a = transport_a.instance_id();
+    let cid = db_a.create_collective("pull-ack-bound").unwrap();
+    let exp_id = db_a.record_experience(minimal_exp(cid)).unwrap();
+
+    // A payload the applier refuses: more G-counter buckets than it accepts.
+    let mut buckets = BTreeMap::new();
+    for i in 0..=65_536u128 {
+        buckets.insert(
+            pulsedb::sync::types::InstanceId::from_bytes(i.to_le_bytes()),
+            1u32,
+        );
+    }
+
+    let change_at = |seq: u64, applications| SyncChange {
+        sequence: seq,
+        source_instance: peer_of_a,
+        collective_id: cid,
+        entity_type: SyncEntityType::Experience,
+        payload: SyncPayload::ExperienceUpdated {
+            id: exp_id,
+            update: SerializableExperienceUpdate {
+                applications,
+                ..Default::default()
+            },
+            timestamp: pulsedb::Timestamp::from_millis(0),
+        },
+        timestamp: pulsedb::Timestamp::now(),
+    };
+
+    // seq 7 applies, seq 8 is refused, seq 9 would apply.
+    transport_b
+        .push_changes(vec![
+            change_at(7, None),
+            change_at(8, Some(buckets)),
+            change_at(9, None),
+        ])
+        .await
+        .unwrap();
+
+    let mut manager_a = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(transport_a),
+        SyncConfig {
+            direction: SyncDirection::PullOnly,
+            ..sync_config()
+        },
+    );
+    manager_a.sync_once().await.unwrap();
+
+    let cursor = db_a
+        .storage_for_test()
+        .load_sync_cursor(&peer_of_a)
+        .unwrap()
+        .expect("the peer must be on record");
+    assert_eq!(
+        cursor.pull_sequence, 7,
+        "the pull position must stop at the last change that applied, so the \
+         refused one is fetched again rather than skipped forever"
+    );
+}
