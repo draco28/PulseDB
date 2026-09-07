@@ -685,7 +685,13 @@ fn real_v0_7_0_sync_cursor_store_upgrades_to_v5() {
 /// The v4→v5 cursor reset runs through a feature-independent raw helper: a build
 /// WITHOUT `sync` (where the cursor table type is cfg'd out) must still migrate
 /// the store to v5 and reset the row (AC-3 runs this under default features).
+///
+/// Gated to a non-`sync` build so it covers what its name promises. Under
+/// `--features sync` it would silently re-run
+/// `real_v0_7_0_sync_cursor_store_upgrades_to_v5`, and a regression in the
+/// non-sync leg would still show green.
 #[test]
+#[cfg(not(feature = "sync"))]
 fn real_v0_7_0_opens_without_sync_feature() {
     let manifest = load_manifest("real-v0.7.0.manifest.json");
     let (_tmp, store) = copy_fixture("real-v0.7.0.redb");

@@ -307,10 +307,12 @@ pub struct SyncStats {
     /// Number of applied changes whose incoming `last_reinforced` lay beyond
     /// `now + SyncConfig::max_clock_skew_ms` (#13).
     ///
-    /// Each one is logged at `warn` with the peer, the experience id and the
-    /// skew, and then merged **unchanged** — FR-031's max-merge is never
-    /// clamped, rejected or re-timestamped (r1 veto fold C2). The bound is
-    /// advisory until protocol v5 carries a record-level time reference.
+    /// Every one is merged **unchanged** — FR-031's max-merge is never clamped,
+    /// rejected or re-timestamped (r1 veto fold C2) — and a batch that carried
+    /// any is logged ONCE at `warn` with the peer, the count and the largest
+    /// skew seen. The log is per batch rather than per change because the
+    /// condition never self-clears while the peer's clock is wrong. The bound
+    /// is advisory until protocol v5 carries a record-level time reference.
     pub skewed_timestamps: u64,
 }
 

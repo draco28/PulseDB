@@ -573,9 +573,19 @@ pub trait StorageEngine: Send + Sync {
     #[cfg(feature = "sync")]
     fn remint_instance_id(&self) -> Result<crate::sync::InstanceId>;
 
-    /// Saves a sync cursor for a peer instance.
+    /// Replaces a peer's whole sync-cursor record.
     ///
-    /// Upserts the cursor in the `SYNC_CURSORS_TABLE`.
+    /// **This is a full-record replace, not a per-side update.** The record
+    /// carries both positions, so a caller that means to set only
+    /// `push_sequence` and leaves `pull_sequence` at its default silently
+    /// resets the pull position to 0 (and vice versa) — the two sides are owned
+    /// by different code paths and neither may clobber the other's half.
+    ///
+    /// Use [`update_push_cursor`](Self::update_push_cursor) or
+    /// [`update_pull_cursor`](Self::update_pull_cursor) to move one side: they
+    /// are single-transaction read-modify-writes and monotonic
+    /// non-decreasing. This method is for seeding or restoring a complete
+    /// record whose *both* positions the caller already knows.
     #[cfg(feature = "sync")]
     fn save_sync_cursor(&self, cursor: &crate::sync::SyncCursor) -> Result<()>;
 

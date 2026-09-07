@@ -3,7 +3,14 @@
 > Applies to the one-time **upgrade-on-open** migration that runs when an older PulseDB store is opened
 > by a newer binary. Covers the redb file-format upgrade (v2→v3), the value-codec cutover
 > (bincode→postcard, `SUBSTRATE_FORMAT` marker 1→2) and the logical-schema reshapes (v3→v4 tags,
-> v4→v5 sync-cursor split — see *Schema v5* below). Steady-state opens are unaffected.
+> v4→v5 sync-cursor split — see *Schema v5* below). A steady-state open performs **no migration
+> work**, but since 0.8.0 every **writable** open of an existing store first takes a bounded
+> read-only peek at the file — one `open_read_only`, the substrate marker and the metadata row, and a
+> metadata decode — to decide whether a pristine sidecar must be claimed before the writable open
+> rewrites the allocator pages. A current-schema (v5) store therefore pays that peek on every
+> writable open, then opens the file again to serve traffic. The peek is O(1) in store size and the
+> NFR-001 open budget (<100 ms) still applies; skipping it for a store already at the current schema
+> version is a tracked follow-up. A **read-only** open performs zero writes and never peeks.
 
 ## What happens on first open of an older store
 

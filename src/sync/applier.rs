@@ -18,7 +18,7 @@ use crate::types::Timestamp;
 use super::config::{ConflictResolution, SyncConfig};
 use super::error::SyncError;
 use super::guard::SyncApplyGuard;
-use super::types::{SyncChange, SyncPayload, SyncStats};
+use super::types::{InstanceId, SyncChange, SyncPayload, SyncStats};
 
 /// Upper bound on the number of per-instance buckets accepted in a single
 /// experience's `applications` G-counter from a remote peer. Each bucket is one
@@ -53,8 +53,10 @@ pub struct ApplyResult {
     /// Number of changes in this batch whose incoming `last_reinforced` lay
     /// beyond `now + SyncConfig::max_clock_skew_ms` (#13).
     ///
-    /// Detection only: each is logged at `warn` and then merged unchanged
-    /// (FR-031 max-merge, r1 veto fold C2). Never serialized on the wire.
+    /// Detection only: the batch is logged once at `warn` — carrying the peer,
+    /// this count and the largest skew observed — and every value is merged
+    /// unchanged (FR-031 max-merge, r1 veto fold C2). Never serialized on the
+    /// wire.
     pub skewed_timestamps: u64,
 }
 
@@ -98,13 +100,23 @@ impl RemoteChangeApplier {
         // rather than the highest, contradicting the field's contract.
         let mut halted = false;
 
+        // #13 skew is reported ONCE per batch, not once per change: the peer's
+        // clock does not self-correct (the value is deliberately merged
+        // unchanged), so a per-change `warn!` would emit up to `batch_size`
+        // lines per cycle, sustained, for as long as the peer is wrong. The
+        // batch summary carries the peer and the largest skew it sent.
+        let mut worst_skew: Option<(InstanceId, i64)> = None;
+
         for change in changes {
             let sequence = change.sequence;
             // #13: surface a skewed reinforcement timestamp BEFORE the apply,
             // so it is counted whatever the apply's outcome. Detection never
             // alters the change — it is applied exactly as received.
-            if self.detect_skew(&change) {
+            if let Some(skew_ms) = self.detect_skew(&change) {
                 result.skewed_timestamps += 1;
+                if worst_skew.is_none_or(|(_, worst_ms)| skew_ms > worst_ms) {
+                    worst_skew = Some((change.source_instance, skew_ms));
+                }
             }
             match self.apply_single(change) {
                 Ok(ApplyOutcome::Applied) => {
@@ -139,6 +151,16 @@ impl RemoteChangeApplier {
             }
         }
 
+        if let Some((peer, max_skew_ms)) = worst_skew {
+            warn!(
+                peer = %peer,
+                skewed_timestamps = result.skewed_timestamps,
+                max_skew_ms,
+                max_clock_skew_ms = self.config.max_clock_skew_ms,
+                "Incoming last_reinforced is beyond the clock-skew bound; merged unchanged (bound is advisory until protocol v5)"
+            );
+        }
+
         debug!(
             applied = result.applied,
             skipped = result.skipped,
@@ -152,44 +174,34 @@ impl RemoteChangeApplier {
 
     /// #13 (r1 veto fold C2) — skew **detection**, never correction.
     ///
-    /// Returns `true` when the change carries a reinforcement timestamp beyond
-    /// `now + max_clock_skew_ms` — at either apply site: the non-collision
-    /// create (`ExperienceCreated`, timestamp written as-is) and the counter
-    /// merge (`ExperienceCreated` collision or `ExperienceUpdated`, FR-031
-    /// max-merge). It logs the condition at `warn` with the peer, the
-    /// experience id and the skew, and leaves the change untouched: the merged
-    /// value stays byte-for-byte what max-merge produces, so convergence is
-    /// unaffected and the skew is visible in logs and [`SyncStats`] instead of
-    /// silently freezing decay. A bound that also corrects needs a
-    /// record-carried reference — protocol v5 (Release 2).
-    fn detect_skew(&self, change: &SyncChange) -> bool {
-        let (id, incoming) = match &change.payload {
-            SyncPayload::ExperienceCreated(experience) => {
-                (experience.id, experience.last_reinforced)
-            }
-            SyncPayload::ExperienceUpdated { id, update, .. } => match update.last_reinforced {
-                Some(incoming) => (*id, incoming),
-                None => return false,
-            },
-            _ => return false,
+    /// Returns `Some(skew_ms)` when the change carries a reinforcement
+    /// timestamp beyond `now + max_clock_skew_ms` — at either apply site: the
+    /// non-collision create (`ExperienceCreated`, timestamp written as-is) and
+    /// the counter merge (`ExperienceCreated` collision or `ExperienceUpdated`,
+    /// FR-031 max-merge) — and `None` otherwise. The change is left untouched:
+    /// the merged value stays byte-for-byte what max-merge produces, so
+    /// convergence is unaffected and the skew is visible in logs and
+    /// [`SyncStats`] instead of silently freezing decay. A bound that also
+    /// corrects needs a record-carried reference — protocol v5 (Release 2).
+    ///
+    /// **Detection does not log.** The condition never self-clears while the
+    /// peer's clock is wrong, so [`apply_batch`](Self::apply_batch) emits one
+    /// `warn!` summary per batch instead of one per change.
+    fn detect_skew(&self, change: &SyncChange) -> Option<i64> {
+        let incoming = match &change.payload {
+            SyncPayload::ExperienceCreated(experience) => experience.last_reinforced,
+            SyncPayload::ExperienceUpdated { update, .. } => update.last_reinforced?,
+            _ => return None,
         };
 
         let now_ms = Timestamp::now().as_millis();
         let allowance = i64::try_from(self.config.max_clock_skew_ms).unwrap_or(i64::MAX);
         let bound = now_ms.saturating_add(allowance);
         if incoming.as_millis() <= bound {
-            return false;
+            return None;
         }
 
-        warn!(
-            peer = %change.source_instance,
-            experience_id = %id,
-            incoming_last_reinforced_ms = incoming.as_millis(),
-            skew_ms = incoming.as_millis().saturating_sub(now_ms),
-            max_clock_skew_ms = self.config.max_clock_skew_ms,
-            "Incoming last_reinforced is beyond the clock-skew bound; merged unchanged (bound is advisory until protocol v5)"
-        );
-        true
+        Some(incoming.as_millis().saturating_sub(now_ms))
     }
 
     /// Applies a single remote change, returning the outcome.

@@ -190,9 +190,11 @@ pub struct SyncConfig {
     /// `last_reinforced` (#13).
     ///
     /// When a pulled or pushed reinforcement carries
-    /// `last_reinforced > now + max_clock_skew_ms`, the applier logs it at
-    /// `warn` (peer, experience id, skew) and counts it in
-    /// [`SyncStats::skewed_timestamps`](super::types::SyncStats::skewed_timestamps).
+    /// `last_reinforced > now + max_clock_skew_ms`, the applier counts it in
+    /// [`SyncStats::skewed_timestamps`](super::types::SyncStats::skewed_timestamps)
+    /// and logs the batch once at `warn` (peer, count, largest skew observed) —
+    /// once per batch, not once per change: the condition never self-clears
+    /// while the peer's clock is wrong.
     /// The value is still merged exactly as FR-031's max-merge dictates — it is
     /// **never** clamped, rejected or re-timestamped — so two peers keep
     /// converging on the same bytes.

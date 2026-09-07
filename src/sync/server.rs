@@ -125,12 +125,13 @@ impl SyncServer {
     }
 
     /// Handles a push request — applies remote changes locally.
-    #[instrument(skip(self, changes), fields(count = changes.len()))]
+    ///
     /// The acknowledged position is the highest sequence the applier handled
     /// safely, **not** the highest sequence received: the sender turns this
     /// into its `push_sequence`, and `compact_wal` deletes below it, so
     /// acknowledging a change that failed to apply would let the sender
     /// discard a WAL event this peer never stored.
+    #[instrument(skip(self, changes), fields(count = changes.len()))]
     pub fn handle_push(&self, changes: Vec<SyncChange>) -> Result<PushResponse, SyncError> {
         let source = changes
             .first()
