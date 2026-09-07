@@ -60,7 +60,7 @@
 //!
 //! **Request byte cap (#26).** Every byte-level server handler
 //! (`SyncServer::handle_{handshake,push,pull}_bytes`, `sync-http`) compares
-//! `bytes.len()` against [`SyncConfig::max_request_bytes`] (default 16 MiB)
+//! `bytes.len()` against [`SyncConfig::max_request_bytes`] (default 64 MiB)
 //! **before** the wire preamble is read and before any postcard decode. An
 //! oversized body is refused with the typed
 //! [`SyncError::PayloadTooLarge`]`{ size, max }` — never a decode error, never

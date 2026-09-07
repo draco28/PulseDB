@@ -6,14 +6,28 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::ValidationError;
+use crate::storage::schema::MAX_CONTENT_SIZE;
 use crate::types::CollectiveId;
 
-/// Default for [`SyncConfig::max_request_bytes`]: 16 MiB.
+/// Default for [`SyncConfig::max_request_bytes`]: 64 MiB.
 ///
-/// Roughly 8x a default 500-experience batch (384-dim embeddings included),
-/// so a healthy peer never trips it while a runaway or hostile body is refused
-/// long before it can exhaust memory. Locked by the r1 grill (Q4).
-pub const DEFAULT_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+/// Sized from the largest *valid* default batch, not from a typical one:
+/// [`SyncConfig::batch_size`] defaults to 500 and a single experience's
+/// `content` may be up to
+/// [`MAX_CONTENT_SIZE`](crate::storage::schema::MAX_CONTENT_SIZE) = 100 KiB,
+/// so a legitimate default batch can reach 500 x 100 KiB = 51 200 000 bytes
+/// (~48.8 MiB) of content alone. There is no byte-aware batch splitting and no
+/// shrink-and-retry, so a cap below that refuses a valid input and every later
+/// cycle retries the same oversized body forever. 64 MiB (67 108 864 bytes)
+/// clears that with room for the embeddings and metadata riding alongside the
+/// content, while still refusing a runaway or hostile body long before it can
+/// exhaust memory. It is deliberately **not** a bound on the theoretical
+/// worst case — one experience may also carry up to `MAX_SOURCE_FILES` paths
+/// and a large `applications` G-counter — because nothing here splits a batch
+/// by bytes; byte-aware batching is protocol v5. `validate()` enforces the
+/// `batch_size` relationship for any consumer that changes either value.
+/// Locked by the r1 grill (Q4).
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
 /// Default for [`SyncConfig::max_clock_skew_ms`]: 300 000 ms (5 minutes).
 ///
@@ -162,7 +176,10 @@ pub struct SyncConfig {
     /// The HTTP transport client applies the same default to *response* bodies
     /// (see `HttpSyncTransport::with_max_response_bytes`).
     ///
-    /// Default: 16 MiB ([`DEFAULT_MAX_REQUEST_BYTES`]). Must be greater than 0.
+    /// Default: 64 MiB ([`DEFAULT_MAX_REQUEST_BYTES`]). Must be greater than 0,
+    /// and at least `batch_size * MAX_CONTENT_SIZE` — the largest batch the
+    /// configured `batch_size` can legitimately produce — or `validate()`
+    /// refuses the pair.
     pub max_request_bytes: usize,
 
     /// Clock-skew allowance, in milliseconds, for an incoming experience's
@@ -212,6 +229,8 @@ impl SyncConfig {
     /// - `push_interval_ms` is 0
     /// - `pull_interval_ms` is 0
     /// - `max_request_bytes` is 0
+    /// - `max_request_bytes` is below `batch_size * MAX_CONTENT_SIZE`, the
+    ///   largest batch `batch_size` can legitimately produce
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.batch_size == 0 {
             return Err(ValidationError::invalid_field(
@@ -237,6 +256,23 @@ impl SyncConfig {
                 "must be greater than 0",
             ));
         }
+        // A batch of `batch_size` experiences each carrying the maximum
+        // `content` is a VALID input. Nothing splits a batch by bytes and
+        // nothing shrinks and retries, so a cap below that size refuses a
+        // legitimate push and every later cycle retries the same body forever.
+        // A consumer who lowers one of the two must lower the other.
+        let min_request_bytes = self.batch_size.saturating_mul(MAX_CONTENT_SIZE);
+        if self.max_request_bytes < min_request_bytes {
+            return Err(ValidationError::invalid_field(
+                "max_request_bytes",
+                format!(
+                    "must be at least batch_size ({}) * MAX_CONTENT_SIZE ({} bytes) \
+                     = {} bytes, the largest batch this batch_size can produce; \
+                     lower batch_size or raise max_request_bytes",
+                    self.batch_size, MAX_CONTENT_SIZE, min_request_bytes
+                ),
+            ));
+        }
         Ok(())
     }
 }
@@ -256,7 +292,7 @@ mod tests {
         assert!(config.collectives.is_none());
         assert!(config.sync_relations);
         assert!(config.sync_insights);
-        assert_eq!(config.max_request_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.max_request_bytes, 64 * 1024 * 1024);
         assert_eq!(config.max_request_bytes, DEFAULT_MAX_REQUEST_BYTES);
         assert_eq!(config.max_clock_skew_ms, 300_000);
         assert_eq!(config.max_clock_skew_ms, DEFAULT_MAX_CLOCK_SKEW_MS);
@@ -313,6 +349,57 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(
             matches!(err, ValidationError::InvalidField { field, .. } if field == "pull_interval_ms")
+        );
+    }
+
+    #[test]
+    fn test_sync_config_default_admits_the_largest_valid_default_batch() {
+        // 500 experiences x 100 KiB of content each is a VALID default batch.
+        let config = SyncConfig::default();
+        assert!(
+            config.max_request_bytes >= config.batch_size * MAX_CONTENT_SIZE,
+            "the default cap must not refuse a valid default batch"
+        );
+    }
+
+    #[test]
+    fn test_sync_config_validate_rejects_cap_below_a_valid_batch() {
+        // Nothing splits a batch by bytes and nothing shrinks and retries, so a
+        // cap below `batch_size * MAX_CONTENT_SIZE` would refuse a legitimate
+        // push forever. The pair must be rejected at construction instead.
+        let config = SyncConfig {
+            batch_size: 500,
+            max_request_bytes: 16 * 1024 * 1024,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        let ValidationError::InvalidField { field, reason } = err else {
+            panic!("expected InvalidField");
+        };
+        assert_eq!(field, "max_request_bytes");
+        assert!(reason.contains("batch_size"), "{reason}");
+        assert!(reason.contains("51200000"), "{reason}");
+
+        // Lowering the other side of the pair makes it valid again.
+        let config = SyncConfig {
+            batch_size: 100,
+            max_request_bytes: 16 * 1024 * 1024,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_sync_config_validate_batch_size_multiply_saturates() {
+        // A colossal batch_size must be refused, not wrap around to a tiny
+        // minimum that lets an unbounded body through.
+        let config = SyncConfig {
+            batch_size: usize::MAX,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ValidationError::InvalidField { field, .. } if field == "max_request_bytes")
         );
     }
 
