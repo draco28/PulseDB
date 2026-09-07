@@ -34,6 +34,15 @@ impl LocalChangePusher {
     /// Creates a new pusher.
     ///
     /// `start_sequence` is the WAL sequence to resume from (0 for fresh sync).
+    ///
+    /// The poller is built with [`SyncConfig::batch_size`], which is what makes
+    /// that setting mean what its rustdoc says — "maximum number of changes per
+    /// sync batch". Left on [`ChangePoller`]'s own default (1000, for
+    /// non-sync callers) the pusher would collect up to 1000 events whatever
+    /// `batch_size` said, and `SyncConfig::validate`'s
+    /// `max_request_bytes >= batch_size * MAX_CONTENT_SIZE` floor would be
+    /// computed against a number this path never used — passing the check while
+    /// the body it builds is refused by the peer's cap on every cycle, forever.
     pub fn new(
         db: Arc<PulseDB>,
         transport: Arc<dyn SyncTransport>,
@@ -42,11 +51,13 @@ impl LocalChangePusher {
         peer_instance_id: InstanceId,
         start_sequence: u64,
     ) -> Self {
+        let poller =
+            ChangePoller::from_sequence(start_sequence).with_batch_limit(config.batch_size);
         Self {
             db,
             transport,
             config,
-            poller: ChangePoller::from_sequence(start_sequence),
+            poller,
             local_instance_id,
             peer_instance_id,
         }
@@ -273,5 +284,70 @@ impl LocalChangePusher {
             .storage_for_test()
             .update_push_cursor(&self.peer_instance_id, sequence)
             .map_err(|e| SyncError::transport(format!("Failed to save push cursor: {}", e)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::sync::transport_mem::InMemorySyncTransport;
+    use crate::{Config, ExperienceType, NewExperience, PulseDB};
+
+    /// `SyncConfig::batch_size` is documented as "maximum number of changes per
+    /// sync batch", and `SyncConfig::validate` sizes `max_request_bytes` from
+    /// it. Both are claims about the push path, so the push path's poller must
+    /// be built with it: on [`ChangePoller`]'s own default (1000, for non-sync
+    /// callers) a configured `batch_size` of 2 would still push everything the
+    /// WAL had.
+    #[tokio::test]
+    async fn a_push_cycle_sends_at_most_batch_size_changes() {
+        let dir = tempdir().unwrap();
+        let db =
+            Arc::new(PulseDB::open(dir.path().join("push-batch.db"), Config::default()).unwrap());
+
+        // WAL event 1 is the collective; 2..=6 are the experiences.
+        let cid = db.create_collective("push-batch-bound").unwrap();
+        for _ in 0..5 {
+            db.record_experience(NewExperience {
+                collective_id: cid,
+                content: "pusher batch bound".to_string(),
+                experience_type: ExperienceType::Generic { category: None },
+                embedding: Some(vec![0.1f32; 384]),
+                importance: 0.5,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+
+        let (transport, _peer) = InMemorySyncTransport::new_pair();
+        let peer_instance_id = transport.instance_id();
+        let mut pusher = LocalChangePusher::new(
+            Arc::clone(&db),
+            Arc::new(transport),
+            SyncConfig {
+                batch_size: 2,
+                ..SyncConfig::default()
+            },
+            db.instance_id(),
+            peer_instance_id,
+            0,
+        );
+
+        for cycle in 0..3 {
+            assert_eq!(
+                pusher.push_pending().await.unwrap(),
+                2,
+                "cycle {cycle} pushed more than the configured batch_size"
+            );
+        }
+        assert_eq!(
+            pusher.push_pending().await.unwrap(),
+            0,
+            "six WAL events in three batches of two leaves nothing pending"
+        );
     }
 }

@@ -640,8 +640,12 @@ async fn test_initial_sync_catchup() {
         exp_ids.push(db_a.record_experience(minimal_exp(cid)).unwrap());
     }
 
-    // Push all from A
-    manager_a.sync_once().await.unwrap();
+    // Push all from A. One cycle pushes at most `batch_size` changes — that is
+    // what `batch_size` means on the push path — so drain the 13 WAL events
+    // (the collective plus twelve experiences) in ceil(13 / 5) cycles.
+    for _ in 0..3 {
+        manager_a.sync_once().await.unwrap();
+    }
 
     // B does initial sync (catches up all changes)
     manager_b.initial_sync(None).await.unwrap();
