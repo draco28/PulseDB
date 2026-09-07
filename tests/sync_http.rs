@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -33,6 +33,16 @@ use tempfile::tempdir;
 // Axum handlers (test server)
 // ============================================================================
 
+/// Maps a typed `SyncError` from the byte-level handlers onto an HTTP status:
+/// an oversized body is `413 Payload Too Large`, everything else is `400`.
+fn status_for(err: SyncError) -> StatusCode {
+    if err.is_payload_too_large() {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        StatusCode::BAD_REQUEST
+    }
+}
+
 async fn handle_health(State(server): State<Arc<SyncServer>>) -> StatusCode {
     match server.handle_health() {
         Ok(()) => StatusCode::OK,
@@ -44,27 +54,21 @@ async fn handle_handshake(
     State(server): State<Arc<SyncServer>>,
     body: Bytes,
 ) -> Result<Vec<u8>, StatusCode> {
-    server
-        .handle_handshake_bytes(&body)
-        .map_err(|_| StatusCode::BAD_REQUEST)
+    server.handle_handshake_bytes(&body).map_err(status_for)
 }
 
 async fn handle_push(
     State(server): State<Arc<SyncServer>>,
     body: Bytes,
 ) -> Result<Vec<u8>, StatusCode> {
-    server
-        .handle_push_bytes(&body)
-        .map_err(|_| StatusCode::BAD_REQUEST)
+    server.handle_push_bytes(&body).map_err(status_for)
 }
 
 async fn handle_pull(
     State(server): State<Arc<SyncServer>>,
     body: Bytes,
 ) -> Result<Vec<u8>, StatusCode> {
-    server
-        .handle_pull_bytes(&body)
-        .map_err(|_| StatusCode::BAD_REQUEST)
+    server.handle_pull_bytes(&body).map_err(status_for)
 }
 
 fn sync_router(server: Arc<SyncServer>) -> Router {
@@ -83,6 +87,7 @@ fn sync_router(server: Arc<SyncServer>) -> Router {
 struct TestServer {
     base_url: String,
     db: Arc<PulseDB>,
+    server: Arc<SyncServer>,
     _dir: tempfile::TempDir,
 }
 
@@ -95,8 +100,9 @@ async fn start_test_server() -> TestServer {
     let addr = listener.local_addr().unwrap();
     let base_url = format!("http://{}", addr);
 
+    let router = sync_router(Arc::clone(&server));
     tokio::spawn(async move {
-        axum::serve(listener, sync_router(server)).await.unwrap();
+        axum::serve(listener, router).await.unwrap();
     });
 
     // Give server a moment to start
@@ -105,6 +111,7 @@ async fn start_test_server() -> TestServer {
     TestServer {
         base_url,
         db,
+        server,
         _dir: dir,
     }
 }
@@ -493,4 +500,279 @@ async fn test_http_handshake_happy_path_carries_preamble() {
         .expect("framed handshake round-trips over HTTP");
     assert!(response.accepted);
     assert_eq!(response.protocol_version, SYNC_PROTOCOL_VERSION);
+}
+
+// ============================================================================
+// Wire hygiene (r1.s1.w3 — #26 request byte cap)
+// ============================================================================
+
+/// Builds an in-process `SyncServer` with an explicit request byte cap.
+fn in_process_server_with_cap(max_request_bytes: usize) -> (Arc<SyncServer>, tempfile::TempDir) {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(PulseDB::open(dir.path().join("server.db"), Config::default()).unwrap());
+    let config = SyncConfig {
+        max_request_bytes,
+        ..SyncConfig::default()
+    };
+    let server = Arc::new(SyncServer::new(db, config));
+    (server, dir)
+}
+
+fn assert_payload_too_large(err: &SyncError, expected_size: usize, expected_max: usize, leg: &str) {
+    assert!(
+        matches!(
+            err,
+            SyncError::PayloadTooLarge { size, max }
+                if *size == expected_size && *max == expected_max
+        ),
+        "{leg}: expected typed PayloadTooLarge {{ size: {expected_size}, max: {expected_max} }}, got {err:?}"
+    );
+    assert!(err.is_payload_too_large(), "{leg}: is_payload_too_large()");
+    assert!(
+        !matches!(
+            err,
+            SyncError::Serialization(_) | SyncError::WireFormatMismatch { .. }
+        ),
+        "{leg}: the cap must not collapse into a decode-side error"
+    );
+}
+
+/// #26: every byte-level server handler compares `bytes.len()` against
+/// `SyncConfig::max_request_bytes` BEFORE the body reaches postcard (and, for
+/// the handshake, before the preamble read). The refused bodies below are all
+/// decodable — postcard ignores trailing bytes and a zero-filled body is a
+/// valid empty `Vec<SyncChange>` — so only a pre-decode length check can
+/// produce the typed `PayloadTooLarge`.
+#[tokio::test]
+async fn oversized_request_is_refused_before_decode() {
+    const CAP: usize = 64;
+    let (server, _dir) = in_process_server_with_cap(CAP);
+
+    // A wire-valid framed handshake under the cap is accepted as before.
+    let framed = write_wire_preamble(&handshake_body_bytes());
+    assert!(
+        framed.len() <= CAP,
+        "fixture must fit under the cap: {} > {CAP}",
+        framed.len()
+    );
+    server
+        .handle_handshake_bytes(&framed)
+        .expect("in-bound framed handshake is accepted");
+
+    // The same body padded one byte past the cap. It still decodes under a
+    // larger cap, which is what proves the refusal happens before decode.
+    let mut padded = framed.clone();
+    padded.resize(CAP + 1, 0);
+    let (lenient, _dir_lenient) = in_process_server_with_cap(1024);
+    lenient
+        .handle_handshake_bytes(&padded)
+        .expect("the padded body is decodable — trailing bytes are ignored by postcard");
+
+    let err = server
+        .handle_handshake_bytes(&padded)
+        .expect_err("oversized handshake must be refused");
+    assert_payload_too_large(&err, CAP + 1, CAP, "handshake");
+
+    // Push and pull bodies (no preamble) are capped the same way.
+    let oversized = vec![0u8; CAP + 1];
+    let err = server
+        .handle_push_bytes(&oversized)
+        .expect_err("oversized push must be refused");
+    assert_payload_too_large(&err, CAP + 1, CAP, "push");
+    let err = server
+        .handle_pull_bytes(&oversized)
+        .expect_err("oversized pull must be refused");
+    assert_payload_too_large(&err, CAP + 1, CAP, "pull");
+
+    // The cap is inclusive: a body exactly at the cap reaches the decoder
+    // (a zero-filled body is an empty change batch).
+    let at_cap = vec![0u8; CAP];
+    let encoded = server
+        .handle_push_bytes(&at_cap)
+        .expect("a body exactly at the cap reaches the decoder");
+    let response: pulsedb::sync::types::PushResponse = postcard::from_bytes(&encoded).unwrap();
+    assert_eq!(response.accepted, 0);
+}
+
+/// #26, client side: the HTTP transport applies the same cap to response
+/// bodies — a `Content-Length` above the cap is refused without reading the
+/// body, and a chunked (no `Content-Length`) body is read bounded and refused
+/// once it crosses the cap.
+#[tokio::test]
+async fn client_refuses_oversized_response_body() {
+    const CAP: usize = 1024;
+    const OVERSIZED: usize = 64 * 1024;
+
+    // A hostile "server": /sync/pull answers with an oversized fixed-length
+    // body; /sync/push streams an oversized body without a Content-Length.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = Router::new()
+        .route("/sync/pull", post(|| async { vec![0u8; OVERSIZED] }))
+        .route(
+            "/sync/push",
+            post(|| async {
+                let chunks =
+                    (0..(OVERSIZED / 256)).map(|_| Ok::<_, std::io::Error>(vec![0u8; 256]));
+                Body::from_stream(futures::stream::iter(chunks))
+            }),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    let transport = HttpSyncTransport::new(format!("http://{addr}")).with_max_response_bytes(CAP);
+    assert_eq!(transport.max_response_bytes(), CAP);
+
+    let pull_request = PullRequest {
+        cursor: SyncCursor::new(InstanceId::new()),
+        batch_size: 10,
+        collectives: None,
+    };
+    let err = transport
+        .pull_changes(pull_request)
+        .await
+        .expect_err("an oversized Content-Length response must be refused");
+    assert!(
+        matches!(err, SyncError::PayloadTooLarge { size, max } if size == OVERSIZED && max == CAP),
+        "pull (Content-Length): expected PayloadTooLarge {{ size: {OVERSIZED}, max: {CAP} }}, got {err:?}"
+    );
+
+    let err = transport
+        .push_changes(Vec::new())
+        .await
+        .expect_err("an oversized chunked response must be refused");
+    assert!(
+        matches!(err, SyncError::PayloadTooLarge { size, max } if size > CAP && max == CAP),
+        "push (chunked): expected PayloadTooLarge {{ size > {CAP}, max: {CAP} }}, got {err:?}"
+    );
+}
+
+// ============================================================================
+// Wire hygiene (r1.s1.w3 — #12 typed client protocol-version mismatch)
+// ============================================================================
+
+/// #12: a server advertising a different `SYNC_PROTOCOL_VERSION` reaches the
+/// client as the typed `SyncError::ProtocolVersion { local, remote }`, not as
+/// a reason string folded into `SyncError::Handshake`. A real `SyncServer`
+/// answers a mismatch with the soft `accepted: false` path (see
+/// `test_protocol_version_mismatch_still_soft_rejects_through_preamble`); that
+/// path must no longer shadow the typed variant on the client.
+#[tokio::test]
+async fn client_reports_protocol_version_mismatch_typed() {
+    const REMOTE_VERSION: u32 = SYNC_PROTOCOL_VERSION + 1;
+
+    // A peer speaking the same wire format but a different protocol version.
+    // It answers exactly as `SyncServer::handle_handshake` does on mismatch:
+    // `accepted: false`, ITS protocol version, and a human-readable reason.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = Router::new().route(
+        "/sync/handshake",
+        post(|| async {
+            let response = pulsedb::sync::types::HandshakeResponse {
+                instance_id: InstanceId::new(),
+                protocol_version: REMOTE_VERSION,
+                accepted: false,
+                reason: Some(format!(
+                    "Protocol version mismatch: server v{REMOTE_VERSION}, client v{SYNC_PROTOCOL_VERSION}"
+                )),
+            };
+            write_wire_preamble(&postcard::to_allocvec(&response).unwrap())
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    let dir = tempdir().unwrap();
+    let db = Arc::new(PulseDB::open(dir.path().join("client.db"), Config::default()).unwrap());
+    let transport = HttpSyncTransport::new(format!("http://{addr}"));
+    let mut manager = SyncManager::new(Arc::clone(&db), Box::new(transport), SyncConfig::default());
+
+    let err = manager
+        .sync_once()
+        .await
+        .expect_err("a version-mismatched peer must fail the handshake");
+    assert!(
+        matches!(
+            err,
+            SyncError::ProtocolVersion { local, remote }
+                if local == SYNC_PROTOCOL_VERSION && remote == REMOTE_VERSION
+        ),
+        "expected typed ProtocolVersion {{ local: {SYNC_PROTOCOL_VERSION}, remote: {REMOTE_VERSION} }}, got {err:?}"
+    );
+    assert!(
+        !matches!(err, SyncError::Handshake(_)),
+        "the mismatch must not be a reason string inside Handshake(_), got {err:?}"
+    );
+
+    // `start()` goes through the same handshake and reports the same variant.
+    let err = manager
+        .start()
+        .await
+        .expect_err("start() fails the handshake the same way");
+    assert!(
+        matches!(err, SyncError::ProtocolVersion { .. }),
+        "start(): expected typed ProtocolVersion, got {err:?}"
+    );
+}
+
+// ============================================================================
+// Skew visibility (r1.s1.w3 — #13, veto fold C2) on the push/server side
+// ============================================================================
+
+/// A pushed change whose `last_reinforced` lies beyond
+/// `now + max_clock_skew_ms` shows up in `SyncServer::stats()` and is merged
+/// unchanged. `skewed_timestamps` is local-only: `PushResponse` on the wire is
+/// untouched.
+#[tokio::test]
+async fn server_stats_count_skewed_last_reinforced() {
+    use std::collections::BTreeMap;
+
+    use pulsedb::sync::types::{
+        SerializableExperienceUpdate, SyncChange, SyncEntityType, SyncPayload, SyncStats,
+    };
+    use pulsedb::Timestamp;
+
+    let server = start_test_server().await;
+    let transport = HttpSyncTransport::new(&server.base_url);
+    let cid = server.db.create_collective("skew-stats-http").unwrap();
+    let exp_id = server.db.record_experience(minimal_exp(cid)).unwrap();
+    assert_eq!(server.server.stats(), SyncStats::default());
+
+    let allowance = i64::try_from(SyncConfig::default().max_clock_skew_ms).unwrap();
+    let skewed = Timestamp::from_millis(Timestamp::now().as_millis() + allowance + 86_400_000);
+    let peer = InstanceId::new();
+    let change = SyncChange {
+        sequence: 7,
+        source_instance: peer,
+        collective_id: cid,
+        entity_type: SyncEntityType::Experience,
+        payload: SyncPayload::ExperienceUpdated {
+            id: exp_id,
+            update: SerializableExperienceUpdate {
+                applications: Some(BTreeMap::from([(peer, 3)])),
+                last_reinforced: Some(skewed),
+                ..Default::default()
+            },
+            timestamp: Timestamp::now(),
+        },
+        timestamp: Timestamp::now(),
+    };
+
+    let response = transport.push_changes(vec![change]).await.unwrap();
+    assert_eq!(response.accepted, 1);
+    assert_eq!(
+        server.server.stats(),
+        SyncStats {
+            skewed_timestamps: 1
+        },
+        "the skewed reinforcement is visible in the server's stats"
+    );
+    let stored = server.db.get_experience(exp_id).unwrap().unwrap();
+    assert_eq!(stored.last_reinforced, skewed, "counted, not clamped");
+    assert_eq!(stored.applications.get(&peer), Some(&3));
 }

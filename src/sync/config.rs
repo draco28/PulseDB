@@ -8,6 +8,20 @@ use serde::{Deserialize, Serialize};
 use crate::error::ValidationError;
 use crate::types::CollectiveId;
 
+/// Default for [`SyncConfig::max_request_bytes`]: 16 MiB.
+///
+/// Roughly 8x a default 500-experience batch (384-dim embeddings included),
+/// so a healthy peer never trips it while a runaway or hostile body is refused
+/// long before it can exhaust memory. Locked by the r1 grill (Q4).
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
+/// Default for [`SyncConfig::max_clock_skew_ms`]: 300 000 ms (5 minutes).
+///
+/// Wide enough that ordinary NTP drift between peers never trips it, tight
+/// enough that a runaway reinforcement timestamp is surfaced. Locked by the r1
+/// grill (Q4).
+pub const DEFAULT_MAX_CLOCK_SKEW_MS: u64 = 300_000;
+
 // ============================================================================
 // SyncDirection
 // ============================================================================
@@ -133,6 +147,42 @@ pub struct SyncConfig {
     ///
     /// Default: true
     pub sync_insights: bool,
+
+    /// Upper bound, in bytes, on a single sync request body accepted by the
+    /// server-side byte handlers (`SyncServer::handle_*_bytes`, `sync-http`).
+    ///
+    /// The check is `bytes.len() <= max_request_bytes`, made **before** the
+    /// wire preamble is read and before any postcard decode, so an oversized
+    /// body is refused with the typed
+    /// [`SyncError::PayloadTooLarge`](super::error::SyncError::PayloadTooLarge)
+    /// and never reaches the decoder. PulseDB builds no router of its own, so
+    /// this is the only cap it enforces at the network edge (ADR-009); a
+    /// consumer's framework body limit applies in addition, not instead.
+    ///
+    /// The HTTP transport client applies the same default to *response* bodies
+    /// (see `HttpSyncTransport::with_max_response_bytes`).
+    ///
+    /// Default: 16 MiB ([`DEFAULT_MAX_REQUEST_BYTES`]). Must be greater than 0.
+    pub max_request_bytes: usize,
+
+    /// Clock-skew allowance, in milliseconds, for an incoming experience's
+    /// `last_reinforced` (#13).
+    ///
+    /// When a pulled or pushed reinforcement carries
+    /// `last_reinforced > now + max_clock_skew_ms`, the applier logs it at
+    /// `warn` (peer, experience id, skew) and counts it in
+    /// [`SyncStats::skewed_timestamps`](super::types::SyncStats::skewed_timestamps).
+    /// The value is still merged exactly as FR-031's max-merge dictates — it is
+    /// **never** clamped, rejected or re-timestamped — so two peers keep
+    /// converging on the same bytes.
+    ///
+    /// **The bound is advisory until protocol v5.** A bound that also corrects
+    /// the value needs a record-carried time reference to converge on, and
+    /// that is a wire change scheduled for protocol v5 (Release 2). Until then
+    /// this setting only decides what is *surfaced*, never what is *stored*.
+    ///
+    /// Default: 300 000 (5 minutes, [`DEFAULT_MAX_CLOCK_SKEW_MS`]).
+    pub max_clock_skew_ms: u64,
 }
 
 impl Default for SyncConfig {
@@ -147,6 +197,8 @@ impl Default for SyncConfig {
             collectives: None,
             sync_relations: true,
             sync_insights: true,
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+            max_clock_skew_ms: DEFAULT_MAX_CLOCK_SKEW_MS,
         }
     }
 }
@@ -159,6 +211,7 @@ impl SyncConfig {
     /// - `batch_size` is 0
     /// - `push_interval_ms` is 0
     /// - `pull_interval_ms` is 0
+    /// - `max_request_bytes` is 0
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.batch_size == 0 {
             return Err(ValidationError::invalid_field(
@@ -175,6 +228,12 @@ impl SyncConfig {
         if self.pull_interval_ms == 0 {
             return Err(ValidationError::invalid_field(
                 "pull_interval_ms",
+                "must be greater than 0",
+            ));
+        }
+        if self.max_request_bytes == 0 {
+            return Err(ValidationError::invalid_field(
+                "max_request_bytes",
                 "must be greater than 0",
             ));
         }
@@ -197,12 +256,28 @@ mod tests {
         assert!(config.collectives.is_none());
         assert!(config.sync_relations);
         assert!(config.sync_insights);
+        assert_eq!(config.max_request_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.max_request_bytes, DEFAULT_MAX_REQUEST_BYTES);
+        assert_eq!(config.max_clock_skew_ms, 300_000);
+        assert_eq!(config.max_clock_skew_ms, DEFAULT_MAX_CLOCK_SKEW_MS);
     }
 
     #[test]
     fn test_sync_config_validate_success() {
         let config = SyncConfig::default();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_sync_config_validate_zero_max_request_bytes() {
+        let config = SyncConfig {
+            max_request_bytes: 0,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ValidationError::InvalidField { field, .. } if field == "max_request_bytes")
+        );
     }
 
     #[test]

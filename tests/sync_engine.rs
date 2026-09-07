@@ -724,7 +724,7 @@ async fn test_selective_collective_sync() {
 
 // ============================================================================
 // WAL compaction vs. unpushed local events (#9 — r1.s1.w1)
-// ============================================================================
+// =====================================================================
 
 /// A remote *pull* position must never let `compact_wal` delete local events
 /// that have not been *pushed* yet (issue #9). Push and pull positions are
@@ -822,4 +822,71 @@ async fn test_compact_wal_keeps_unpushed_local_events() {
         remaining[0].0, 2,
         "the unpushed event above the push position survives"
     );
+=======
+// Skew visibility (r1.s1.w3 — #13, veto fold C2)
+// ============================================================================
+
+/// A pulled change whose `last_reinforced` lies beyond
+/// `now + max_clock_skew_ms` shows up in `SyncManager::stats()` and is merged
+/// unchanged — visible, never clamped.
+#[tokio::test]
+async fn manager_stats_count_skewed_last_reinforced() {
+    use std::collections::BTreeMap;
+
+    use pulsedb::sync::transport::SyncTransport;
+    use pulsedb::sync::types::{
+        SerializableExperienceUpdate, SyncChange, SyncEntityType, SyncPayload, SyncStats,
+    };
+    use pulsedb::Timestamp;
+
+    let (db_a, _dir_a) = open_db();
+    let (transport_a, transport_b) = InMemorySyncTransport::new_pair();
+    let cid = db_a.create_collective("skew-stats").unwrap();
+    let exp_id = db_a.record_experience(minimal_exp(cid)).unwrap();
+
+    let config = SyncConfig {
+        direction: SyncDirection::PullOnly,
+        ..sync_config()
+    };
+    let mut manager_a = SyncManager::new(Arc::clone(&db_a), Box::new(transport_a), config.clone());
+    assert_eq!(manager_a.stats(), SyncStats::default());
+
+    // The peer pushes a reinforcement whose timestamp is a day past the bound.
+    let allowance = i64::try_from(config.max_clock_skew_ms).unwrap();
+    let skewed = Timestamp::from_millis(Timestamp::now().as_millis() + allowance + 86_400_000);
+    let peer = transport_b.instance_id();
+    let change = SyncChange {
+        sequence: 1_000,
+        source_instance: peer,
+        collective_id: cid,
+        entity_type: SyncEntityType::Experience,
+        payload: SyncPayload::ExperienceUpdated {
+            id: exp_id,
+            update: SerializableExperienceUpdate {
+                applications: Some(BTreeMap::from([(peer, 1)])),
+                last_reinforced: Some(skewed),
+                ..Default::default()
+            },
+            timestamp: Timestamp::now(),
+        },
+        timestamp: Timestamp::now(),
+    };
+    transport_b.push_changes(vec![change]).await.unwrap();
+
+    manager_a.sync_once().await.unwrap();
+
+    assert_eq!(
+        manager_a.stats(),
+        SyncStats {
+            skewed_timestamps: 1
+        },
+        "the skewed reinforcement is visible in the manager's stats"
+    );
+    let stored = db_a.get_experience(exp_id).unwrap().unwrap();
+    assert_eq!(stored.last_reinforced, skewed, "counted, not clamped");
+    assert_eq!(stored.applications.get(&peer), Some(&1));
+
+    // Stats are cumulative across cycles and untouched by a clean cycle.
+    manager_a.sync_once().await.unwrap();
+    assert_eq!(manager_a.stats().skewed_timestamps, 1);
 }

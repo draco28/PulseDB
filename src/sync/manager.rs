@@ -8,7 +8,7 @@
 //! - Error recovery with exponential backoff
 //! - Graceful shutdown
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -22,7 +22,7 @@ use super::error::SyncError;
 use super::progress::SyncProgressCallback;
 use super::pusher::LocalChangePusher;
 use super::transport::SyncTransport;
-use super::types::{HandshakeRequest, InstanceId, PullRequest, SyncPosition, SyncStatus};
+use super::types::{HandshakeRequest, InstanceId, PullRequest, SyncPosition, SyncStats, SyncStatus};
 use super::{SYNC_CAPABILITY_GCOUNTER_APPLICATIONS, SYNC_PROTOCOL_VERSION};
 
 /// Orchestrator for sync operations between two PulseDB instances.
@@ -54,6 +54,7 @@ pub struct SyncManager {
     local_instance_id: InstanceId,
     peer_instance_id: Option<InstanceId>,
     status: Arc<RwLock<SyncStatus>>,
+    stats: Arc<Mutex<SyncStats>>,
     shutdown: Arc<Notify>,
     task_handle: Option<JoinHandle<()>>,
 }
@@ -74,6 +75,7 @@ impl SyncManager {
             local_instance_id,
             peer_instance_id: None,
             status: Arc::new(RwLock::new(SyncStatus::Idle)),
+            stats: Arc::new(Mutex::new(SyncStats::default())),
             shutdown: Arc::new(Notify::new()),
             task_handle: None,
         }
@@ -101,10 +103,14 @@ impl SyncManager {
         let config = self.config.clone();
         let local_id = self.local_instance_id;
         let status = Arc::clone(&self.status);
+        let stats = Arc::clone(&self.stats);
         let shutdown = Arc::clone(&self.shutdown);
 
         let handle = tokio::spawn(async move {
-            Self::background_loop(db, transport, config, local_id, peer_id, status, shutdown).await;
+            Self::background_loop(
+                db, transport, config, local_id, peer_id, status, stats, shutdown,
+            )
+            .await;
         });
 
         self.task_handle = Some(handle);
@@ -212,7 +218,9 @@ impl SyncManager {
             let batch_size = response.changes.len();
 
             if batch_size > 0 {
-                applier.apply_batch(response.changes)?;
+                applier
+                    .apply_batch(response.changes)?
+                    .record_into(&self.stats);
             }
 
             total_pulled += batch_size;
@@ -244,6 +252,15 @@ impl SyncManager {
             .clone()
     }
 
+    /// Returns a snapshot of the local-only sync counters accumulated over
+    /// every change this manager has applied (`sync_once`, `initial_sync`
+    /// and the background loop alike).
+    ///
+    /// See [`SyncStats::skewed_timestamps`] for the #13 skew counter.
+    pub fn stats(&self) -> SyncStats {
+        *self.stats.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     // ─── Internal helpers ────────────────────────────────────────────
 
     #[instrument(skip(self))]
@@ -260,17 +277,29 @@ impl SyncManager {
 
         let response = self.transport.handshake(request).await?;
 
-        if !response.accepted {
-            return Err(SyncError::handshake(
-                response.reason.unwrap_or_else(|| "rejected".into()),
-            ));
-        }
-
+        // Protocol-version check FIRST. A server that speaks a different
+        // version answers with the soft `accepted: false` path carrying its
+        // own version (see `SyncServer::handle_handshake`), so mapping the
+        // rejection generically before this check would shadow the typed
+        // variant behind a reason string (#12). Callers can now match on
+        // `SyncError::ProtocolVersion { local, remote }`.
         if response.protocol_version != SYNC_PROTOCOL_VERSION {
+            warn!(
+                peer = %response.instance_id,
+                local = SYNC_PROTOCOL_VERSION,
+                remote = response.protocol_version,
+                "Sync handshake refused: protocol version mismatch"
+            );
             return Err(SyncError::ProtocolVersion {
                 local: SYNC_PROTOCOL_VERSION,
                 remote: response.protocol_version,
             });
+        }
+
+        if !response.accepted {
+            return Err(SyncError::handshake(
+                response.reason.unwrap_or_else(|| "rejected".into()),
+            ));
         }
 
         debug!(peer = %response.instance_id, "Handshake accepted");
@@ -326,7 +355,9 @@ impl SyncManager {
         let count = response.changes.len();
 
         if count > 0 {
-            applier.apply_batch(response.changes)?;
+            applier
+                .apply_batch(response.changes)?
+                .record_into(&self.stats);
             self.save_pull_position(peer_id, response.new_cursor.sequence)?;
         }
 
@@ -334,6 +365,7 @@ impl SyncManager {
     }
 
     /// Background loop that runs push+pull on configured intervals.
+    #[allow(clippy::too_many_arguments)]
     async fn background_loop(
         db: Arc<PulseDB>,
         transport: Arc<dyn SyncTransport>,
@@ -341,6 +373,7 @@ impl SyncManager {
         local_id: InstanceId,
         peer_id: InstanceId,
         status: Arc<RwLock<SyncStatus>>,
+        stats: Arc<Mutex<SyncStats>>,
         shutdown: Arc<Notify>,
     ) {
         let interval_ms = std::cmp::max(config.push_interval_ms, config.pull_interval_ms);
@@ -386,7 +419,7 @@ impl SyncManager {
                     );
                     let applier = RemoteChangeApplier::new(Arc::clone(&db), config.clone());
 
-                    let result = Self::run_sync_cycle(&mut pusher, &applier, &transport, &db, &config, peer_id).await;
+                    let result = Self::run_sync_cycle(&mut pusher, &applier, &transport, &db, &config, peer_id, &stats).await;
 
                     match result {
                         Ok(_) => {
@@ -422,6 +455,7 @@ impl SyncManager {
     }
 
     /// Execute one push+pull cycle. Used by background loop.
+    #[allow(clippy::too_many_arguments)]
     async fn run_sync_cycle(
         pusher: &mut LocalChangePusher,
         applier: &RemoteChangeApplier,
@@ -429,6 +463,7 @@ impl SyncManager {
         db: &Arc<PulseDB>,
         config: &SyncConfig,
         peer_id: InstanceId,
+        stats: &Mutex<SyncStats>,
     ) -> Result<(), SyncError> {
         // Push
         if matches!(
@@ -459,7 +494,7 @@ impl SyncManager {
             let count = response.changes.len();
 
             if count > 0 {
-                applier.apply_batch(response.changes)?;
+                applier.apply_batch(response.changes)?.record_into(stats);
                 // Pull side only — the pusher owns the push position.
                 db.storage_for_test()
                     .update_pull_cursor(&peer_id, response.new_cursor.sequence)

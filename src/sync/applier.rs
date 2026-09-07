@@ -7,17 +7,18 @@
 //! - Idempotent deletes (skip if entity missing)
 //! - Conflict resolution for experience updates
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tracing::{debug, instrument, trace, warn};
 
 use crate::db::PulseDB;
 use crate::experience::ExperienceUpdate;
+use crate::types::Timestamp;
 
 use super::config::{ConflictResolution, SyncConfig};
 use super::error::SyncError;
 use super::guard::SyncApplyGuard;
-use super::types::{SyncChange, SyncPayload};
+use super::types::{SyncChange, SyncPayload, SyncStats};
 
 /// Upper bound on the number of per-instance buckets accepted in a single
 /// experience's `applications` G-counter from a remote peer. Each bucket is one
@@ -36,6 +37,22 @@ pub struct ApplyResult {
     pub skipped: usize,
     /// Number of changes where conflict resolution was used.
     pub conflicts: usize,
+    /// Number of changes in this batch whose incoming `last_reinforced` lay
+    /// beyond `now + SyncConfig::max_clock_skew_ms` (#13).
+    ///
+    /// Detection only: each is logged at `warn` and then merged unchanged
+    /// (FR-031 max-merge, r1 veto fold C2). Never serialized on the wire.
+    pub skewed_timestamps: u64,
+}
+
+impl ApplyResult {
+    /// Folds this batch's counters into a cumulative, local-only [`SyncStats`].
+    pub(crate) fn record_into(&self, stats: &Mutex<SyncStats>) {
+        let mut stats = stats.lock().unwrap_or_else(|e| e.into_inner());
+        stats.skewed_timestamps = stats
+            .skewed_timestamps
+            .saturating_add(self.skewed_timestamps);
+    }
 }
 
 /// Applies remote sync changes to the local PulseDB instance.
@@ -59,6 +76,12 @@ impl RemoteChangeApplier {
         let mut result = ApplyResult::default();
 
         for change in changes {
+            // #13: surface a skewed reinforcement timestamp BEFORE the apply,
+            // so it is counted whatever the apply's outcome. Detection never
+            // alters the change — it is applied exactly as received.
+            if self.detect_skew(&change) {
+                result.skewed_timestamps += 1;
+            }
             match self.apply_single(change) {
                 Ok(ApplyOutcome::Applied) => result.applied += 1,
                 Ok(ApplyOutcome::Skipped) => result.skipped += 1,
@@ -78,9 +101,52 @@ impl RemoteChangeApplier {
             applied = result.applied,
             skipped = result.skipped,
             conflicts = result.conflicts,
+            skewed_timestamps = result.skewed_timestamps,
             "Applied remote change batch"
         );
         Ok(result)
+    }
+
+    /// #13 (r1 veto fold C2) — skew **detection**, never correction.
+    ///
+    /// Returns `true` when the change carries a reinforcement timestamp beyond
+    /// `now + max_clock_skew_ms` — at either apply site: the non-collision
+    /// create (`ExperienceCreated`, timestamp written as-is) and the counter
+    /// merge (`ExperienceCreated` collision or `ExperienceUpdated`, FR-031
+    /// max-merge). It logs the condition at `warn` with the peer, the
+    /// experience id and the skew, and leaves the change untouched: the merged
+    /// value stays byte-for-byte what max-merge produces, so convergence is
+    /// unaffected and the skew is visible in logs and [`SyncStats`] instead of
+    /// silently freezing decay. A bound that also corrects needs a
+    /// record-carried reference — protocol v5 (Release 2).
+    fn detect_skew(&self, change: &SyncChange) -> bool {
+        let (id, incoming) = match &change.payload {
+            SyncPayload::ExperienceCreated(experience) => {
+                (experience.id, experience.last_reinforced)
+            }
+            SyncPayload::ExperienceUpdated { id, update, .. } => match update.last_reinforced {
+                Some(incoming) => (*id, incoming),
+                None => return false,
+            },
+            _ => return false,
+        };
+
+        let now_ms = Timestamp::now().as_millis();
+        let allowance = i64::try_from(self.config.max_clock_skew_ms).unwrap_or(i64::MAX);
+        let bound = now_ms.saturating_add(allowance);
+        if incoming.as_millis() <= bound {
+            return false;
+        }
+
+        warn!(
+            peer = %change.source_instance,
+            experience_id = %id,
+            incoming_last_reinforced_ms = incoming.as_millis(),
+            skew_ms = incoming.as_millis().saturating_sub(now_ms),
+            max_clock_skew_ms = self.config.max_clock_skew_ms,
+            "Incoming last_reinforced is beyond the clock-skew bound; merged unchanged (bound is advisory until protocol v5)"
+        );
+        true
     }
 
     /// Applies a single remote change, returning the outcome.
@@ -286,7 +352,8 @@ mod tests {
     use super::*;
     use crate::sync::types::{SerializableExperienceUpdate, SyncEntityType};
     use crate::{
-        CollectiveId, Config, ExperienceType, InstanceId, NewExperience, PulseDB, Timestamp,
+        CollectiveId, Config, ExperienceId, ExperienceType, InstanceId, NewExperience, PulseDB,
+        Timestamp,
     };
 
     fn open_db() -> (Arc<PulseDB>, tempfile::TempDir) {
@@ -414,5 +481,128 @@ mod tests {
         // Nothing from the oversized map may have been persisted.
         let stored = db.get_experience(exp_id).unwrap().unwrap();
         assert!(stored.applications.len() <= 1);
+    }
+
+    /// #13 (veto fold C2): an incoming `last_reinforced` beyond
+    /// `now + max_clock_skew_ms` is COUNTED in `ApplyResult::skewed_timestamps`
+    /// (and logged) at every apply site, and NEVER clamped, rejected or
+    /// re-timestamped — the stored value is byte-for-byte what FR-031's
+    /// max-merge produces.
+    #[test]
+    fn skewed_last_reinforced_is_counted_not_clamped() {
+        let (db, _dir) = open_db();
+        let cid = db.create_collective("applier-skew").unwrap();
+        let exp_id = db.record_experience(minimal_exp(cid)).unwrap();
+        let config = SyncConfig::default();
+        assert_eq!(config.max_clock_skew_ms, 300_000, "grill Q4 default");
+        let applier = RemoteChangeApplier::new(Arc::clone(&db), config.clone());
+        let remote_key = InstanceId::new();
+
+        let now_ms = Timestamp::now().as_millis();
+        let allowance = i64::try_from(config.max_clock_skew_ms).unwrap();
+        // One day past the skew bound.
+        let skewed = Timestamp::from_millis(now_ms + allowance + 86_400_000);
+
+        // 1. Counter-merge site (ExperienceUpdated): counted once, merged as-is.
+        let update = SerializableExperienceUpdate {
+            applications: Some(BTreeMap::from([(remote_key, 2)])),
+            last_reinforced: Some(skewed),
+            ..Default::default()
+        };
+        let result = applier
+            .apply_batch(vec![change(
+                SyncPayload::ExperienceUpdated {
+                    id: exp_id,
+                    update,
+                    timestamp: Timestamp::now(),
+                },
+                cid,
+            )])
+            .unwrap();
+        assert_eq!(result.skewed_timestamps, 1, "skewed update is counted once");
+        assert_eq!(result.applied, 1);
+        let stored = db.get_experience(exp_id).unwrap().unwrap();
+        assert_eq!(
+            stored.last_reinforced, skewed,
+            "max-merge result is stored byte-for-byte — not clamped"
+        );
+        assert_eq!(stored.applications.get(&remote_key), Some(&2));
+
+        // 2. An in-bound timestamp is not counted; the max-merge still holds.
+        let in_bound = Timestamp::from_millis(now_ms + 1_000);
+        let update = SerializableExperienceUpdate {
+            last_reinforced: Some(in_bound),
+            ..Default::default()
+        };
+        let result = applier
+            .apply_batch(vec![change(
+                SyncPayload::ExperienceUpdated {
+                    id: exp_id,
+                    update,
+                    timestamp: Timestamp::now(),
+                },
+                cid,
+            )])
+            .unwrap();
+        assert_eq!(
+            result.skewed_timestamps, 0,
+            "in-bound update is not counted"
+        );
+        assert_eq!(
+            db.get_experience(exp_id).unwrap().unwrap().last_reinforced,
+            skewed,
+            "max-merge keeps the larger (skewed) value"
+        );
+
+        // 3. Non-collision create site (ExperienceCreated, unknown id): counted,
+        //    the record is written with its timestamp untouched.
+        let mut fresh = db.get_experience(exp_id).unwrap().unwrap();
+        fresh.id = ExperienceId::new();
+        fresh.last_reinforced = skewed;
+        let result = applier
+            .apply_batch(vec![change(
+                SyncPayload::ExperienceCreated(fresh.clone()),
+                cid,
+            )])
+            .unwrap();
+        assert_eq!(result.skewed_timestamps, 1, "fresh create is counted");
+        assert_eq!(result.applied, 1);
+        assert_eq!(
+            db.get_experience(fresh.id)
+                .unwrap()
+                .unwrap()
+                .last_reinforced,
+            skewed,
+            "fresh create stores the skewed value unchanged"
+        );
+
+        // 4. Collision create site (ExperienceCreated, known id): counted and
+        //    max-merged unchanged.
+        let mut collision = db.get_experience(exp_id).unwrap().unwrap();
+        collision.last_reinforced = Timestamp::from_millis(skewed.as_millis() + 1);
+        let result = applier
+            .apply_batch(vec![change(
+                SyncPayload::ExperienceCreated(collision.clone()),
+                cid,
+            )])
+            .unwrap();
+        assert_eq!(result.skewed_timestamps, 1, "collision create is counted");
+        assert_eq!(
+            db.get_experience(exp_id).unwrap().unwrap().last_reinforced,
+            collision.last_reinforced,
+            "collision max-merge stores the skewed value unchanged"
+        );
+
+        // 5. A change with no reinforcement timestamp is never counted.
+        let result = applier
+            .apply_batch(vec![change(
+                SyncPayload::ExperienceArchived {
+                    id: exp_id,
+                    timestamp: skewed,
+                },
+                cid,
+            )])
+            .unwrap();
+        assert_eq!(result.skewed_timestamps, 0);
     }
 }
