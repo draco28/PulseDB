@@ -218,6 +218,6 @@ pub use transport_http::HttpSyncTransport;
 pub use transport_mem::InMemorySyncTransport;
 pub use types::{
     HandshakeRequest, HandshakeResponse, InstanceId, PullRequest, PullResponse, PushResponse,
-    SerializableExperienceUpdate, SyncChange, SyncCursor, SyncEntityType, SyncPayload, SyncStats,
-    SyncStatus,
+    SerializableExperienceUpdate, SyncChange, SyncCursor, SyncEntityType, SyncPayload,
+    SyncPosition, SyncStats, SyncStatus,
 };
