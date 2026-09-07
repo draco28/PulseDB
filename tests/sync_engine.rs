@@ -724,7 +724,7 @@ async fn test_selective_collective_sync() {
 
 // ============================================================================
 // WAL compaction vs. unpushed local events (#9 — r1.s1.w1)
-// =====================================================================
+// ============================================================================
 
 /// A remote *pull* position must never let `compact_wal` delete local events
 /// that have not been *pushed* yet (issue #9). Push and pull positions are
@@ -822,7 +822,9 @@ async fn test_compact_wal_keeps_unpushed_local_events() {
         remaining[0].0, 2,
         "the unpushed event above the push position survives"
     );
-=======
+}
+
+// ============================================================================
 // Skew visibility (r1.s1.w3 — #13, veto fold C2)
 // ============================================================================
 
