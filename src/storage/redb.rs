@@ -3249,6 +3249,12 @@ impl StorageEngine for RedbStorage {
     }
 
     fn reinforce_experience(&self, id: ExperienceId) -> Result<Option<u32>> {
+        // Read the cached identity BEFORE opening the write transaction.
+        // `remint_instance_id` takes the identity write guard and then opens
+        // its own write transaction; taking these two in the opposite order
+        // here would let the two calls deadlock permanently (redb's
+        // `begin_write` blocks rather than failing).
+        let instance_id = self.current_instance_id();
         let write_txn = self.db.begin_write().map_err(StorageError::from)?;
         let (new_count, collective_id, timestamp) = {
             let mut exp_table = write_txn.open_table(EXPERIENCES_TABLE)?;
@@ -3262,10 +3268,7 @@ impl StorageEngine for RedbStorage {
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             drop(entry);
 
-            let bucket = experience
-                .applications
-                .entry(self.current_instance_id())
-                .or_insert(0);
+            let bucket = experience.applications.entry(instance_id).or_insert(0);
             *bucket = bucket.saturating_add(1);
             experience.last_reinforced = Timestamp::now();
             let new_count = experience.applications();
