@@ -21,7 +21,7 @@ use pulsedb::sync::manager::SyncManager;
 use pulsedb::sync::server::SyncServer;
 use pulsedb::sync::transport::SyncTransport;
 use pulsedb::sync::transport_http::HttpSyncTransport;
-use pulsedb::sync::types::{HandshakeRequest, InstanceId, PullRequest, SyncCursor};
+use pulsedb::sync::types::{HandshakeRequest, InstanceId, PullRequest, SyncPosition};
 use pulsedb::sync::{
     read_wire_preamble, write_wire_preamble, SYNC_PROTOCOL_VERSION, SYNC_WIRE_MAGIC,
     SYNC_WIRE_PREAMBLE_LEN, WIRE_FORMAT_VERSION,
@@ -179,7 +179,7 @@ async fn test_http_push_and_pull_roundtrip() {
 
     // Pull changes via HTTP
     let pull_request = PullRequest {
-        cursor: SyncCursor::new(InstanceId::new()),
+        cursor: SyncPosition::new(InstanceId::new(), 0),
         batch_size: 100,
         collectives: None,
     };

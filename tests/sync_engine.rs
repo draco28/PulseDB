@@ -678,3 +678,105 @@ async fn test_selective_collective_sync() {
         "Excluded experience should not sync"
     );
 }
+
+// ============================================================================
+// WAL compaction vs. unpushed local events (#9 — r1.s1.w1)
+// ============================================================================
+
+/// A remote *pull* position must never let `compact_wal` delete local events
+/// that have not been *pushed* yet (issue #9). Push and pull positions are
+/// tracked separately per peer, and compaction trusts only the push side.
+#[tokio::test]
+async fn test_compact_wal_keeps_unpushed_local_events() {
+    let (db_a, _dir_a) = open_db();
+    let (db_b, _dir_b) = open_db();
+    let (transport_a, transport_b) = InMemorySyncTransport::new_pair();
+    let peer_of_a = transport_a.instance_id();
+
+    let mut manager_a = SyncManager::new(Arc::clone(&db_a), Box::new(transport_a), sync_config());
+    // B pushes and pulls through separate managers over the same transport so
+    // B's own seeding push does not advance B's pull position past A's events.
+    let mut manager_b_push = SyncManager::new(
+        Arc::clone(&db_b),
+        Box::new(transport_b.clone()),
+        SyncConfig {
+            direction: SyncDirection::PushOnly,
+            ..sync_config()
+        },
+    );
+    let mut manager_b_pull = SyncManager::new(
+        Arc::clone(&db_b),
+        Box::new(transport_b),
+        SyncConfig {
+            direction: SyncDirection::PullOnly,
+            ..sync_config()
+        },
+    );
+
+    // Seed B so A's pull position lands well above A's own WAL.
+    let cid = db_b.create_collective("shared").unwrap();
+    for _ in 0..8 {
+        db_b.record_experience(minimal_exp(cid)).unwrap();
+    }
+    manager_b_push.sync_once().await.unwrap();
+
+    // initial_sync A <- B: A's pull position for B is now 9 (collective + 8).
+    manager_a.initial_sync(None).await.unwrap();
+    assert!(
+        db_a.get_collective(cid).unwrap().is_some(),
+        "A should have pulled B's collective"
+    );
+
+    // A writes locally: WAL seq 1 (sync-applied changes record no WAL events).
+    let local_id = db_a.record_experience(minimal_exp(cid)).unwrap();
+    assert_eq!(db_a.get_current_sequence().unwrap(), 1);
+
+    // Nothing has been pushed to B yet -> compaction must delete nothing.
+    let deleted = db_a.compact_wal().unwrap();
+    assert_eq!(
+        deleted, 0,
+        "compaction deleted unpushed local events off a remote pull position (#9)"
+    );
+    let pending = db_a.storage_for_test().poll_sync_events(0, 100).unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "the unpushed local event must survive compaction"
+    );
+    assert_eq!(pending[0].0, 1);
+
+    // Push A -> B; B pulls and has the record.
+    manager_a.sync_once().await.unwrap();
+    manager_b_pull.sync_once().await.unwrap();
+    assert!(
+        db_b.get_experience(local_id).unwrap().is_some(),
+        "B should have A's local record after the push"
+    );
+
+    // After the push, compaction may delete at most up to A's push position (1).
+    // A second local write above that position must survive.
+    db_a.record_experience(minimal_exp(cid)).unwrap();
+    assert_eq!(db_a.get_current_sequence().unwrap(), 2);
+    let cursor = db_a
+        .storage_for_test()
+        .load_sync_cursor(&peer_of_a)
+        .unwrap()
+        .expect("A persisted a cursor for B");
+    assert_eq!(cursor.push_sequence, 1, "push side = what B acknowledged");
+    assert_eq!(
+        cursor.pull_sequence, 9,
+        "pull side = B's WAL position, untouched by the push"
+    );
+    let deleted = db_a.compact_wal().unwrap();
+    assert!(
+        deleted <= cursor.push_sequence,
+        "compaction must not exceed the push position"
+    );
+    assert_eq!(deleted, 1, "compaction deletes exactly the pushed event");
+    let remaining = db_a.storage_for_test().poll_sync_events(0, 100).unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(
+        remaining[0].0, 2,
+        "the unpushed event above the push position survives"
+    );
+}

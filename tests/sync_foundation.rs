@@ -12,7 +12,7 @@ use pulsedb::sync::transport::SyncTransport;
 use pulsedb::sync::transport_mem::InMemorySyncTransport;
 use pulsedb::sync::types::{
     HandshakeRequest, InstanceId, PullRequest, SyncChange, SyncCursor, SyncEntityType, SyncPayload,
-    SyncStatus,
+    SyncPosition, SyncStatus,
 };
 use pulsedb::sync::SYNC_PROTOCOL_VERSION;
 use pulsedb::{Collective, CollectiveId, Config, Timestamp};
@@ -78,7 +78,8 @@ fn test_sync_cursor_save_and_load() {
     let peer_id = InstanceId::new();
     let cursor = SyncCursor {
         instance_id: peer_id,
-        last_sequence: 42,
+        push_sequence: 42,
+        pull_sequence: 0,
     };
 
     // Save
@@ -114,7 +115,8 @@ fn test_sync_cursor_upsert() {
     storage
         .save_sync_cursor(&SyncCursor {
             instance_id: peer_id,
-            last_sequence: 10,
+            push_sequence: 10,
+            pull_sequence: 0,
         })
         .unwrap();
 
@@ -122,12 +124,13 @@ fn test_sync_cursor_upsert() {
     storage
         .save_sync_cursor(&SyncCursor {
             instance_id: peer_id,
-            last_sequence: 50,
+            push_sequence: 50,
+            pull_sequence: 0,
         })
         .unwrap();
 
     let loaded = storage.load_sync_cursor(&peer_id).unwrap().unwrap();
-    assert_eq!(loaded.last_sequence, 50);
+    assert_eq!(loaded.push_sequence, 50);
 }
 
 #[test]
@@ -144,19 +147,22 @@ fn test_sync_cursor_list_multiple_peers() {
     storage
         .save_sync_cursor(&SyncCursor {
             instance_id: peer_a,
-            last_sequence: 10,
+            push_sequence: 10,
+            pull_sequence: 0,
         })
         .unwrap();
     storage
         .save_sync_cursor(&SyncCursor {
             instance_id: peer_b,
-            last_sequence: 20,
+            push_sequence: 20,
+            pull_sequence: 0,
         })
         .unwrap();
     storage
         .save_sync_cursor(&SyncCursor {
             instance_id: peer_c,
-            last_sequence: 30,
+            push_sequence: 30,
+            pull_sequence: 0,
         })
         .unwrap();
 
@@ -184,7 +190,8 @@ fn test_sync_cursor_persists_across_reopens() {
         storage
             .save_sync_cursor(&SyncCursor {
                 instance_id: peer_id,
-                last_sequence: 99,
+                push_sequence: 99,
+                pull_sequence: 0,
             })
             .unwrap();
         drop(storage);
@@ -194,7 +201,7 @@ fn test_sync_cursor_persists_across_reopens() {
     {
         let storage = pulsedb::storage::RedbStorage::open(&path, &config).unwrap();
         let loaded = storage.load_sync_cursor(&peer_id).unwrap().unwrap();
-        assert_eq!(loaded.last_sequence, 99);
+        assert_eq!(loaded.push_sequence, 99);
     }
 }
 
@@ -281,7 +288,7 @@ async fn test_memory_transport_full_roundtrip() {
 
     // Pull changes from remote (shared buffer)
     let pull_req = PullRequest {
-        cursor: SyncCursor::new(remote.instance_id()),
+        cursor: SyncPosition::new(remote.instance_id(), 0),
         batch_size: 500,
         collectives: None,
     };
@@ -306,14 +313,14 @@ async fn test_memory_transport_incremental_pull() {
 
     // Pull first batch (size 2)
     let pull1 = PullRequest {
-        cursor: SyncCursor::new(remote.instance_id()),
+        cursor: SyncPosition::new(remote.instance_id(), 0),
         batch_size: 2,
         collectives: None,
     };
     let resp1 = remote.pull_changes(pull1).await.unwrap();
     assert_eq!(resp1.changes.len(), 2);
     assert!(resp1.has_more);
-    assert_eq!(resp1.new_cursor.last_sequence, 2);
+    assert_eq!(resp1.new_cursor.sequence, 2);
 
     // Pull next batch from cursor
     let pull2 = PullRequest {
@@ -324,7 +331,7 @@ async fn test_memory_transport_incremental_pull() {
     let resp2 = remote.pull_changes(pull2).await.unwrap();
     assert_eq!(resp2.changes.len(), 2);
     assert!(resp2.has_more);
-    assert_eq!(resp2.new_cursor.last_sequence, 4);
+    assert_eq!(resp2.new_cursor.sequence, 4);
 
     // Pull remainder
     let pull3 = PullRequest {
@@ -335,7 +342,7 @@ async fn test_memory_transport_incremental_pull() {
     let resp3 = remote.pull_changes(pull3).await.unwrap();
     assert_eq!(resp3.changes.len(), 1);
     assert!(!resp3.has_more);
-    assert_eq!(resp3.new_cursor.last_sequence, 5);
+    assert_eq!(resp3.new_cursor.sequence, 5);
 }
 
 // ============================================================================
@@ -418,7 +425,8 @@ fn test_instance_id_postcard_roundtrip() {
 fn test_sync_cursor_postcard_roundtrip() {
     let cursor = SyncCursor {
         instance_id: InstanceId::new(),
-        last_sequence: 12345,
+        push_sequence: 12345,
+        pull_sequence: 0,
     };
     let bytes = postcard::to_stdvec(&cursor).unwrap();
     let restored: SyncCursor = postcard::from_bytes(&bytes).unwrap();
@@ -759,7 +767,8 @@ fn test_compact_wal_single_peer() {
     let peer_id = InstanceId::new();
     let cursor = SyncCursor {
         instance_id: peer_id,
-        last_sequence: 4,
+        push_sequence: 4,
+        pull_sequence: 0,
     };
     db.storage_for_test().save_sync_cursor(&cursor).unwrap();
 
@@ -791,13 +800,15 @@ fn test_compact_wal_multiple_peers_uses_min_cursor() {
     db.storage_for_test()
         .save_sync_cursor(&SyncCursor {
             instance_id: peer_a,
-            last_sequence: 3,
+            push_sequence: 3,
+            pull_sequence: 0,
         })
         .unwrap();
     db.storage_for_test()
         .save_sync_cursor(&SyncCursor {
             instance_id: peer_b,
-            last_sequence: 7,
+            push_sequence: 7,
+            pull_sequence: 0,
         })
         .unwrap();
 
@@ -825,7 +836,8 @@ fn test_compact_wal_preserves_events_above_cursor() {
     db.storage_for_test()
         .save_sync_cursor(&SyncCursor {
             instance_id: InstanceId::new(),
-            last_sequence: 2,
+            push_sequence: 2,
+            pull_sequence: 0,
         })
         .unwrap();
 
@@ -848,7 +860,8 @@ fn test_compact_wal_idempotent() {
     db.storage_for_test()
         .save_sync_cursor(&SyncCursor {
             instance_id: InstanceId::new(),
-            last_sequence: 2,
+            push_sequence: 2,
+            pull_sequence: 0,
         })
         .unwrap();
 

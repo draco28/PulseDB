@@ -17,7 +17,7 @@ use super::config::SyncConfig;
 use super::error::SyncError;
 use super::transport::SyncTransport;
 use super::types::{
-    InstanceId, SerializableExperienceUpdate, SyncChange, SyncCursor, SyncEntityType, SyncPayload,
+    InstanceId, SerializableExperienceUpdate, SyncChange, SyncEntityType, SyncPayload,
 };
 
 /// Polls local WAL events and pushes them to a remote peer via transport.
@@ -75,16 +75,24 @@ impl LocalChangePusher {
         }
 
         if changes.is_empty() {
-            // All events were filtered or entities were deleted — still save cursor
-            self.save_push_cursor()?;
+            // All events were filtered or entities were deleted — nothing to
+            // acknowledge. Advance the push position past them: they will never
+            // be pushed to this peer, so compaction may reclaim them.
+            self.save_push_cursor(self.poller.last_sequence())?;
             return Ok(0);
         }
 
         let count = changes.len();
-        let _response = self.transport.push_changes(changes).await?;
+        let response = self.transport.push_changes(changes).await?;
 
-        // Persist cursor after successful push
-        self.save_push_cursor()?;
+        // Persist the position the peer ACKNOWLEDGED, bounded by what was
+        // actually polled: a peer cannot advance the push position — and so
+        // unlock compaction — past events it was never sent.
+        let acknowledged = response
+            .new_cursor
+            .sequence
+            .min(self.poller.last_sequence());
+        self.save_push_cursor(acknowledged)?;
 
         debug!(count, "Pushed local changes to remote");
         Ok(count)
@@ -258,15 +266,12 @@ impl LocalChangePusher {
         }
     }
 
-    /// Persists the current push cursor position.
-    fn save_push_cursor(&self) -> Result<(), SyncError> {
-        let cursor = SyncCursor {
-            instance_id: self.peer_instance_id,
-            last_sequence: self.poller.last_sequence(),
-        };
+    /// Persists the push position for this peer (push side only — the pull
+    /// position is owned by the manager's pull path and is never touched here).
+    fn save_push_cursor(&self, sequence: u64) -> Result<(), SyncError> {
         self.db
             .storage_for_test()
-            .save_sync_cursor(&cursor)
+            .update_push_cursor(&self.peer_instance_id, sequence)
             .map_err(|e| SyncError::transport(format!("Failed to save push cursor: {}", e)))
     }
 }

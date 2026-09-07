@@ -22,7 +22,7 @@ use super::error::SyncError;
 use super::progress::SyncProgressCallback;
 use super::pusher::LocalChangePusher;
 use super::transport::SyncTransport;
-use super::types::{HandshakeRequest, InstanceId, PullRequest, SyncCursor, SyncStatus};
+use super::types::{HandshakeRequest, InstanceId, PullRequest, SyncPosition, SyncStatus};
 use super::{SYNC_CAPABILITY_GCOUNTER_APPLICATIONS, SYNC_PROTOCOL_VERSION};
 
 /// Orchestrator for sync operations between two PulseDB instances.
@@ -138,8 +138,8 @@ impl SyncManager {
 
         self.set_status(SyncStatus::Syncing);
 
-        // Load saved push cursor
-        let push_seq = self.load_cursor_sequence(peer_id)?;
+        // Load the saved push position (push side of the per-peer cursor).
+        let push_seq = self.load_push_sequence(peer_id)?;
         let mut pusher = LocalChangePusher::new(
             Arc::clone(&self.db),
             Arc::clone(&self.transport),
@@ -197,14 +197,11 @@ impl SyncManager {
         let applier = RemoteChangeApplier::new(Arc::clone(&self.db), self.config.clone());
 
         let mut total_pulled = 0usize;
-        let mut cursor = SyncCursor {
-            instance_id: peer_id,
-            last_sequence: self.load_cursor_sequence(peer_id)?,
-        };
+        let mut position = SyncPosition::new(peer_id, self.load_pull_sequence(peer_id)?);
 
         loop {
             let pull_request = PullRequest {
-                cursor: cursor.clone(),
+                cursor: position.clone(),
                 batch_size: self.config.batch_size,
                 collectives: self.config.collectives.clone(),
             };
@@ -217,10 +214,11 @@ impl SyncManager {
             }
 
             total_pulled += batch_size;
-            cursor = response.new_cursor;
+            position = response.new_cursor;
 
-            // Save cursor after each batch (crash-safe)
-            self.save_cursor(&cursor)?;
+            // Save the pull position after each batch (crash-safe). Pull side
+            // only — the push position is never touched here.
+            self.save_pull_position(peer_id, position.sequence)?;
 
             if let Some(ref cb) = progress {
                 cb.on_progress(batch_size, total_pulled, response.has_more);
@@ -283,19 +281,30 @@ impl SyncManager {
         }
     }
 
-    fn load_cursor_sequence(&self, peer_id: InstanceId) -> Result<u64, SyncError> {
+    /// The persisted push position for `peer_id` (0 if no cursor yet).
+    fn load_push_sequence(&self, peer_id: InstanceId) -> Result<u64, SyncError> {
         self.db
             .storage_for_test()
             .load_sync_cursor(&peer_id)
             .map_err(|e| SyncError::transport(format!("Failed to load cursor: {}", e)))
-            .map(|opt| opt.map_or(0, |c| c.last_sequence))
+            .map(|opt| opt.map_or(0, |c| c.push_sequence))
     }
 
-    fn save_cursor(&self, cursor: &SyncCursor) -> Result<(), SyncError> {
+    /// The persisted pull position for `peer_id` (0 if no cursor yet).
+    fn load_pull_sequence(&self, peer_id: InstanceId) -> Result<u64, SyncError> {
         self.db
             .storage_for_test()
-            .save_sync_cursor(cursor)
-            .map_err(|e| SyncError::transport(format!("Failed to save cursor: {}", e)))
+            .load_sync_cursor(&peer_id)
+            .map_err(|e| SyncError::transport(format!("Failed to load cursor: {}", e)))
+            .map(|opt| opt.map_or(0, |c| c.pull_sequence))
+    }
+
+    /// Persists the pull position for `peer_id` (pull side only).
+    fn save_pull_position(&self, peer_id: InstanceId, sequence: u64) -> Result<(), SyncError> {
+        self.db
+            .storage_for_test()
+            .update_pull_cursor(&peer_id, sequence)
+            .map_err(|e| SyncError::transport(format!("Failed to save pull cursor: {}", e)))
     }
 
     /// Pull changes from remote and apply them locally.
@@ -304,12 +313,9 @@ impl SyncManager {
         applier: &RemoteChangeApplier,
         peer_id: InstanceId,
     ) -> Result<usize, SyncError> {
-        let cursor_seq = self.load_cursor_sequence(peer_id)?;
+        let pull_seq = self.load_pull_sequence(peer_id)?;
         let pull_request = PullRequest {
-            cursor: SyncCursor {
-                instance_id: peer_id,
-                last_sequence: cursor_seq,
-            },
+            cursor: SyncPosition::new(peer_id, pull_seq),
             batch_size: self.config.batch_size,
             collectives: self.config.collectives.clone(),
         };
@@ -319,7 +325,7 @@ impl SyncManager {
 
         if count > 0 {
             applier.apply_batch(response.changes)?;
-            self.save_cursor(&response.new_cursor)?;
+            self.save_pull_position(peer_id, response.new_cursor.sequence)?;
         }
 
         Ok(count)
@@ -361,12 +367,12 @@ impl SyncManager {
                     break;
                 }
                 _ = tokio::time::sleep(sleep_duration) => {
-                    // Build push cursor from saved state
+                    // Build the pusher from the saved push position
                     let push_seq = db
                         .storage_for_test()
                         .load_sync_cursor(&peer_id)
                         .unwrap_or(None)
-                        .map_or(0, |c| c.last_sequence);
+                        .map_or(0, |c| c.push_sequence);
 
                     let mut pusher = LocalChangePusher::new(
                         Arc::clone(&db),
@@ -435,17 +441,14 @@ impl SyncManager {
             config.direction,
             SyncDirection::PullOnly | SyncDirection::Bidirectional
         ) {
-            let cursor_seq = db
+            let pull_seq = db
                 .storage_for_test()
                 .load_sync_cursor(&peer_id)
                 .map_err(|e| SyncError::transport(format!("cursor load: {}", e)))?
-                .map_or(0, |c| c.last_sequence);
+                .map_or(0, |c| c.pull_sequence);
 
             let pull_request = PullRequest {
-                cursor: SyncCursor {
-                    instance_id: peer_id,
-                    last_sequence: cursor_seq,
-                },
+                cursor: SyncPosition::new(peer_id, pull_seq),
                 batch_size: config.batch_size,
                 collectives: config.collectives.clone(),
             };
@@ -455,9 +458,9 @@ impl SyncManager {
 
             if count > 0 {
                 applier.apply_batch(response.changes)?;
-                let cursor = response.new_cursor;
+                // Pull side only — the pusher owns the push position.
                 db.storage_for_test()
-                    .save_sync_cursor(&cursor)
+                    .update_pull_cursor(&peer_id, response.new_cursor.sequence)
                     .map_err(|e| SyncError::transport(format!("cursor save: {}", e)))?;
             }
         }

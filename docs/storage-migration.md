@@ -1,8 +1,9 @@
 # Storage migration & crash-recovery posture
 
 > Applies to the one-time **upgrade-on-open** migration that runs when an older PulseDB store is opened
-> by a newer binary. Covers the redb file-format upgrade (v2→v3) and the value-codec cutover
-> (bincode→postcard, `SUBSTRATE_FORMAT` marker 1→2). Steady-state opens are unaffected.
+> by a newer binary. Covers the redb file-format upgrade (v2→v3), the value-codec cutover
+> (bincode→postcard, `SUBSTRATE_FORMAT` marker 1→2) and the logical-schema reshapes (v3→v4 tags,
+> v4→v5 sync-cursor split — see *Schema v5* below). Steady-state opens are unaffected.
 
 ## What happens on first open of an older store
 
@@ -71,3 +72,48 @@ that clears the single-txn budget.
   stores — deferred (tracked as crash-recovery / resumability follow-up #46).
 - **Kill-at-every-boundary fault-injection tests** — deferred to the real-fixture hardening slice (#46).
 - **Offline `pulsedb migrate` tool** implementation — deferred (#45).
+
+## Schema v5 (0.8.0): sync cursors reset
+
+**What changed.** The per-peer sync cursor used to be a single slot (`SyncCursor { instance_id,
+last_sequence }`) that the push path and the pull path both overwrote. A remote *pull* position could
+therefore land in the slot `compact_wal` trusted, and compaction deleted local events that had never
+been pushed (issue #9). Schema v5 splits the record into
+`SyncCursor { instance_id, push_sequence, pull_sequence }`: `push_sequence` is the local WAL sequence
+the peer has acknowledged, `pull_sequence` is the remote WAL sequence applied locally, and
+`compact_wal` uses `min(push_sequence)` only. The wire format is unchanged (`SYNC_PROTOCOL_VERSION`
+stays 4): pull/push messages carry a single-direction `SyncPosition { instance_id, sequence }` whose
+bytes equal the old wire cursor.
+
+**What happens on the first writable open of a schema-4 store** (every 0.7.x store):
+
+1. **Pristine backup.** `<db>.pre-v5.bak` is claimed as a byte-for-byte copy of the file **before the
+   first writable redb open** (a redb read-only open peeks at `schema_version`; a writable open would
+   already rewrite the file's allocator pages). If that peek cannot run (crashed session, locked file),
+   the copy is taken after the open instead — a valid store, but not byte-identical. The sidecar is
+   never overwritten once it exists. (The same pre-open claim now covers `.pre-v4.bak` for redb-v3
+   schema-3 stores; redb-v2 stores keep `.pre-substrate.bak` as their pristine copy.)
+2. **Cursor reset (single write transaction).** Every `sync_cursors` row is rewritten as
+   `{ instance_id, push_sequence: 0, pull_sequence: 0 }`. The legacy `last_sequence` is **not** used
+   to seed either side — it may hold a local *or* a remote sequence, and seeding from it could skip
+   events. Each discarded value is logged at `warn` (one line per peer) as the audit trail. The store's
+   `schema_version` becomes `5`; the substrate marker (`redb-v3, postcard`) is unchanged. The reset runs
+   on builds **with and without** the `sync` feature (it goes through a feature-independent raw-table
+   helper).
+3. **Read-only opens refuse.** A `read_only` open of a not-yet-migrated schema-4 store returns the typed
+   `ReadOnly` error and performs zero writes (no sidecar, no migration), as for v3→v4.
+
+**Consequences for operators.**
+
+- **One full, idempotent resync per peer.** With both positions at 0, the next sync pushes the whole
+  local WAL again and pulls the peer's WAL from the start; all sync applies are idempotent (G-counter
+  merges, create-collision merges), so totals stay exact.
+- **Compaction stays blocked until the next push to each peer** (`push_sequence == 0` blocks it). A
+  peer this instance only ever pulls from (`SyncDirection::PullOnly`) keeps the WAL growing until a push
+  happens — the conservative rule is deliberate (see `PulseDB::compact_wal`).
+- **Events compacted before the upgrade are not recoverable.** If a pre-0.8.0 compaction already
+  deleted unpushed events (the #9 failure), the migration cannot restore them; the resync covers only
+  what is still in the WAL.
+- **Rollback** (ADR-011): reinstall 0.7.x and restore `<db>.pre-v5.bak` over the store. A 0.7.x
+  binary refuses a schema-5 store with `SchemaVersionMismatch`, so a downgrade without the restore
+  fails loud rather than misreading cursors.

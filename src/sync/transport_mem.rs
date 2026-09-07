@@ -12,7 +12,7 @@ use super::error::SyncError;
 use super::transport::SyncTransport;
 use super::types::{
     HandshakeRequest, HandshakeResponse, InstanceId, PullRequest, PullResponse, PushResponse,
-    SyncChange, SyncCursor,
+    SyncChange, SyncPosition,
 };
 use super::SYNC_PROTOCOL_VERSION;
 
@@ -94,10 +94,7 @@ impl SyncTransport for InMemorySyncTransport {
         Ok(PushResponse {
             accepted,
             rejected: 0,
-            new_cursor: SyncCursor {
-                instance_id: self.peer_instance_id,
-                last_sequence: max_seq,
-            },
+            new_cursor: SyncPosition::new(self.peer_instance_id, max_seq),
         })
     }
 
@@ -107,7 +104,7 @@ impl SyncTransport for InMemorySyncTransport {
             .lock()
             .map_err(|e| SyncError::transport(format!("buffer lock poisoned: {}", e)))?;
 
-        let after_seq = request.cursor.last_sequence;
+        let after_seq = request.cursor.sequence;
         let batch_size = request.batch_size;
 
         // Filter changes after the cursor position
@@ -136,10 +133,7 @@ impl SyncTransport for InMemorySyncTransport {
         Ok(PullResponse {
             changes: batch,
             has_more,
-            new_cursor: SyncCursor {
-                instance_id: self.peer_instance_id,
-                last_sequence: new_seq,
-            },
+            new_cursor: SyncPosition::new(self.peer_instance_id, new_seq),
         })
     }
 
@@ -216,14 +210,14 @@ mod tests {
 
         // Pull all via remote (shared buffer)
         let pull_req = PullRequest {
-            cursor: SyncCursor::new(remote.instance_id()),
+            cursor: SyncPosition::new(remote.instance_id(), 0),
             batch_size: 100,
             collectives: None,
         };
         let pull_resp = remote.pull_changes(pull_req).await.unwrap();
         assert_eq!(pull_resp.changes.len(), 3);
         assert!(!pull_resp.has_more);
-        assert_eq!(pull_resp.new_cursor.last_sequence, 3);
+        assert_eq!(pull_resp.new_cursor.sequence, 3);
     }
 
     #[tokio::test]
@@ -237,10 +231,7 @@ mod tests {
 
         // Pull starting after sequence 3
         let pull_req = PullRequest {
-            cursor: SyncCursor {
-                instance_id: remote.instance_id(),
-                last_sequence: 3,
-            },
+            cursor: SyncPosition::new(remote.instance_id(), 3),
             batch_size: 100,
             collectives: None,
         };
@@ -261,14 +252,14 @@ mod tests {
 
         // Pull with batch_size=3
         let pull_req = PullRequest {
-            cursor: SyncCursor::new(remote.instance_id()),
+            cursor: SyncPosition::new(remote.instance_id(), 0),
             batch_size: 3,
             collectives: None,
         };
         let pull_resp = remote.pull_changes(pull_req).await.unwrap();
         assert_eq!(pull_resp.changes.len(), 3);
         assert!(pull_resp.has_more);
-        assert_eq!(pull_resp.new_cursor.last_sequence, 3);
+        assert_eq!(pull_resp.new_cursor.sequence, 3);
     }
 
     #[tokio::test]
@@ -286,7 +277,7 @@ mod tests {
 
         // Pull only cid_a
         let pull_req = PullRequest {
-            cursor: SyncCursor::new(remote.instance_id()),
+            cursor: SyncPosition::new(remote.instance_id(), 0),
             batch_size: 100,
             collectives: Some(vec![cid_a]),
         };
@@ -299,7 +290,7 @@ mod tests {
     async fn test_pull_empty_buffer() {
         let (_, remote) = InMemorySyncTransport::new_pair();
         let pull_req = PullRequest {
-            cursor: SyncCursor::new(remote.instance_id()),
+            cursor: SyncPosition::new(remote.instance_id(), 0),
             batch_size: 100,
             collectives: None,
         };
