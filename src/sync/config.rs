@@ -181,8 +181,14 @@ pub struct SyncConfig {
     /// configured `batch_size` can legitimately produce — or `validate()`
     /// refuses the pair.
     ///
-    /// Absent from a deserialized config (every persisted 0.7.x one), it falls
-    /// back to the default rather than failing the load.
+    /// Absent from a deserialized config in a **self-describing** format
+    /// (JSON/TOML/YAML — a persisted 0.7.x one), it falls back to the default
+    /// rather than failing the load. A **postcard**-encoded 0.7.x config does
+    /// NOT load: postcard writes a struct as a fixed-length sequence carrying
+    /// no field names, so the buffer ends before this field and the
+    /// deserializer hits end-of-input — there is no missing *field* for a
+    /// serde default to fill, only absent *bytes*. Re-encode such a config from
+    /// a self-describing form, or from `SyncConfig::default()`.
     #[serde(default = "default_max_request_bytes")]
     pub max_request_bytes: usize,
 
@@ -206,17 +212,36 @@ pub struct SyncConfig {
     ///
     /// Default: 300 000 (5 minutes, [`DEFAULT_MAX_CLOCK_SKEW_MS`]).
     ///
-    /// Absent from a deserialized config (every persisted 0.7.x one), it falls
-    /// back to the default rather than failing the load.
+    /// Absent from a deserialized config in a **self-describing** format
+    /// (JSON/TOML/YAML — a persisted 0.7.x one), it falls back to the default
+    /// rather than failing the load. A **postcard**-encoded 0.7.x config does
+    /// NOT load: postcard writes a struct as a fixed-length sequence carrying
+    /// no field names, so the buffer ends before this field and the
+    /// deserializer hits end-of-input — there is no missing *field* for a
+    /// serde default to fill, only absent *bytes*. Re-encode such a config from
+    /// a self-describing form, or from `SyncConfig::default()`.
     #[serde(default = "default_max_clock_skew_ms")]
     pub max_clock_skew_ms: u64,
 }
 
 /// `serde` fallback for [`SyncConfig::max_request_bytes`].
 ///
-/// The field was added in 0.8.0. Without this a persisted 0.7.x config fails
-/// to load with ``missing field `max_request_bytes` `` — a hard startup
-/// failure, not a fallback.
+/// The field was added in 0.8.0. Without this a persisted 0.7.x config in a
+/// **self-describing** format (JSON, TOML, YAML) fails to load with
+/// ``missing field `max_request_bytes` `` — a hard startup failure, not a
+/// fallback.
+///
+/// **It rescues self-describing formats only.** A **postcard**-encoded 0.7.x
+/// `SyncConfig` still fails to load, and no `#[serde(default)]` can change
+/// that: postcard writes a struct as a fixed-length sequence carrying no field
+/// names, so a 0.7.x buffer simply ends after `sync_insights` and the
+/// deserializer hits end-of-input — there is no missing *field* for a default
+/// to fill, only absent *bytes*. postcard is a supported representation of this
+/// type (see `test_sync_config_postcard_roundtrip`), so a consumer that
+/// persisted a `SyncConfig` that way must re-encode it from a self-describing
+/// form, or from `SyncConfig::default()`, after upgrading.
+/// A versioned or custom deserializer for that case is deferred to a tracked
+/// issue.
 fn default_max_request_bytes() -> usize {
     DEFAULT_MAX_REQUEST_BYTES
 }
@@ -444,9 +469,10 @@ mod tests {
 
     /// A persisted 0.7.x `SyncConfig` carries neither `max_request_bytes` nor
     /// `max_clock_skew_ms`. Both were added in 0.8.0, so without
-    /// `#[serde(default)]` every stored config fails to load with
-    /// ``missing field `max_request_bytes` `` — a hard startup failure rather
-    /// than a fallback.
+    /// `#[serde(default)]` a config stored in a **self-describing** format
+    /// fails to load with ``missing field `max_request_bytes` `` — a hard
+    /// startup failure rather than a fallback. (The defaults cannot rescue a
+    /// postcard-encoded 0.7.x config; see [`default_max_request_bytes`].)
     #[test]
     fn test_sync_config_deserializes_a_0_7_x_payload_without_the_new_fields() {
         let legacy = r#"{
