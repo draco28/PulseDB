@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`SyncCursor.last_sequence` removed** (replaced by `push_sequence` / `pull_sequence`); `PullRequest.cursor`, `PullResponse.new_cursor` and `PushResponse.new_cursor` are `SyncPosition` (was `SyncCursor`). Custom `SyncTransport` implementations and code constructing these messages must move to the new field names.
 
 ### Breaking
-- **`SyncConfig` gains `max_request_bytes` and `max_clock_skew_ms`.** Struct literals without `..Default::default()` must add the new fields. (`sync` feature.)
+- **`SyncConfig` gains `max_request_bytes` and `max_clock_skew_ms`.** Struct literals without `..Default::default()` must add the new fields. **Deserialization is unaffected** — both fields carry `#[serde(default)]`, so a persisted 0.7.x config still loads and picks up the new defaults rather than failing with `missing field`. (`sync` feature.)
 - **New `SyncError::PayloadTooLarge` variant** — exhaustive matches on `SyncError` must handle it. (`sync` feature.)
 
 ## [0.7.0] - 2026-08-09

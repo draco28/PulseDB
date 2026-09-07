@@ -180,6 +180,10 @@ pub struct SyncConfig {
     /// and at least `batch_size * MAX_CONTENT_SIZE` — the largest batch the
     /// configured `batch_size` can legitimately produce — or `validate()`
     /// refuses the pair.
+    ///
+    /// Absent from a deserialized config (every persisted 0.7.x one), it falls
+    /// back to the default rather than failing the load.
+    #[serde(default = "default_max_request_bytes")]
     pub max_request_bytes: usize,
 
     /// Clock-skew allowance, in milliseconds, for an incoming experience's
@@ -199,7 +203,26 @@ pub struct SyncConfig {
     /// this setting only decides what is *surfaced*, never what is *stored*.
     ///
     /// Default: 300 000 (5 minutes, [`DEFAULT_MAX_CLOCK_SKEW_MS`]).
+    ///
+    /// Absent from a deserialized config (every persisted 0.7.x one), it falls
+    /// back to the default rather than failing the load.
+    #[serde(default = "default_max_clock_skew_ms")]
     pub max_clock_skew_ms: u64,
+}
+
+/// `serde` fallback for [`SyncConfig::max_request_bytes`].
+///
+/// The field was added in 0.8.0. Without this a persisted 0.7.x config fails
+/// to load with ``missing field `max_request_bytes` `` — a hard startup
+/// failure, not a fallback.
+fn default_max_request_bytes() -> usize {
+    DEFAULT_MAX_REQUEST_BYTES
+}
+
+/// `serde` fallback for [`SyncConfig::max_clock_skew_ms`]; see
+/// [`default_max_request_bytes`].
+fn default_max_clock_skew_ms() -> u64 {
+    DEFAULT_MAX_CLOCK_SKEW_MS
 }
 
 impl Default for SyncConfig {
@@ -415,6 +438,68 @@ mod tests {
         let restored: SyncConfig = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(config.direction, restored.direction);
         assert_eq!(config.batch_size, restored.batch_size);
+    }
+
+    /// A persisted 0.7.x `SyncConfig` carries neither `max_request_bytes` nor
+    /// `max_clock_skew_ms`. Both were added in 0.8.0, so without
+    /// `#[serde(default)]` every stored config fails to load with
+    /// ``missing field `max_request_bytes` `` — a hard startup failure rather
+    /// than a fallback.
+    #[test]
+    fn test_sync_config_deserializes_a_0_7_x_payload_without_the_new_fields() {
+        let legacy = r#"{
+            "direction": "Bidirectional",
+            "conflict_resolution": "ServerWins",
+            "batch_size": 500,
+            "push_interval_ms": 1000,
+            "pull_interval_ms": 1000,
+            "retry": {
+                "max_retries": 5,
+                "initial_backoff_ms": 500,
+                "max_backoff_ms": 30000,
+                "backoff_multiplier": 2.0
+            },
+            "collectives": null,
+            "sync_relations": true,
+            "sync_insights": true
+        }"#;
+
+        let config: SyncConfig =
+            serde_json::from_str(legacy).expect("a 0.7.x config must still load");
+
+        assert_eq!(config.max_request_bytes, DEFAULT_MAX_REQUEST_BYTES);
+        assert_eq!(config.max_clock_skew_ms, DEFAULT_MAX_CLOCK_SKEW_MS);
+        // The rest of the payload is preserved, and the result is usable.
+        assert_eq!(config.batch_size, 500);
+        assert_eq!(config.direction, SyncDirection::Bidirectional);
+        assert!(config.validate().is_ok());
+    }
+
+    /// An explicit value in the payload still wins over the fallback.
+    #[test]
+    fn test_sync_config_deserialize_honours_explicit_new_fields() {
+        let payload = r#"{
+            "direction": "PushOnly",
+            "conflict_resolution": "LastWriteWins",
+            "batch_size": 10,
+            "push_interval_ms": 1000,
+            "pull_interval_ms": 1000,
+            "retry": {
+                "max_retries": 5,
+                "initial_backoff_ms": 500,
+                "max_backoff_ms": 30000,
+                "backoff_multiplier": 2.0
+            },
+            "collectives": null,
+            "sync_relations": true,
+            "sync_insights": true,
+            "max_request_bytes": 2097152,
+            "max_clock_skew_ms": 42
+        }"#;
+
+        let config: SyncConfig = serde_json::from_str(payload).unwrap();
+        assert_eq!(config.max_request_bytes, 2 * 1024 * 1024);
+        assert_eq!(config.max_clock_skew_ms, 42);
     }
 
     #[test]
