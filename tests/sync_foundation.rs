@@ -206,6 +206,97 @@ fn test_sync_cursor_persists_across_reopens() {
 }
 
 // ============================================================================
+// Cursor positions are monotonic non-decreasing (PR #88 review, class A)
+// ============================================================================
+
+/// A push whose FIRST change fails to apply is acknowledged as sequence 0.
+/// Writing that 0 over an already-advanced `push_sequence` would permanently
+/// wedge `compact_wal` — it blocks while any peer's push position is 0 — and
+/// re-push the whole WAL every cycle forever. The zero ack must leave the
+/// stored position exactly where it was.
+#[test]
+fn test_zero_push_acknowledgement_does_not_rewind_the_stored_position() {
+    let dir = tempdir().unwrap();
+    let config = Config::default();
+    let storage =
+        pulsedb::storage::RedbStorage::open(dir.path().join("cursor.db"), &config).unwrap();
+
+    let peer_id = InstanceId::new();
+
+    // The peer has acknowledged through 120 over previous cycles.
+    storage.update_push_cursor(&peer_id, 120).unwrap();
+    assert_eq!(
+        storage
+            .load_sync_cursor(&peer_id)
+            .unwrap()
+            .unwrap()
+            .push_sequence,
+        120
+    );
+
+    // The next batch's first change fails to apply: the peer acknowledges 0.
+    storage.update_push_cursor(&peer_id, 0).unwrap();
+
+    let loaded = storage.load_sync_cursor(&peer_id).unwrap().unwrap();
+    assert_eq!(
+        loaded.push_sequence, 120,
+        "a zero acknowledgement must never move the push position backwards"
+    );
+    assert_eq!(loaded.pull_sequence, 0, "the pull side is untouched");
+}
+
+/// The same rule for every backwards acknowledgement, not just zero, and on
+/// both sides of the record.
+#[test]
+fn test_cursor_positions_are_monotonic_non_decreasing() {
+    let dir = tempdir().unwrap();
+    let config = Config::default();
+    let storage =
+        pulsedb::storage::RedbStorage::open(dir.path().join("cursor.db"), &config).unwrap();
+
+    let peer_id = InstanceId::new();
+
+    storage.update_push_cursor(&peer_id, 50).unwrap();
+    storage.update_pull_cursor(&peer_id, 70).unwrap();
+
+    // Backwards acknowledgements are absorbed.
+    storage.update_push_cursor(&peer_id, 20).unwrap();
+    storage.update_pull_cursor(&peer_id, 0).unwrap();
+
+    let loaded = storage.load_sync_cursor(&peer_id).unwrap().unwrap();
+    assert_eq!(loaded.push_sequence, 50);
+    assert_eq!(loaded.pull_sequence, 70);
+
+    // Forward acknowledgements still advance.
+    storage.update_push_cursor(&peer_id, 51).unwrap();
+    storage.update_pull_cursor(&peer_id, 71).unwrap();
+
+    let loaded = storage.load_sync_cursor(&peer_id).unwrap().unwrap();
+    assert_eq!(loaded.push_sequence, 51);
+    assert_eq!(loaded.pull_sequence, 71);
+}
+
+/// The monotonic clamp must not stop an absent record from being created — a
+/// zero-valued update is how an empty pull registers a `PullOnly` peer.
+#[test]
+fn test_zero_update_still_registers_an_unknown_peer() {
+    let dir = tempdir().unwrap();
+    let config = Config::default();
+    let storage =
+        pulsedb::storage::RedbStorage::open(dir.path().join("cursor.db"), &config).unwrap();
+
+    let peer_id = InstanceId::new();
+    storage.update_pull_cursor(&peer_id, 0).unwrap();
+
+    let loaded = storage
+        .load_sync_cursor(&peer_id)
+        .unwrap()
+        .expect("an empty pull must still create the peer's record");
+    assert_eq!(loaded.push_sequence, 0);
+    assert_eq!(loaded.pull_sequence, 0);
+}
+
+// ============================================================================
 // SyncApplyGuard (thread-local echo prevention)
 // ============================================================================
 

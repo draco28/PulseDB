@@ -45,6 +45,10 @@ pub struct ApplyResult {
     /// counts either — the peer must be able to retry it, and the sender's
     /// `push_sequence` (which is what `compact_wal` trusts) is derived from
     /// this value.
+    ///
+    /// It is a running maximum over the sequences handled before the halt, so
+    /// a batch a remote peer ordered arbitrarily still reports the *highest*
+    /// safe sequence rather than the last one seen.
     pub safe_through: Option<u64>,
     /// Number of changes in this batch whose incoming `last_reinforced` lay
     /// beyond `now + SyncConfig::max_clock_skew_ms` (#13).
@@ -87,6 +91,11 @@ impl RemoteChangeApplier {
         // Once a change errors, nothing at or after it may be acknowledged:
         // the sender derives its push position from `safe_through`, and
         // compaction deletes below that position.
+        //
+        // `safe_through` is kept as a running MAXIMUM, not the last sequence
+        // handled: a remote peer controls the batch's order, so a batch whose
+        // sequences are not ascending would otherwise report the last one
+        // rather than the highest, contradicting the field's contract.
         let mut halted = false;
 
         for change in changes {
@@ -101,20 +110,23 @@ impl RemoteChangeApplier {
                 Ok(ApplyOutcome::Applied) => {
                     result.applied += 1;
                     if !halted {
-                        result.safe_through = Some(sequence);
+                        result.safe_through =
+                            Some(result.safe_through.map_or(sequence, |s| s.max(sequence)));
                     }
                 }
                 Ok(ApplyOutcome::Skipped) => {
                     result.skipped += 1;
                     if !halted {
-                        result.safe_through = Some(sequence);
+                        result.safe_through =
+                            Some(result.safe_through.map_or(sequence, |s| s.max(sequence)));
                     }
                 }
                 Ok(ApplyOutcome::ConflictResolved) => {
                     result.applied += 1;
                     result.conflicts += 1;
                     if !halted {
-                        result.safe_through = Some(sequence);
+                        result.safe_through =
+                            Some(result.safe_through.map_or(sequence, |s| s.max(sequence)));
                     }
                 }
                 Err(e) => {
@@ -690,5 +702,45 @@ mod tests {
             )])
             .unwrap();
         assert_eq!(result.skewed_timestamps, 0);
+    }
+
+    /// `safe_through` is documented as "the highest sequence at or below which
+    /// every change was applied". A remote peer controls the batch's order, so
+    /// a batch whose sequences are not ascending must still report the highest
+    /// one — reporting the last would rewind the sender's push position.
+    #[test]
+    fn safe_through_is_the_highest_sequence_not_the_last_one() {
+        let (db, _dir) = open_db();
+        let applier = RemoteChangeApplier::new(Arc::clone(&db), SyncConfig::default());
+
+        let collective = |seq: u64| {
+            let cid = CollectiveId::new();
+            SyncChange {
+                sequence: seq,
+                source_instance: InstanceId::new(),
+                collective_id: cid,
+                entity_type: SyncEntityType::Collective,
+                payload: SyncPayload::CollectiveCreated(crate::collective::Collective {
+                    id: cid,
+                    name: format!("out-of-order-{seq}"),
+                    owner_id: None,
+                    embedding_dimension: 384,
+                    created_at: Timestamp::now(),
+                    updated_at: Timestamp::now(),
+                }),
+                timestamp: Timestamp::now(),
+            }
+        };
+
+        let result = applier
+            .apply_batch(vec![collective(9), collective(3)])
+            .unwrap();
+
+        assert_eq!(result.applied, 2);
+        assert_eq!(
+            result.safe_through,
+            Some(9),
+            "the running maximum, not the last sequence handled"
+        );
     }
 }

@@ -594,22 +594,29 @@ pub trait StorageEngine: Send + Sync {
     #[cfg(feature = "sync")]
     fn list_sync_cursors(&self) -> Result<Vec<crate::sync::SyncCursor>>;
 
-    /// Sets the **push** position for `peer` — the local WAL sequence the peer
-    /// has acknowledged — leaving its pull position untouched.
+    /// Advances the **push** position for `peer` — the local WAL sequence the
+    /// peer has acknowledged — leaving its pull position untouched.
     ///
     /// A single-transaction read-modify-write, so the pusher and the puller
     /// can never lose each other's half of the record. Creates the record
     /// (with `pull_sequence = 0`) if the peer has none yet.
+    ///
+    /// **Monotonic non-decreasing.** The persisted value is
+    /// `max(stored, sequence)`: an acknowledgement below the stored position —
+    /// including the zero a peer reports when the batch's *first* change failed
+    /// to apply — never moves the position backwards. A backwards step would
+    /// wedge [`compact_wal`](crate::PulseDB::compact_wal), which blocks while
+    /// any peer's push position is 0, and re-push the whole WAL every cycle.
     #[cfg(feature = "sync")]
     fn update_push_cursor(&self, peer: &crate::sync::InstanceId, sequence: u64) -> Result<()>;
 
-    /// Sets the **pull** position for `peer` — the remote WAL sequence applied
-    /// locally — leaving its push position untouched.
+    /// Advances the **pull** position for `peer` — the remote WAL sequence
+    /// applied locally — leaving its push position untouched.
     ///
-    /// Same single-transaction read-modify-write contract as
-    /// [`update_push_cursor`](Self::update_push_cursor). Creates the record
-    /// (with `push_sequence = 0`, which keeps compaction blocked for the peer)
-    /// if the peer has none yet.
+    /// Same single-transaction read-modify-write and monotonic non-decreasing
+    /// contract as [`update_push_cursor`](Self::update_push_cursor). Creates
+    /// the record (with `push_sequence = 0`, which keeps compaction blocked for
+    /// the peer) if the peer has none yet.
     #[cfg(feature = "sync")]
     fn update_pull_cursor(&self, peer: &crate::sync::InstanceId, sequence: u64) -> Result<()>;
 

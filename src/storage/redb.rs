@@ -4100,15 +4100,42 @@ impl StorageEngine for RedbStorage {
 
     #[cfg(feature = "sync")]
     fn update_push_cursor(&self, peer: &crate::sync::InstanceId, sequence: u64) -> Result<()> {
-        self.update_sync_cursor(peer, |cursor| cursor.push_sequence = sequence)?;
-        debug!(peer = %peer, push_sequence = sequence, "Updated push cursor");
+        // Monotonic non-decreasing: `max(stored, sequence)`. A push whose FIRST
+        // change fails is acknowledged as sequence 0, and writing that 0 over an
+        // already-advanced position would permanently wedge `compact_wal` (it
+        // blocks while any peer sits at 0) and re-push the whole WAL every
+        // cycle. An acknowledgement below the stored position is information the
+        // peer already gave us, never a retreat.
+        let mut stored = sequence;
+        self.update_sync_cursor(peer, |cursor| {
+            cursor.push_sequence = cursor.push_sequence.max(sequence);
+            stored = cursor.push_sequence;
+        })?;
+        debug!(
+            peer = %peer,
+            acknowledged = sequence,
+            push_sequence = stored,
+            "Updated push cursor"
+        );
         Ok(())
     }
 
     #[cfg(feature = "sync")]
     fn update_pull_cursor(&self, peer: &crate::sync::InstanceId, sequence: u64) -> Result<()> {
-        self.update_sync_cursor(peer, |cursor| cursor.pull_sequence = sequence)?;
-        debug!(peer = %peer, pull_sequence = sequence, "Updated pull cursor");
+        // Monotonic non-decreasing, for the same reason as the push side: a
+        // batch whose first change failed to apply reports position 0, and that
+        // must not undo progress an earlier pull already made durable.
+        let mut stored = sequence;
+        self.update_sync_cursor(peer, |cursor| {
+            cursor.pull_sequence = cursor.pull_sequence.max(sequence);
+            stored = cursor.pull_sequence;
+        })?;
+        debug!(
+            peer = %peer,
+            applied_through = sequence,
+            pull_sequence = stored,
+            "Updated pull cursor"
+        );
         Ok(())
     }
 
