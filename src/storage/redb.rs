@@ -227,6 +227,58 @@ fn pre_v5_backup_path(path: &Path) -> PathBuf {
     backup
 }
 
+/// The permission bits of the source store, for mirroring onto a sidecar copy.
+///
+/// `None` when they cannot be read — the caller then leaves the sidecar on the
+/// process default, exactly as before this existed.
+#[cfg(unix)]
+fn source_permission_mode(source: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(source)
+        .ok()
+        .map(|metadata| metadata.permissions().mode() & 0o7777)
+}
+
+/// Creates `sidecar` as a brand-new file (`create_new`/O_EXCL) carrying the
+/// permission bits of `source`.
+///
+/// Every sidecar in the backup family is a byte copy of the database, so it
+/// must not be more readable than the database. Creating it with the process
+/// default (commonly `0644` under a `022` umask) exposes the contents of a
+/// store restricted to `0600` to every account that can reach the directory.
+/// The bits are supplied at CREATION rather than chmod'ed afterwards, so there
+/// is no window in which a partially written copy is world-readable; O_CREAT
+/// masks the mode by the umask, which can only remove bits, so the second
+/// `set_permissions` restores the source's exact mode once the file exists.
+///
+/// Unix-only: other platforms create the file exactly as before. Best-effort in
+/// the same posture as the rest of the sidecar family — a permissions failure
+/// is swallowed and must never turn a successful `open` into an error.
+fn create_sidecar_file(source: &Path, sidecar: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    let mode = source_permission_mode(source);
+    #[cfg(not(unix))]
+    let _ = source;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+
+    let file = options.open(sidecar)?;
+
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(mode));
+    }
+
+    Ok(file)
+}
+
 /// Claims the logical-schema backup sidecar at `backup_path` as a plain file
 /// copy of `path` (the `.pre-v3.bak` / `.pre-v4.bak` / `.pre-v5.bak` family).
 ///
@@ -238,16 +290,15 @@ fn pre_v5_backup_path(path: &Path) -> PathBuf {
 /// `.pre-substrate.bak` uses the temp+rename [`backup_once`] pattern because it
 /// runs under the exclusive migration lock; the schema backup does not.)
 ///
+/// The sidecar is created through [`create_sidecar_file`], so it carries the
+/// SOURCE store's permission bits rather than the process default.
+///
 /// Returns `Ok(true)` when this call created the sidecar, `Ok(false)` when an
 /// existing one was preserved.
 fn claim_schema_backup_copy(path: &Path, backup_path: &Path) -> Result<bool> {
     // r1.s3: temp+rename+fsync — this schema-sidecar copy path is the plain
     // `create_new` + `io::copy` form; hardening it (#25) is r1.s3's.
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(backup_path)
-    {
+    match create_sidecar_file(path, backup_path) {
         Ok(mut backup_file) => {
             let copy_result = std::fs::File::open(path)
                 .and_then(|mut source| std::io::copy(&mut source, &mut backup_file).map(|_| ()));
@@ -379,12 +430,11 @@ fn backup_once(src: &Path, backup_path: &Path) -> Result<BackupOutcome> {
     // file. We therefore never write THROUGH a symlink to an attacker-chosen target,
     // and never wedge on a stale temp. A concurrent re-plant makes `create_new` fail
     // closed rather than follow it; legitimately there is no race (MigrationLock).
+    // The temp carries `src`'s permission bits ([`create_sidecar_file`]) and the
+    // rename below publishes that same inode, so the sidecar is never more
+    // readable than the store it copies.
     let _ = std::fs::remove_file(&temp_path);
-    let mut temp_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(PulseDBError::Io)?;
+    let mut temp_file = create_sidecar_file(src, &temp_path).map_err(PulseDBError::Io)?;
     // Open the redb file `src`: reads of `src` are the lock-contention signal — a
     // concurrent migrator holding the redb file lock surfaces on Windows as a raw
     // lock/sharing violation, so classify it as the typed, retryable DatabaseLocked
@@ -858,16 +908,25 @@ impl RedbStorage {
     ///    `schema_version` back off it: it must equal the `schema_version` the
     ///    peek already established for the source. A torn copy fails to open,
     ///    fails the metadata read, or reads back a different version;
-    /// 3. publish by atomic `rename`, so the final path transitions absent →
-    ///    fully-formed in one step.
+    /// 3. publish by linking the validated temp onto the final path, so it
+    ///    transitions absent → fully-formed in one step.
     ///
-    /// `create_new` semantics are preserved: an already-published sidecar is never
-    /// overwritten — checked before staging AND again before the rename; the
-    /// staged copy is discarded and `Ok(false)` returned with the same
-    /// preserve-it logging. Any validation or I/O failure removes the temp,
-    /// publishes NOTHING and returns `Err`, which the best-effort caller only
-    /// logs — `open_existing`'s post-lock claim (which does hold the writer lock,
-    /// via `claim_schema_backup_copy`) remains the fallback, unchanged.
+    /// `create_new` semantics are preserved, and **enforced** rather than merely
+    /// checked. The publish is `hard_link`, NOT `rename`: `rename` REPLACES an
+    /// existing destination on both Unix and Windows, so two processes that both
+    /// saw the sidecar absent would let the second silently overwrite the first's
+    /// genuine, published rollback point. `hard_link` is create-if-absent — it
+    /// fails with `AlreadyExists`, which is the same preserve-it branch as the
+    /// pre-staging and pre-publish checks (`Ok(false)`, same logging). The temp
+    /// is removed on EVERY path, the success one included, since the link leaves
+    /// it behind.
+    ///
+    /// Any validation or I/O failure — a `hard_link` error that is not
+    /// `AlreadyExists` included (a filesystem without links, a cross-device
+    /// temp) — removes the temp, publishes NOTHING and returns `Err`, which the
+    /// best-effort caller only logs: `open_existing`'s post-lock claim (which
+    /// does hold the writer lock, via `claim_schema_backup_copy`) remains the
+    /// fallback, unchanged, and `open` still succeeds.
     ///
     /// Durability (fsync of the staged bytes and of the parent directory) is out
     /// of scope here — issue #89 / r1.s3 own it for the whole sidecar family.
@@ -895,17 +954,33 @@ impl RedbStorage {
             debug!("pre-migration backup already exists; preserving it");
             return Ok(false);
         }
-        if let Err(error) = std::fs::rename(&temp_path, backup_path) {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(PulseDBError::Io(error));
+
+        // Publish with a create-if-absent primitive, not `rename`: `rename`
+        // replaces an existing destination, so the check above would be a
+        // check-then-act race — two processes both find the sidecar absent and
+        // the second silently overwrites the first's genuine rollback point.
+        // `hard_link` fails closed with `AlreadyExists` instead.
+        let published = std::fs::hard_link(&temp_path, backup_path);
+        // The link does not consume the temp; remove it on every path, success
+        // included.
+        let _ = std::fs::remove_file(&temp_path);
+        match published {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                debug!("pre-migration backup already exists; preserving it");
+                Ok(false)
+            }
+            Err(error) => Err(PulseDBError::Io(error)),
         }
-        // The rename consumed the temp: nothing to clean up on the success path.
-        Ok(true)
     }
 
     /// Stages a copy of `path` at `temp_path` and proves the STAGED bytes are a
     /// whole store carrying `schema_version` (the version the pristine peek read
     /// off the source). The caller removes `temp_path` on `Err`.
+    ///
+    /// The temp is created through [`create_sidecar_file`], so it carries the
+    /// source store's permission bits from the first byte written — and the
+    /// publishing hard link keeps them, since it publishes this very inode.
     fn stage_pristine_schema_backup(
         path: &Path,
         temp_path: &Path,
@@ -916,11 +991,7 @@ impl RedbStorage {
         // fresh regular file — a stale temp from a crashed run never wedges the
         // retry, and a hostile symlink is never written THROUGH.
         let _ = std::fs::remove_file(temp_path);
-        let mut temp_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(temp_path)
-            .map_err(PulseDBError::Io)?;
+        let mut temp_file = create_sidecar_file(path, temp_path).map_err(PulseDBError::Io)?;
         // Reads of the redb file are the lock-contention signal (Windows surfaces a
         // concurrent holder as a raw sharing violation), so classify them; writes to
         // our own temp are sidecar-space ⇒ plain `Io`. `io::copy` conflates the two,
@@ -4812,6 +4883,84 @@ mod tests {
         // into an error.
         let storage = RedbStorage::open(&path, &default_config()).unwrap();
         Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_pristine_schema_backup_publishes_the_validated_bytes_and_keeps_no_temp() {
+        // The publish is a create-if-absent hard link rather than a rename, so
+        // the staged temp survives it and must be removed on the SUCCESS path
+        // too — and an already-published sidecar is preserved, never replaced.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+        Box::new(storage).close().unwrap();
+
+        let backup_path = pre_v5_backup_path(&path);
+        let temp_path = pristine_schema_backup_temp_path(&backup_path);
+        assert!(
+            RedbStorage::claim_pristine_schema_backup_copy(&path, &backup_path, SCHEMA_VERSION)
+                .unwrap(),
+            "the first claim publishes the sidecar"
+        );
+        assert_eq!(
+            std::fs::read(&backup_path).unwrap(),
+            std::fs::read(&path).unwrap(),
+            "the published sidecar must be the validated copy of the store"
+        );
+        assert!(
+            !temp_path.exists(),
+            "the staging temp must not survive a successful publish"
+        );
+
+        // A second claim keeps the published rollback point untouched.
+        let published = std::fs::read(&backup_path).unwrap();
+        assert!(
+            !RedbStorage::claim_pristine_schema_backup_copy(&path, &backup_path, SCHEMA_VERSION)
+                .unwrap(),
+            "an already-published sidecar is preserved, not re-published"
+        );
+        assert_eq!(std::fs::read(&backup_path).unwrap(), published);
+        assert!(!temp_path.exists());
+    }
+
+    /// A sidecar is a byte copy of the database, so it must never be more
+    /// readable than the database: a store restricted to `0600` in a directory
+    /// other accounts can reach would otherwise get a `0644` copy of its
+    /// contents. Both claim paths carry the source's mode onto the copy.
+    #[cfg(unix)]
+    #[test]
+    fn test_schema_backup_sidecars_carry_the_source_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode_of = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+        Box::new(storage).close().unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // The pristine path: staged at a temp, published by hard link, so the
+        // mode is the one the temp was created with.
+        let pristine = pre_v5_backup_path(&path);
+        assert!(
+            RedbStorage::claim_pristine_schema_backup_copy(&path, &pristine, SCHEMA_VERSION)
+                .unwrap()
+        );
+        assert_eq!(
+            mode_of(&pristine),
+            0o600,
+            "the pristine sidecar must not be more readable than the store"
+        );
+
+        // The post-lock path: `create_new` straight at the final path.
+        let post_lock = pre_v4_backup_path(&path);
+        assert!(claim_schema_backup_copy(&path, &post_lock).unwrap());
+        assert_eq!(
+            mode_of(&post_lock),
+            0o600,
+            "the post-lock sidecar must not be more readable than the store"
+        );
     }
 
     #[test]
