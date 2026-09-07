@@ -2526,6 +2526,19 @@ impl RedbStorage {
     /// redb serializes write transactions, so the pusher (push side) and the
     /// puller (pull side) can interleave freely without one overwriting the
     /// other's half of the record (issue #9).
+    ///
+    /// **A no-op mutation of an existing record costs no durable write.** The
+    /// pull path persists its position on every cycle, empty pulls included,
+    /// and the intervals default to one second — so an idle deployment would
+    /// otherwise pay one `begin_write` + durable `commit` (fsync) per second
+    /// per peer to write bytes identical to what is already on disk. When the
+    /// record existed and `mutate` left it unchanged, the transaction is
+    /// aborted instead of committed.
+    ///
+    /// When the record was **absent** it is always written, even at both
+    /// positions 0: creating the record is what registers the peer in the
+    /// cursor store, and `compact_wal` needs to see its `push_sequence == 0`
+    /// to stay blocked for a peer that has only ever been pulled from.
     #[cfg(feature = "sync")]
     fn update_sync_cursor(
         &self,
@@ -2533,23 +2546,37 @@ impl RedbStorage {
         mutate: impl FnOnce(&mut crate::sync::SyncCursor),
     ) -> Result<()> {
         let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        let mut wrote = false;
         {
             let mut table = write_txn.open_table(SYNC_CURSORS_TABLE)?;
-            let mut cursor = match table.get(peer.as_bytes())? {
+            let existing: Option<crate::sync::SyncCursor> = match table.get(peer.as_bytes())? {
                 Some(entry) => {
-                    let existing: crate::sync::SyncCursor = postcard::from_bytes(entry.value())
+                    let decoded: crate::sync::SyncCursor = postcard::from_bytes(entry.value())
                         .map_err(|e| StorageError::serialization(e.to_string()))?;
                     drop(entry);
-                    existing
+                    Some(decoded)
                 }
-                None => crate::sync::SyncCursor::new(*peer),
+                None => None,
             };
+            let mut cursor = existing
+                .clone()
+                .unwrap_or_else(|| crate::sync::SyncCursor::new(*peer));
             mutate(&mut cursor);
-            let bytes = postcard::to_stdvec(&cursor)
-                .map_err(|e| StorageError::serialization(e.to_string()))?;
-            table.insert(peer.as_bytes(), bytes.as_slice())?;
+
+            if existing.as_ref() != Some(&cursor) {
+                let bytes = postcard::to_stdvec(&cursor)
+                    .map_err(|e| StorageError::serialization(e.to_string()))?;
+                table.insert(peer.as_bytes(), bytes.as_slice())?;
+                wrote = true;
+            }
         }
-        write_txn.commit().map_err(StorageError::from)?;
+        if wrote {
+            write_txn.commit().map_err(StorageError::from)?;
+        } else {
+            // Nothing changed: discard the transaction rather than paying an
+            // fsync to rewrite the bytes already on disk.
+            write_txn.abort().map_err(StorageError::from)?;
+        }
         Ok(())
     }
 }

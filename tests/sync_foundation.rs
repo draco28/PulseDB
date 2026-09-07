@@ -296,6 +296,39 @@ fn test_zero_update_still_registers_an_unknown_peer() {
     assert_eq!(loaded.pull_sequence, 0);
 }
 
+/// The pull path persists its position on every cycle, empty pulls included,
+/// and the intervals default to one second — so a no-op update must not pay a
+/// durable write. An update that changes nothing about an existing record
+/// leaves the store file untouched.
+#[test]
+fn test_no_op_cursor_update_does_not_touch_the_store() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("cursor.db");
+    let config = Config::default();
+    let storage = pulsedb::storage::RedbStorage::open(&path, &config).unwrap();
+
+    let peer_id = InstanceId::new();
+    storage.update_pull_cursor(&peer_id, 7).unwrap();
+
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+    // Ten idle cycles' worth of "persist the position we already have".
+    for _ in 0..10 {
+        storage.update_pull_cursor(&peer_id, 7).unwrap();
+        storage.update_push_cursor(&peer_id, 0).unwrap();
+    }
+
+    let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+    assert_eq!(
+        before, after,
+        "a cursor update that changes nothing must not commit a write transaction"
+    );
+
+    let loaded = storage.load_sync_cursor(&peer_id).unwrap().unwrap();
+    assert_eq!(loaded.pull_sequence, 7);
+    assert_eq!(loaded.push_sequence, 0);
+}
+
 // ============================================================================
 // SyncApplyGuard (thread-local echo prevention)
 // ============================================================================
