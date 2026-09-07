@@ -37,6 +37,15 @@ pub struct ApplyResult {
     pub skipped: usize,
     /// Number of changes where conflict resolution was used.
     pub conflicts: usize,
+    /// Highest sequence that is safe to acknowledge: every change at or below
+    /// it was applied, resolved, or idempotently skipped. `None` when the very
+    /// first change failed.
+    ///
+    /// A change that *errored* stops this advancing, and nothing after it
+    /// counts either — the peer must be able to retry it, and the sender's
+    /// `push_sequence` (which is what `compact_wal` trusts) is derived from
+    /// this value.
+    pub safe_through: Option<u64>,
     /// Number of changes in this batch whose incoming `last_reinforced` lay
     /// beyond `now + SyncConfig::max_clock_skew_ms` (#13).
     ///
@@ -75,7 +84,13 @@ impl RemoteChangeApplier {
     pub fn apply_batch(&self, changes: Vec<SyncChange>) -> Result<ApplyResult, SyncError> {
         let mut result = ApplyResult::default();
 
+        // Once a change errors, nothing at or after it may be acknowledged:
+        // the sender derives its push position from `safe_through`, and
+        // compaction deletes below that position.
+        let mut halted = false;
+
         for change in changes {
+            let sequence = change.sequence;
             // #13: surface a skewed reinforcement timestamp BEFORE the apply,
             // so it is counted whatever the apply's outcome. Detection never
             // alters the change — it is applied exactly as received.
@@ -83,15 +98,30 @@ impl RemoteChangeApplier {
                 result.skewed_timestamps += 1;
             }
             match self.apply_single(change) {
-                Ok(ApplyOutcome::Applied) => result.applied += 1,
-                Ok(ApplyOutcome::Skipped) => result.skipped += 1,
+                Ok(ApplyOutcome::Applied) => {
+                    result.applied += 1;
+                    if !halted {
+                        result.safe_through = Some(sequence);
+                    }
+                }
+                Ok(ApplyOutcome::Skipped) => {
+                    result.skipped += 1;
+                    if !halted {
+                        result.safe_through = Some(sequence);
+                    }
+                }
                 Ok(ApplyOutcome::ConflictResolved) => {
                     result.applied += 1;
                     result.conflicts += 1;
+                    if !halted {
+                        result.safe_through = Some(sequence);
+                    }
                 }
                 Err(e) => {
-                    warn!("Failed to apply sync change: {}", e);
-                    // Continue applying remaining changes — don't fail the batch
+                    warn!(sequence, "Failed to apply sync change: {}", e);
+                    // Continue applying the rest — a later change may be
+                    // independent — but never acknowledge past this one.
+                    halted = true;
                     result.skipped += 1;
                 }
             }
@@ -102,6 +132,7 @@ impl RemoteChangeApplier {
             skipped = result.skipped,
             conflicts = result.conflicts,
             skewed_timestamps = result.skewed_timestamps,
+            safe_through = result.safe_through,
             "Applied remote change batch"
         );
         Ok(result)
@@ -444,6 +475,61 @@ mod tests {
         assert_eq!(merged.applications(), 6);
         assert_eq!(merged.last_reinforced, incoming_last_reinforced);
         assert!((merged.importance - 0.9).abs() < f32::EPSILON);
+    }
+
+    /// A change that fails to apply must stop the acknowledged position dead:
+    /// the sender turns `safe_through` into its `push_sequence`, and
+    /// `compact_wal` deletes below that, so acknowledging past a rejected
+    /// change would let the sender discard a WAL event this peer never stored.
+    #[test]
+    fn a_rejected_change_stops_the_acknowledged_position() {
+        let (db, _dir) = open_db();
+        let cid = db.create_collective("applier-ack-bound").unwrap();
+        let good_a = db.record_experience(minimal_exp(cid)).unwrap();
+        let good_b = db.record_experience(minimal_exp(cid)).unwrap();
+
+        // A hostile payload the applier refuses (same bound as above).
+        let mut buckets = BTreeMap::new();
+        for i in 0..=(MAX_SYNC_APPLICATION_BUCKETS as u128) {
+            buckets.insert(InstanceId::from_bytes(i.to_le_bytes()), 1u32);
+        }
+        let poison = SerializableExperienceUpdate {
+            applications: Some(buckets),
+            ..Default::default()
+        };
+        let benign = SerializableExperienceUpdate {
+            importance: Some(0.5),
+            ..Default::default()
+        };
+
+        let at = |seq: u64, id, update| {
+            let mut c = change(
+                SyncPayload::ExperienceUpdated {
+                    id,
+                    update,
+                    timestamp: Timestamp::from_millis(0),
+                },
+                cid,
+            );
+            c.sequence = seq;
+            c
+        };
+        let batch = vec![
+            at(7, good_a, benign.clone()),
+            at(8, good_b, poison),
+            at(9, good_a, benign),
+        ];
+
+        let applier = RemoteChangeApplier::new(Arc::clone(&db), SyncConfig::default());
+        let result = applier.apply_batch(batch).unwrap();
+
+        assert_eq!(
+            result.safe_through,
+            Some(7),
+            "acknowledgement must stop at the last change before the failure, \
+             not run on to the last change that happened to succeed"
+        );
+        assert_eq!(result.skipped, 1, "the rejected change counts as skipped");
     }
 
     #[test]

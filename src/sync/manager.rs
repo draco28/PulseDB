@@ -360,8 +360,13 @@ impl SyncManager {
             applier
                 .apply_batch(response.changes)?
                 .record_into(&self.stats);
-            self.save_pull_position(peer_id, response.new_cursor.sequence)?;
         }
+        // Persist on EVERY successful pull, empty batches included. The record
+        // is what represents this peer in the cursor store, and `compact_wal`
+        // needs to see its `push_sequence == 0` to stay blocked; a PullOnly
+        // peer that never returns changes would otherwise have no record at
+        // all, and compaction would delete events it has never been sent.
+        self.save_pull_position(peer_id, response.new_cursor.sequence)?;
 
         Ok(count)
     }
@@ -497,11 +502,13 @@ impl SyncManager {
 
             if count > 0 {
                 applier.apply_batch(response.changes)?.record_into(stats);
-                // Pull side only — the pusher owns the push position.
-                db.storage_for_test()
-                    .update_pull_cursor(&peer_id, response.new_cursor.sequence)
-                    .map_err(|e| SyncError::transport(format!("cursor save: {}", e)))?;
             }
+            // Persist on every successful pull, empty included — see
+            // `pull_and_apply`. Pull side only; the pusher owns the push
+            // position.
+            db.storage_for_test()
+                .update_pull_cursor(&peer_id, response.new_cursor.sequence)
+                .map_err(|e| SyncError::transport(format!("cursor save: {}", e)))?;
         }
 
         Ok(())

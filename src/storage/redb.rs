@@ -689,6 +689,7 @@ impl RedbStorage {
     /// A poisoned lock is recovered rather than propagated: the guarded value
     /// is a plain `Copy` id that is always written whole, so a panic elsewhere
     /// cannot have left it half-updated.
+    #[cfg(feature = "sync")]
     fn current_instance_id(&self) -> InstanceId {
         *self
             .instance_id
@@ -3249,12 +3250,19 @@ impl StorageEngine for RedbStorage {
     }
 
     fn reinforce_experience(&self, id: ExperienceId) -> Result<Option<u32>> {
-        // Read the cached identity BEFORE opening the write transaction.
-        // `remint_instance_id` takes the identity write guard and then opens
-        // its own write transaction; taking these two in the opposite order
-        // here would let the two calls deadlock permanently (redb's
-        // `begin_write` blocks rather than failing).
-        let instance_id = self.current_instance_id();
+        // Identity guard FIRST, held across the whole transaction — the same
+        // order `remint_instance_id` uses (identity lock, then redb writer).
+        // Taking the two in opposite orders deadlocks permanently, because
+        // redb's `begin_write` blocks rather than failing; taking the identity
+        // read and releasing it before `begin_write` avoids the deadlock but
+        // lets a remint commit and return while a reinforcement is parked, so
+        // the increment lands under the retired id and a restored clone can
+        // re-collide. Holding it linearizes the two.
+        let identity = self
+            .instance_id
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance_id = *identity;
         let write_txn = self.db.begin_write().map_err(StorageError::from)?;
         let (new_count, collective_id, timestamp) = {
             let mut exp_table = write_txn.open_table(EXPERIENCES_TABLE)?;

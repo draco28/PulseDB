@@ -892,3 +892,52 @@ async fn manager_stats_count_skewed_last_reinforced() {
     manager_a.sync_once().await.unwrap();
     assert_eq!(manager_a.stats().skewed_timestamps, 1);
 }
+
+// ============================================================================
+// Empty pulls still register the peer (#9 follow-up — PR #88 review)
+// ============================================================================
+
+/// A pull that returns nothing must still persist the peer's cursor record.
+/// The record is what represents the peer in the cursor store, and
+/// `compact_wal` needs to see its `push_sequence == 0` to stay blocked. Without
+/// it a `PullOnly` peer is invisible, and once other peers acknowledge the
+/// local WAL, compaction deletes events this peer was never sent.
+#[tokio::test]
+async fn empty_pull_still_registers_the_peer_and_blocks_compaction() {
+    let (db_a, _dir_a) = open_db();
+    let (_db_b, _dir_b) = open_db();
+    let (transport_a, transport_b) = InMemorySyncTransport::new_pair();
+    let peer_of_a = transport_a.instance_id();
+    drop(transport_b);
+
+    // B has nothing to offer, so A's pull comes back empty.
+    let mut manager_a = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(transport_a),
+        SyncConfig {
+            direction: SyncDirection::PullOnly,
+            ..sync_config()
+        },
+    );
+    manager_a.sync_once().await.unwrap();
+
+    // The peer must nevertheless be on record, at push_sequence 0.
+    let cursor = db_a
+        .storage_for_test()
+        .load_sync_cursor(&peer_of_a)
+        .unwrap()
+        .expect("an empty pull must still register the peer");
+    assert_eq!(
+        cursor.push_sequence, 0,
+        "nothing has been pushed to this peer"
+    );
+
+    // A writes locally; compaction must not touch it while that peer sits at 0.
+    let cid = db_a.create_collective("local-only").unwrap();
+    db_a.record_experience(minimal_exp(cid)).unwrap();
+    assert_eq!(
+        db_a.compact_wal().unwrap(),
+        0,
+        "a peer at push_sequence 0 blocks compaction"
+    );
+}

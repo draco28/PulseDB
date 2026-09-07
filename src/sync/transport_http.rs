@@ -172,12 +172,16 @@ impl HttpSyncTransport {
 
         let status = response.status();
         if !status.is_success() {
-            // Error bodies are read under the same cap; an unreadable or
-            // oversized one degrades to "unknown" rather than masking the status.
-            let body_text = Self::read_body_bounded(response, self.max_response_bytes)
-                .await
-                .map(|b| String::from_utf8_lossy(&b).into_owned())
-                .unwrap_or_else(|_| "unknown".into());
+            // Error bodies are read under the same cap. An oversized one keeps
+            // its typed identity — a caller checking `is_payload_too_large()`
+            // must see it whether the cap was hit on a success or an error
+            // response — while an ordinary unreadable body degrades to
+            // "unknown" rather than masking the status.
+            let body_text = match Self::read_body_bounded(response, self.max_response_bytes).await {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(err @ SyncError::PayloadTooLarge { .. }) => return Err(err),
+                Err(_) => "unknown".into(),
+            };
             return Err(if status.is_client_error() {
                 SyncError::invalid_payload(format!("HTTP {}: {}", status, body_text))
             } else {
