@@ -35,7 +35,7 @@ use super::config::SyncConfig;
 use super::error::SyncError;
 use super::types::{
     HandshakeRequest, HandshakeResponse, InstanceId, PullRequest, PullResponse, PushResponse,
-    SyncChange, SyncCursor,
+    SyncChange, SyncPosition,
 };
 use super::{read_wire_preamble, write_wire_preamble, SYNC_PROTOCOL_VERSION};
 
@@ -119,10 +119,7 @@ impl SyncServer {
         Ok(PushResponse {
             accepted: result.applied,
             rejected: result.skipped,
-            new_cursor: SyncCursor {
-                instance_id: source,
-                last_sequence: max_seq,
-            },
+            new_cursor: SyncPosition::new(source, max_seq),
         })
     }
 
@@ -130,7 +127,7 @@ impl SyncServer {
     #[instrument(skip(self, request))]
     pub fn handle_pull(&self, request: PullRequest) -> Result<PullResponse, SyncError> {
         let storage = self.db.storage_for_test();
-        let mut poller = ChangePoller::from_sequence(request.cursor.last_sequence);
+        let mut poller = ChangePoller::from_sequence(request.cursor.sequence);
 
         let events = poller
             .poll_sync_events(storage)
@@ -159,15 +156,12 @@ impl SyncServer {
         let new_seq = changes
             .last()
             .map(|c| c.sequence)
-            .unwrap_or(request.cursor.last_sequence);
+            .unwrap_or(request.cursor.sequence);
 
         Ok(PullResponse {
             changes,
             has_more,
-            new_cursor: SyncCursor {
-                instance_id: self.instance_id,
-                last_sequence: new_seq,
-            },
+            new_cursor: SyncPosition::new(self.instance_id, new_seq),
         })
     }
 

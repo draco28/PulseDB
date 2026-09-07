@@ -28,7 +28,7 @@
 //! # Module Overview
 //!
 //! **Core** (always with `sync` feature):
-//! - `types` — Wire types: `SyncChange`, `SyncPayload`, `InstanceId`, `SyncCursor`
+//! - `types` — Wire types: `SyncChange`, `SyncPayload`, `InstanceId`, `SyncPosition` (+ the persisted `SyncCursor` record)
 //! - `config` — `SyncConfig`, `SyncDirection`, `ConflictResolution`, `RetryConfig`
 //! - `error` — `SyncError` enum (Transport, Timeout, ProtocolVersion, etc.)
 //! - `transport` — `SyncTransport` pluggable trait
@@ -49,7 +49,8 @@
 //! The WAL grows unboundedly as entities are created/updated/deleted.
 //! Call [`PulseDB::compact_wal()`](crate::PulseDB::compact_wal) periodically
 //! to trim events that all peers have already synced. Compaction uses the
-//! min-cursor strategy: only events below the oldest peer's cursor are removed.
+//! min-push-position strategy: only events every peer has acknowledged receiving
+//! are removed (pull positions never feed compaction — issue #9).
 
 pub mod applier;
 pub mod config;

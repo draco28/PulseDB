@@ -3240,11 +3240,28 @@ impl PulseDB {
     // Sync WAL Compaction (feature: sync)
     // =========================================================================
 
-    /// Compacts the WAL by removing events that all peers have already synced.
+    /// Compacts the WAL by removing events that every peer has already
+    /// **received**.
     ///
-    /// Finds the minimum cursor across all known peers and deletes WAL events
-    /// up to that sequence. If no peers exist, no compaction occurs (events
-    /// may be needed when a peer connects later).
+    /// Takes the minimum **push** position across all known peers
+    /// (`SyncCursor::push_sequence` — the local WAL sequence each peer has
+    /// acknowledged) and deletes WAL events up to that sequence. Pull positions
+    /// (`SyncCursor::pull_sequence`) never feed compaction: a pull position is a
+    /// *remote* WAL sequence, and trusting it here deleted unpushed local events
+    /// (issue #9).
+    ///
+    /// The rule is deliberately conservative:
+    ///
+    /// - If no peers exist, nothing is compacted (events may be needed when a
+    ///   peer connects later).
+    /// - A peer whose push position is still `0` blocks compaction entirely.
+    /// - A peer this instance only ever *pulls from*
+    ///   ([`SyncDirection::PullOnly`](crate::sync::config::SyncDirection::PullOnly))
+    ///   is indistinguishable in the cursor store from a peer it simply has not
+    ///   pushed to yet, so it holds compaction at `0` as well: under `PullOnly`
+    ///   the WAL grows until a push to that peer happens. Direction-aware
+    ///   cursors on the wire (sync protocol v5) are what would let compaction
+    ///   tell the two apart.
     ///
     /// Call this periodically (e.g., daily) to reclaim disk space.
     /// Returns the number of WAL events deleted.
@@ -3272,14 +3289,17 @@ impl PulseDB {
             return Ok(0);
         }
 
-        let min_seq = cursors.iter().map(|c| c.last_sequence).min().unwrap_or(0);
+        // Push positions only: `pull_sequence` is a remote-WAL position and
+        // must never bound local compaction (#9).
+        let min_push_seq = cursors.iter().map(|c| c.push_sequence).min().unwrap_or(0);
 
-        if min_seq == 0 {
+        if min_push_seq == 0 {
+            // Some peer has not acknowledged anything yet (or is PullOnly).
             return Ok(0);
         }
 
-        let deleted = self.storage.compact_wal_events(min_seq)?;
-        info!(deleted, min_seq, "WAL compacted");
+        let deleted = self.storage.compact_wal_events(min_push_seq)?;
+        info!(deleted, min_push_seq, "WAL compacted");
         Ok(deleted)
     }
 

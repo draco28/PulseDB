@@ -580,6 +580,25 @@ pub trait StorageEngine: Send + Sync {
     #[cfg(feature = "sync")]
     fn list_sync_cursors(&self) -> Result<Vec<crate::sync::SyncCursor>>;
 
+    /// Sets the **push** position for `peer` — the local WAL sequence the peer
+    /// has acknowledged — leaving its pull position untouched.
+    ///
+    /// A single-transaction read-modify-write, so the pusher and the puller
+    /// can never lose each other's half of the record. Creates the record
+    /// (with `pull_sequence = 0`) if the peer has none yet.
+    #[cfg(feature = "sync")]
+    fn update_push_cursor(&self, peer: &crate::sync::InstanceId, sequence: u64) -> Result<()>;
+
+    /// Sets the **pull** position for `peer` — the remote WAL sequence applied
+    /// locally — leaving its push position untouched.
+    ///
+    /// Same single-transaction read-modify-write contract as
+    /// [`update_push_cursor`](Self::update_push_cursor). Creates the record
+    /// (with `push_sequence = 0`, which keeps compaction blocked for the peer)
+    /// if the peer has none yet.
+    #[cfg(feature = "sync")]
+    fn update_pull_cursor(&self, peer: &crate::sync::InstanceId, sequence: u64) -> Result<()>;
+
     /// Compacts the WAL by deleting events with sequence <= `up_to_seq`.
     ///
     /// Returns the number of events deleted. This is a write operation

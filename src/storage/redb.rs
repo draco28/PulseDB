@@ -208,6 +208,63 @@ fn pre_v4_backup_path(path: &Path) -> PathBuf {
     backup
 }
 
+/// Deterministic sibling path for the pre-v5 backup (schema v4→v5 migration:
+/// splits the per-peer sync cursor into push/pull positions and resets both —
+/// r1.s1.w1 / issue #9).
+///
+/// Distinct from [`pre_v4_backup_path`] (`.pre-v4.bak`): a schema-4 store never
+/// took a pre-v4 backup, so the v5 reshape gets its own pristine copy (ADR-011:
+/// backup-before-migrate on every format change). Schema ≤ 3 stores already
+/// have `.pre-v3.bak` / `.pre-v4.bak` from the earlier reshapes.
+fn pre_v5_backup_path(path: &Path) -> PathBuf {
+    let mut backup = path.to_path_buf();
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "pulsedb.redb".into());
+    backup.set_file_name(format!("{file_name}.pre-v5.bak"));
+    backup
+}
+
+/// Claims the logical-schema backup sidecar at `backup_path` as a plain file
+/// copy of `path` (the `.pre-v3.bak` / `.pre-v4.bak` / `.pre-v5.bak` family).
+///
+/// Uses `create_new` (O_EXCL) on the FINAL path: concurrent openers are
+/// serialized by the O_EXCL claim, and the one that lost the race sees
+/// `AlreadyExists` and preserves the genuine sidecar. Same crash-atomicity
+/// posture as the original `.pre-v3.bak` backup: a hard kill mid-copy leaves a
+/// truncated file that a later open's `AlreadyExists` branch preserves. (The
+/// `.pre-substrate.bak` uses the temp+rename [`backup_once`] pattern because it
+/// runs under the exclusive migration lock; the schema backup does not.)
+///
+/// Returns `Ok(true)` when this call created the sidecar, `Ok(false)` when an
+/// existing one was preserved.
+fn claim_schema_backup_copy(path: &Path, backup_path: &Path) -> Result<bool> {
+    // r1.s3: temp+rename+fsync — this schema-sidecar copy path is the plain
+    // `create_new` + `io::copy` form; hardening it (#25) is r1.s3's.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(backup_path)
+    {
+        Ok(mut backup_file) => {
+            let copy_result = std::fs::File::open(path)
+                .and_then(|mut source| std::io::copy(&mut source, &mut backup_file).map(|_| ()));
+            if let Err(error) = copy_result {
+                drop(backup_file);
+                let _ = std::fs::remove_file(backup_path);
+                return Err(migration_io_error(error));
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            debug!("pre-migration backup already exists; preserving it");
+            Ok(false)
+        }
+        Err(error) => Err(migration_io_error(error)),
+    }
+}
+
 /// Deterministic sibling path retained before the redb-format substrate migration
 /// (the v2→v3 in-place `upgrade()`).
 ///
@@ -659,6 +716,20 @@ impl RedbStorage {
 
         debug!(db_exists = db_exists, "Opening storage engine");
 
+        // r1.s1.w1 / ADR-011 (backup-before-migrate): claim the logical-schema
+        // sidecar from the PRISTINE file, BEFORE the first writable redb open.
+        // redb 4.x rewrites the file on every writable open+close (it persists
+        // the allocator state on close), so a copy taken inside `open_existing`
+        // — after `create_or_migrate` — is a valid store but not byte-identical
+        // to what the operator had on disk. Best-effort: a redb-v2 file, a
+        // crashed session, a locked file or an unreadable header makes the
+        // read-only peek fail, and `open_existing`'s claim (same helper) is the
+        // fallback exactly as before. A read-only open performs zero writes
+        // (FR-035), so it never claims a sidecar.
+        if db_exists && !config.read_only {
+            Self::claim_pristine_schema_backup(path);
+        }
+
         // Create or open the database under redb 4.1. A v2-format file (every
         // <=v0.5.1 database) hard-refuses here with `UpgradeRequired` *before* any
         // value is reachable — the redb-format axis is detected here, the
@@ -673,6 +744,64 @@ impl RedbStorage {
         } else {
             // Initialize new database
             Self::initialize_new(db, path.to_path_buf(), config)
+        }
+    }
+
+    /// Best-effort claim of the logical-schema backup sidecar from the
+    /// **pristine** on-disk file, before any writable redb open touches it.
+    ///
+    /// Peeks at `db_metadata.schema_version` through a redb **read-only** open
+    /// (zero writes; `ReadOnlyDatabase` never persists allocator state), maps it
+    /// to the sidecar the pending reshape takes (`≤ 2` → `.pre-v3.bak`, `3` →
+    /// `.pre-v4.bak`, `4` → `.pre-v5.bak`, current → none), drops the handle,
+    /// and copies through [`claim_schema_backup_copy`]. Every failure is
+    /// swallowed at `debug!`: a redb-v2 file (`UpgradeRequired`), a crashed
+    /// session (`RepairAborted`), a file another writer holds, or an unreadable
+    /// header all fall through to `open_existing`, which surfaces the real error
+    /// and claims the sidecar itself (same helper, post-open bytes) as before.
+    fn claim_pristine_schema_backup(path: &Path) {
+        let read_only = match Database::builder().open_read_only(path) {
+            Ok(db) => db,
+            Err(error) => {
+                debug!(
+                    error = %error,
+                    "pristine schema-backup peek skipped (read-only open failed); \
+                     open_existing claims the sidecar"
+                );
+                return;
+            }
+        };
+        let schema_version = match Self::read_metadata(&read_only) {
+            Ok(metadata) => metadata.schema_version,
+            Err(error) => {
+                debug!(
+                    error = %error,
+                    "pristine schema-backup peek skipped (metadata unreadable); \
+                     open_existing claims the sidecar"
+                );
+                return;
+            }
+        };
+        drop(read_only);
+
+        let backup_path = match schema_version {
+            1..=2 => pre_v3_backup_path(path),
+            3 => pre_v4_backup_path(path),
+            4 => pre_v5_backup_path(path),
+            _ => return,
+        };
+        match claim_schema_backup_copy(path, &backup_path) {
+            Ok(true) => info!(
+                schema_version,
+                backup = %backup_path.display(),
+                "claimed pristine pre-migration backup before the writable open"
+            ),
+            Ok(false) => {}
+            Err(error) => warn!(
+                error = %error,
+                backup = %backup_path.display(),
+                "pristine schema-backup claim failed; open_existing will retry"
+            ),
         }
     }
 
@@ -848,7 +977,7 @@ impl RedbStorage {
     /// Note: this is a pure read primitive. It does NOT itself trigger any
     /// migration; the migration decision (acting on `Older`/`Absent`/`Newer`) lives
     /// in `open_existing`, which consumes this.
-    pub(crate) fn read_substrate_marker(db: &Database) -> Result<SubstrateFormat> {
+    pub(crate) fn read_substrate_marker<D: ReadableDatabase>(db: &D) -> Result<SubstrateFormat> {
         let read_txn = db.begin_read().map_err(StorageError::from)?;
         let meta_table = read_txn
             .open_table(METADATA_TABLE)
@@ -878,7 +1007,7 @@ impl RedbStorage {
     ///
     /// `Newer` is handled by the caller (`open_existing`) before any value read, so
     /// it never reaches here; we treat it as the postcard path defensively.
-    fn read_metadata(db: &Database) -> Result<DatabaseMetadata> {
+    fn read_metadata<D: ReadableDatabase>(db: &D) -> Result<DatabaseMetadata> {
         let marker = Self::read_substrate_marker(db)?;
         let read_txn = db.begin_read().map_err(StorageError::from)?;
         let meta_table = read_txn
@@ -1038,8 +1167,9 @@ impl RedbStorage {
         let mut needs_v2_migration = metadata.schema_version == 1;
         let mut needs_v3_migration = metadata.schema_version <= 2;
         let mut needs_v4_migration = metadata.schema_version <= 3;
+        let mut needs_v5_migration = metadata.schema_version <= 4;
 
-        if (needs_v3_migration || needs_v4_migration) && config.read_only {
+        if (needs_v3_migration || needs_v4_migration || needs_v5_migration) && config.read_only {
             return Err(PulseDBError::ReadOnly);
         }
 
@@ -1053,11 +1183,14 @@ impl RedbStorage {
         // Schema ≤ 2 stores take `.pre-v3.bak` (they run the v2→v3 reshape).
         // Schema == 3 stores take `.pre-v4.bak` (v3→v4 tag-field append — no
         // v3 backup exists for them).
-        let db = if needs_v3_migration || needs_v4_migration {
+        // Schema == 4 stores take `.pre-v5.bak` (v4→v5 sync-cursor split — no
+        // earlier backup exists for them).
+        let db = if needs_v3_migration || needs_v4_migration || needs_v5_migration {
             drop(db);
             // Schema ≤ 2 stores take `.pre-v3.bak` (they run the v2→v3 reshape).
             // Schema == 3 stores take `.pre-v4.bak` (v3→v4 tag-field append — no
             // v3 backup exists for them).
+            // Schema == 4 stores take `.pre-v5.bak` (v4→v5 sync-cursor split).
             //
             // Uses `create_new` (O_EXCL) on the FINAL path: concurrent openers that
             // both enter this block (the migration lock only covers `create_or_migrate`,
@@ -1069,31 +1202,19 @@ impl RedbStorage {
             // (The `.pre-substrate.bak` uses the temp+rename `backup_once` pattern
             // because it runs under the exclusive migration lock; the schema backup
             // does not.)
+            //
+            // In the common case `open()` already claimed this sidecar from the
+            // pristine file (before the first writable open) and this is the
+            // `AlreadyExists` → preserve branch; it is the real claim only when
+            // that read-only peek could not run.
             let backup_path = if needs_v3_migration {
                 pre_v3_backup_path(&path)
-            } else {
+            } else if needs_v4_migration {
                 pre_v4_backup_path(&path)
+            } else {
+                pre_v5_backup_path(&path)
             };
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&backup_path)
-            {
-                Ok(mut backup_file) => {
-                    let copy_result = std::fs::File::open(&path).and_then(|mut source| {
-                        std::io::copy(&mut source, &mut backup_file).map(|_| ())
-                    });
-                    if let Err(error) = copy_result {
-                        drop(backup_file);
-                        let _ = std::fs::remove_file(&backup_path);
-                        return Err(migration_io_error(error));
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    debug!("pre-migration backup already exists; preserving it");
-                }
-                Err(error) => return Err(migration_io_error(error)),
-            }
+            claim_schema_backup_copy(&path, &backup_path)?;
             let reopened = Self::create_database(&path, config)?;
             let reopened_metadata = Self::read_metadata(&reopened)?;
             Self::validate_existing_metadata(&reopened_metadata, config)?;
@@ -1101,6 +1222,7 @@ impl RedbStorage {
             needs_v2_migration = metadata.schema_version == 1;
             needs_v3_migration = metadata.schema_version <= 2;
             needs_v4_migration = metadata.schema_version <= 3;
+            needs_v5_migration = metadata.schema_version <= 4;
             reopened
         } else {
             db
@@ -1198,7 +1320,8 @@ impl RedbStorage {
         if !config.read_only {
             // Update last_opened_at timestamp and bump schema version if migrating.
             metadata.touch();
-            if needs_v2_migration || needs_v3_migration || needs_v4_migration {
+            if needs_v2_migration || needs_v3_migration || needs_v4_migration || needs_v5_migration
+            {
                 metadata.schema_version = SCHEMA_VERSION;
             }
 
@@ -1254,6 +1377,30 @@ impl RedbStorage {
                     let _ = write_txn.open_multimap_table(EXPERIENCES_BY_TAG_TABLE)?;
                     Self::migrate_experiences_v3_to_v4(&write_txn)?;
                     info!("Migrated experiences from schema v3 to v4");
+                }
+
+                // Schema v4→v5: split the per-peer sync cursor into push/pull
+                // positions and reset both to 0 (r1.s1.w1 / #9, grill Q1). Runs
+                // BEFORE the codec re-encode so it reads either legacy-bincode
+                // or postcard v4 rows through the dual-format reader and writes
+                // v5-format postcard; the re-encode pass below then round-trips
+                // the v5 rows idempotently. Feature-independent (raw table
+                // probe), so a build WITHOUT `sync` migrates the store too.
+                //
+                // One leg is deliberately left to a `sync` build: a non-`sync`
+                // binary opening a BINCODE-ERA store (marker Absent/Older) must fail
+                // closed with `SubstrateMigrationRequiresSync` when cursor rows exist
+                // (#57 guard in the codec pass below), with the whole txn rolled
+                // back — so the rows are not reshaped here first. Without rows the
+                // reshape would be a no-op anyway; with rows the guard aborts the txn.
+                let cursor_reshape_deferred_to_sync_build =
+                    cfg!(not(feature = "sync")) && needs_marker_write;
+                if needs_v5_migration && !cursor_reshape_deferred_to_sync_build {
+                    let reset = Self::migrate_sync_cursors_v4_to_v5(&write_txn)?;
+                    info!(
+                        peers = reset,
+                        "Migrated sync cursors from schema v4 to v5 (push/pull split; positions reset)"
+                    );
                 }
 
                 // DECOUPLED CODEC RE-ENCODE (design §2.3 / grill Q1): driven SOLELY
@@ -1565,6 +1712,80 @@ impl RedbStorage {
 
         debug!("Migrated experience records from v3 to v4");
         Ok(())
+    }
+
+    // ========================================================================
+    // Schema v4 → v5: split the sync cursor into push/pull positions
+    // (r1.s1.w1 / issue #9)
+    // ========================================================================
+
+    /// Reshapes every `sync_cursors` row from the schema-≤4 single-slot
+    /// `{instance_id, last_sequence}` record to the schema-v5
+    /// `{instance_id, push_sequence, pull_sequence}` record, resetting **both**
+    /// positions to 0 (grill Q1, locked — never seeded from `last_sequence`).
+    ///
+    /// Why reset rather than seed: the legacy slot may hold either a local
+    /// (push) or a remote (pull) sequence — the two paths overwrote each other —
+    /// so seeding either side from it can skip events. Both at 0 costs one full
+    /// idempotent resync per peer and loses nothing still in the WAL. Each
+    /// discarded value is logged at `warn` as the audit trail.
+    ///
+    /// Feature-independent: the live `SyncCursor` type and `SYNC_CURSORS_TABLE`
+    /// are behind `sync`, so this goes through the raw
+    /// `SYNC_CURSORS_MIGRATION_TABLE` probe (same name + types) and the frozen
+    /// `SyncCursorV4` / `SyncCursorV5` records (identical postcard layout to the
+    /// live type). A store that never had a `sync_cursors` table is left
+    /// untouched — opening the table would create it.
+    ///
+    /// Returns the number of peer rows reset.
+    fn migrate_sync_cursors_v4_to_v5(write_txn: &::redb::WriteTransaction) -> Result<usize> {
+        use super::schema::{SyncCursorV4, SyncCursorV5, SYNC_CURSORS_MIGRATION_TABLE};
+        use ::redb::TableHandle;
+
+        let has_table = write_txn
+            .list_tables()
+            .map_err(StorageError::from)?
+            .any(|h| h.name() == "sync_cursors");
+        if !has_table {
+            debug!("no sync_cursors table; nothing to migrate to v5");
+            return Ok(0);
+        }
+
+        let table = write_txn.open_table(SYNC_CURSORS_MIGRATION_TABLE)?;
+        let mut rows: Vec<([u8; 16], Vec<u8>)> = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry.map_err(StorageError::from)?;
+            rows.push((*k.value(), v.value().to_vec()));
+        }
+        drop(table);
+
+        let mut table = write_txn.open_table(SYNC_CURSORS_MIGRATION_TABLE)?;
+        for (key, bytes) in &rows {
+            // Dual-format read: legacy bincode (marker Older/Absent store) or
+            // postcard (marker Current store) — both are the v4 shape.
+            let legacy: SyncCursorV4 =
+                Self::decode_blob_legacy_or_postcard(bytes, "v4 sync cursor record")?;
+            warn!(
+                peer = %legacy.instance_id,
+                discarded_last_sequence = legacy.last_sequence,
+                "schema v5: sync cursor reset to push_sequence=0 / pull_sequence=0; \
+                 one full resync with this peer will follow"
+            );
+            let v5 = SyncCursorV5 {
+                instance_id: legacy.instance_id,
+                push_sequence: 0,
+                pull_sequence: 0,
+            };
+            let re =
+                postcard::to_stdvec(&v5).map_err(|e| StorageError::serialization(e.to_string()))?;
+            table.insert(key, re.as_slice())?;
+        }
+
+        debug!(
+            count = rows.len(),
+            "Migrated sync cursor records from v4 to v5"
+        );
+        Ok(rows.len())
     }
 
     // ========================================================================
@@ -2276,6 +2497,42 @@ impl RedbStorage {
     #[inline]
     pub fn embedding_dimension(&self) -> EmbeddingDimension {
         self.metadata.embedding_dimension
+    }
+
+    /// Single-transaction read-modify-write of one peer's persisted
+    /// [`SyncCursor`](crate::sync::SyncCursor).
+    ///
+    /// Reads the current record (or starts from
+    /// [`SyncCursor::new`](crate::sync::SyncCursor::new) — both positions 0),
+    /// applies `mutate`, and writes it back inside the same write transaction.
+    /// redb serializes write transactions, so the pusher (push side) and the
+    /// puller (pull side) can interleave freely without one overwriting the
+    /// other's half of the record (issue #9).
+    #[cfg(feature = "sync")]
+    fn update_sync_cursor(
+        &self,
+        peer: &crate::sync::InstanceId,
+        mutate: impl FnOnce(&mut crate::sync::SyncCursor),
+    ) -> Result<()> {
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        {
+            let mut table = write_txn.open_table(SYNC_CURSORS_TABLE)?;
+            let mut cursor = match table.get(peer.as_bytes())? {
+                Some(entry) => {
+                    let existing: crate::sync::SyncCursor = postcard::from_bytes(entry.value())
+                        .map_err(|e| StorageError::serialization(e.to_string()))?;
+                    drop(entry);
+                    existing
+                }
+                None => crate::sync::SyncCursor::new(*peer),
+            };
+            mutate(&mut cursor);
+            let bytes = postcard::to_stdvec(&cursor)
+                .map_err(|e| StorageError::serialization(e.to_string()))?;
+            table.insert(peer.as_bytes(), bytes.as_slice())?;
+        }
+        write_txn.commit().map_err(StorageError::from)?;
+        Ok(())
     }
 }
 
@@ -3747,7 +4004,8 @@ impl StorageEngine for RedbStorage {
         write_txn.commit().map_err(StorageError::from)?;
         debug!(
             peer = %cursor.instance_id,
-            last_sequence = cursor.last_sequence,
+            push_sequence = cursor.push_sequence,
+            pull_sequence = cursor.pull_sequence,
             "Saved sync cursor"
         );
         Ok(())
@@ -3782,6 +4040,20 @@ impl StorageEngine for RedbStorage {
             cursors.push(cursor);
         }
         Ok(cursors)
+    }
+
+    #[cfg(feature = "sync")]
+    fn update_push_cursor(&self, peer: &crate::sync::InstanceId, sequence: u64) -> Result<()> {
+        self.update_sync_cursor(peer, |cursor| cursor.push_sequence = sequence)?;
+        debug!(peer = %peer, push_sequence = sequence, "Updated push cursor");
+        Ok(())
+    }
+
+    #[cfg(feature = "sync")]
+    fn update_pull_cursor(&self, peer: &crate::sync::InstanceId, sequence: u64) -> Result<()> {
+        self.update_sync_cursor(peer, |cursor| cursor.pull_sequence = sequence)?;
+        debug!(peer = %peer, pull_sequence = sequence, "Updated pull cursor");
+        Ok(())
     }
 
     #[cfg(feature = "sync")]
@@ -7318,7 +7590,8 @@ mod tests {
         fn sample_sync_cursor() -> crate::sync::SyncCursor {
             crate::sync::SyncCursor {
                 instance_id: InstanceId::from_bytes([0x44; 16]),
-                last_sequence: 42,
+                push_sequence: 42,
+                pull_sequence: 7,
             }
         }
 
