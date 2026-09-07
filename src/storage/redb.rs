@@ -266,6 +266,20 @@ fn claim_schema_backup_copy(path: &Path, backup_path: &Path) -> Result<bool> {
     }
 }
 
+/// Sibling temp path where the PRISTINE schema-backup claim
+/// ([`RedbStorage::claim_pristine_schema_backup_copy`]) stages its copy before
+/// validating it and renaming it onto `backup_path`.
+///
+/// Process-unique (`.<pid>.pristine.tmp`), unlike [`backup_temp_path`]: that
+/// staging runs under the exclusive [`MigrationLock`], whereas the pristine
+/// claim runs BEFORE any writer lock exists, so two processes can be staging the
+/// same sidecar at once and must not share one temp file.
+fn pristine_schema_backup_temp_path(backup_path: &Path) -> PathBuf {
+    let mut temp = backup_path.as_os_str().to_owned();
+    temp.push(format!(".{}.pristine.tmp", std::process::id()));
+    PathBuf::from(temp)
+}
+
 /// Deterministic sibling path retained before the redb-format substrate migration
 /// (the v2→v3 in-place `upgrade()`).
 ///
@@ -772,7 +786,9 @@ impl RedbStorage {
     /// (zero writes; `ReadOnlyDatabase` never persists allocator state), maps it
     /// to the sidecar the pending reshape takes (`≤ 2` → `.pre-v3.bak`, `3` →
     /// `.pre-v4.bak`, `4` → `.pre-v5.bak`, current → none), drops the handle,
-    /// and copies through [`claim_schema_backup_copy`]. Every failure is
+    /// and copies through [`Self::claim_pristine_schema_backup_copy`] — which
+    /// stages, validates and only then publishes, because no writer lock is held
+    /// here. Every failure is
     /// swallowed at `debug!`: a redb-v2 file (`UpgradeRequired`), a crashed
     /// session (`RepairAborted`), a file another writer holds, or an unreadable
     /// header all fall through to `open_existing`, which surfaces the real error
@@ -808,7 +824,7 @@ impl RedbStorage {
             4 => pre_v5_backup_path(path),
             _ => return,
         };
-        match claim_schema_backup_copy(path, &backup_path) {
+        match Self::claim_pristine_schema_backup_copy(path, &backup_path, schema_version) {
             Ok(true) => info!(
                 schema_version,
                 backup = %backup_path.display(),
@@ -821,6 +837,122 @@ impl RedbStorage {
                 "pristine schema-backup claim failed; open_existing will retry"
             ),
         }
+    }
+
+    /// The copy step of the PRISTINE claim: stage, validate, then publish.
+    ///
+    /// Same outcome contract as [`claim_schema_backup_copy`] — `Ok(true)` when
+    /// this call published the sidecar, `Ok(false)` when an existing one was
+    /// preserved — but the bytes are PROVEN before they are published.
+    ///
+    /// Why this path cannot use the plain `create_new` + `io::copy` form: it runs
+    /// before `create_or_migrate`, so no redb writer lock exists yet, and
+    /// `open_read_only` takes none. Another process can therefore be holding the
+    /// store open writable and committing while we copy, and the copy would be a
+    /// TORN image — which `create_new` publishes at the final path, where every
+    /// later open's `AlreadyExists` branch then preserves it as genuine. ADR-011's
+    /// rollback would restore a corrupt store, silently. So:
+    ///
+    /// 1. stage the copy at a sibling temp ([`pristine_schema_backup_temp_path`]);
+    /// 2. VALIDATE it by opening **the copy** read-only and reading
+    ///    `schema_version` back off it: it must equal the `schema_version` the
+    ///    peek already established for the source. A torn copy fails to open,
+    ///    fails the metadata read, or reads back a different version;
+    /// 3. publish by atomic `rename`, so the final path transitions absent →
+    ///    fully-formed in one step.
+    ///
+    /// `create_new` semantics are preserved: an already-published sidecar is never
+    /// overwritten — checked before staging AND again before the rename; the
+    /// staged copy is discarded and `Ok(false)` returned with the same
+    /// preserve-it logging. Any validation or I/O failure removes the temp,
+    /// publishes NOTHING and returns `Err`, which the best-effort caller only
+    /// logs — `open_existing`'s post-lock claim (which does hold the writer lock,
+    /// via `claim_schema_backup_copy`) remains the fallback, unchanged.
+    ///
+    /// Durability (fsync of the staged bytes and of the parent directory) is out
+    /// of scope here — issue #89 / r1.s3 own it for the whole sidecar family.
+    fn claim_pristine_schema_backup_copy(
+        path: &Path,
+        backup_path: &Path,
+        schema_version: u32,
+    ) -> Result<bool> {
+        if backup_path.try_exists().map_err(PulseDBError::Io)? {
+            debug!("pre-migration backup already exists; preserving it");
+            return Ok(false);
+        }
+
+        let temp_path = pristine_schema_backup_temp_path(backup_path);
+        if let Err(error) = Self::stage_pristine_schema_backup(path, &temp_path, schema_version) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
+
+        // Same rule as the `create_new` claim, re-checked at publish time: another
+        // opener may have published the genuine sidecar while we staged ours. Keep
+        // theirs, discard the staged copy.
+        if backup_path.try_exists().unwrap_or(false) {
+            let _ = std::fs::remove_file(&temp_path);
+            debug!("pre-migration backup already exists; preserving it");
+            return Ok(false);
+        }
+        if let Err(error) = std::fs::rename(&temp_path, backup_path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(PulseDBError::Io(error));
+        }
+        // The rename consumed the temp: nothing to clean up on the success path.
+        Ok(true)
+    }
+
+    /// Stages a copy of `path` at `temp_path` and proves the STAGED bytes are a
+    /// whole store carrying `schema_version` (the version the pristine peek read
+    /// off the source). The caller removes `temp_path` on `Err`.
+    fn stage_pristine_schema_backup(
+        path: &Path,
+        temp_path: &Path,
+        schema_version: u32,
+    ) -> Result<()> {
+        // Symlink-safe open, as in `backup_once`: `remove_file` unlinks the entry
+        // itself (never following a symlink), then `create_new` (O_EXCL) creates a
+        // fresh regular file — a stale temp from a crashed run never wedges the
+        // retry, and a hostile symlink is never written THROUGH.
+        let _ = std::fs::remove_file(temp_path);
+        let mut temp_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(temp_path)
+            .map_err(PulseDBError::Io)?;
+        // Reads of the redb file are the lock-contention signal (Windows surfaces a
+        // concurrent holder as a raw sharing violation), so classify them; writes to
+        // our own temp are sidecar-space ⇒ plain `Io`. `io::copy` conflates the two,
+        // and this path is best-effort either way — the typed error only reaches a
+        // log line — so the copy takes the lock-classifying map.
+        let mut source = std::fs::File::open(path).map_err(migration_io_error)?;
+        std::io::copy(&mut source, &mut temp_file).map_err(migration_io_error)?;
+        drop(source);
+        // Close the temp before reopening it read-only: the validation must see the
+        // bytes as they will be published, not a handle we still hold open.
+        drop(temp_file);
+
+        // Validate the COPY, never the source. A read-only open performs zero
+        // writes, so the staged bytes reach the sidecar unaltered (the upgrade
+        // fixture asserts `.pre-v5.bak` is byte-identical to the pristine store).
+        let staged = Database::builder()
+            .open_read_only(temp_path)
+            .map_err(|error| {
+                StorageError::corrupted(format!(
+                    "staged pristine schema backup does not open as a database: {error}"
+                ))
+            })?;
+        let staged_version = Self::read_metadata(&staged)?.schema_version;
+        drop(staged);
+        if staged_version != schema_version {
+            return Err(StorageError::corrupted(format!(
+                "staged pristine schema backup reads schema_version {staged_version}, \
+                 expected {schema_version} (the source changed under the copy)"
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     /// Opens the redb-4.1 database, running the one-time redb file-format
@@ -4636,6 +4768,50 @@ mod tests {
             !pre_v3_backup_path(&path).exists(),
             "read-only refusal must happen before migration backup/write work"
         );
+    }
+
+    #[test]
+    fn test_pristine_schema_backup_discards_a_staged_copy_that_fails_validation() {
+        // The pristine claim runs BEFORE `create_or_migrate`, so no redb writer
+        // lock is held: the bytes it copies can be a torn mid-commit image of a
+        // store another process is writing. Such a copy must be staged, REJECTED
+        // and deleted — never published at the sidecar path, where every later
+        // open's preserve-branch would take it for a genuine ADR-011 rollback
+        // point and silently restore a corrupt store.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+        Box::new(storage).close().unwrap();
+
+        // Stand-in for a source read mid-write: a truncated image of the store.
+        // The peek is taken to have established schema_version 4 for it (the
+        // `.pre-v5.bak` claimant); the staged copy cannot corroborate that.
+        let torn = dir.path().join("torn.db");
+        let whole = std::fs::read(&path).unwrap();
+        std::fs::write(&torn, &whole[..whole.len() / 4]).unwrap();
+
+        let backup_path = pre_v5_backup_path(&torn);
+        let error = RedbStorage::claim_pristine_schema_backup_copy(&torn, &backup_path, 4)
+            .expect_err("a staged copy that fails validation must never be published");
+        assert!(
+            error.to_string().contains("staged pristine schema backup"),
+            "validation failure must be reported as such, got: {error}"
+        );
+        assert!(
+            !backup_path.exists(),
+            "a staged copy that fails validation must be discarded, not published \
+             at {} (a later open would preserve it as the genuine sidecar)",
+            backup_path.display()
+        );
+        assert!(
+            !pristine_schema_backup_temp_path(&backup_path).exists(),
+            "the rejected staging temp must be cleaned up on the failure path"
+        );
+
+        // Best-effort throughout: a rejected claim never turns a successful open
+        // into an error.
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+        Box::new(storage).close().unwrap();
     }
 
     #[test]

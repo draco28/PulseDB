@@ -96,9 +96,13 @@ bytes equal the old wire cursor.
 
 1. **Pristine backup.** `<db>.pre-v5.bak` is claimed as a byte-for-byte copy of the file **before the
    first writable redb open** (a redb read-only open peeks at `schema_version`; a writable open would
-   already rewrite the file's allocator pages). If that peek cannot run (crashed session, locked file),
-   the copy is taken after the open instead — a valid store, but not byte-identical. The sidecar is
-   never overwritten once it exists. (The same pre-open claim now covers `.pre-v4.bak` for redb-v3
+   already rewrite the file's allocator pages). Because no writer lock is held that early, the copy is
+   staged at a sibling temp, validated by re-opening the staged file read-only and reading
+   `schema_version` back off it, and published by an atomic rename only if it validates — a copy torn
+   by a concurrent writer's commit is discarded, never published. If the peek cannot run or the staged
+   copy fails validation (crashed session, locked file, concurrent writer), the copy is taken after the
+   open instead — a valid store, but not byte-identical. The sidecar is never overwritten once it
+   exists. (The same pre-open claim now covers `.pre-v4.bak` for redb-v3
    schema-3 stores; redb-v2 stores keep `.pre-substrate.bak` as their pristine copy.)
 2. **Cursor reset (single write transaction).** Every `sync_cursors` row is rewritten as
    `{ instance_id, push_sequence: 0, pull_sequence: 0 }`. The legacy `last_sequence` is **not** used
