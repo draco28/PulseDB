@@ -243,15 +243,36 @@ impl SyncManager {
                 cb.on_progress(batch_size, total_pulled, response.has_more);
             }
 
-            // A batch whose first change failed leaves the position where it
-            // was. Re-requesting it would spin forever, so stop and let the
-            // next sync retry it.
-            if batch_size > 0 && next <= requested {
-                warn!(
-                    peer = %peer_id,
-                    position = requested,
-                    "Initial sync stopped: the batch could not be applied past its first change"
-                );
+            // The position did not move, so the next request would be
+            // byte-identical to this one. Three ways to get here:
+            //
+            // - the server has nothing at or after this position — the ordinary
+            //   "already caught up" end of an initial sync (empty batch,
+            //   `has_more: false`), which is not a fault and is not logged;
+            // - a batch whose FIRST change failed to apply, which leaves the
+            //   position exactly where it was; and
+            // - an EMPTY batch reported with `has_more: true` — what the server
+            //   returns when it filtered every event it polled (a `collectives`
+            //   filter, or entities deleted since the WAL event so
+            //   `build_change_from_record` yields `None`).
+            //
+            // The last two spin forever without this guard. An honest server
+            // never advances `new_cursor.sequence` on an empty batch
+            // (`SyncServer::handle_pull` and `InMemorySyncTransport::pull_changes`
+            // both echo the requested sequence), so `next <= requested` can only
+            // mean no progress. Stop and let the next sync retry from here.
+            if next <= requested {
+                if batch_size > 0 || response.has_more {
+                    warn!(
+                        peer = %peer_id,
+                        position = requested,
+                        batch_size,
+                        has_more = response.has_more,
+                        "Initial sync stopped: the pull position did not advance \
+                         (the batch could not be applied past its first change, or \
+                         the server returned no changes at this position)"
+                    );
+                }
                 break;
             }
 

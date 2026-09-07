@@ -1016,3 +1016,101 @@ async fn pull_position_does_not_advance_past_a_change_that_failed_to_apply() {
          refused one is fetched again rather than skipped forever"
     );
 }
+
+// ============================================================================
+// initial_sync terminates on a stalled position (PR #88 review, class B)
+// ============================================================================
+
+/// A server that filtered every event it polled returns `changes: []`,
+/// `has_more: true` and an UNADVANCED cursor. `initial_sync` must read the
+/// stalled position as "no progress" and stop, not re-issue the identical
+/// request forever.
+///
+/// The transport fails the request once it has been asked more times than the
+/// guard should ever allow, so a regression surfaces as a failed assertion
+/// rather than a hung test: the loop's awaits all resolve immediately, so on a
+/// current-thread runtime a spin never yields long enough for a timeout to
+/// fire.
+#[tokio::test]
+async fn initial_sync_terminates_on_an_empty_batch_that_claims_more() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use pulsedb::sync::transport::SyncTransport;
+    use pulsedb::sync::types::{
+        HandshakeRequest, HandshakeResponse, InstanceId, PullRequest, PullResponse, PushResponse,
+        SyncChange, SyncPosition,
+    };
+    use pulsedb::sync::{SyncError, SYNC_PROTOCOL_VERSION};
+
+    /// More pulls than a correct `initial_sync` can possibly issue here.
+    const SPIN_TRIPWIRE: usize = 8;
+
+    /// Always answers with an empty batch, `has_more: true`, and the sequence
+    /// that was asked for — the shape a fully-filtered poll produces.
+    struct StalledPullTransport {
+        peer: InstanceId,
+        pulls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SyncTransport for StalledPullTransport {
+        async fn handshake(
+            &self,
+            _request: HandshakeRequest,
+        ) -> Result<HandshakeResponse, SyncError> {
+            Ok(HandshakeResponse {
+                instance_id: self.peer,
+                protocol_version: SYNC_PROTOCOL_VERSION,
+                accepted: true,
+                reason: None,
+            })
+        }
+
+        async fn push_changes(&self, _changes: Vec<SyncChange>) -> Result<PushResponse, SyncError> {
+            unreachable!("initial_sync never pushes");
+        }
+
+        async fn pull_changes(&self, request: PullRequest) -> Result<PullResponse, SyncError> {
+            if self.pulls.fetch_add(1, Ordering::SeqCst) >= SPIN_TRIPWIRE {
+                return Err(SyncError::transport("initial_sync is spinning"));
+            }
+            Ok(PullResponse {
+                changes: Vec::new(),
+                has_more: true,
+                new_cursor: SyncPosition::new(self.peer, request.cursor.sequence),
+            })
+        }
+
+        async fn health_check(&self) -> Result<(), SyncError> {
+            Ok(())
+        }
+    }
+
+    let (db, _dir) = open_db();
+    let pulls = Arc::new(AtomicUsize::new(0));
+    let transport = StalledPullTransport {
+        peer: InstanceId::new(),
+        pulls: Arc::clone(&pulls),
+    };
+
+    let mut manager = SyncManager::new(
+        Arc::clone(&db),
+        Box::new(transport),
+        SyncConfig {
+            direction: SyncDirection::PullOnly,
+            ..sync_config()
+        },
+    );
+
+    manager
+        .initial_sync(None)
+        .await
+        .expect("initial_sync must stop at the unadvanced cursor, not spin");
+
+    assert_eq!(
+        pulls.load(Ordering::SeqCst),
+        1,
+        "one request is enough to learn the position will not move"
+    );
+}
