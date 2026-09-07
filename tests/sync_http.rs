@@ -626,7 +626,7 @@ async fn client_refuses_oversized_response_body() {
     assert_eq!(transport.max_response_bytes(), CAP);
 
     let pull_request = PullRequest {
-        cursor: SyncCursor::new(InstanceId::new()),
+        cursor: SyncPosition::new(InstanceId::new(), 0),
         batch_size: 10,
         collectives: None,
     };
