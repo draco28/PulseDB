@@ -18,6 +18,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 use ::redb::{Database, ReadableTable};
 // redb 3.0 moved begin_read()/cache_stats() onto the ReadableDatabase trait;
@@ -618,10 +619,26 @@ pub struct RedbStorage {
     path: PathBuf,
 
     /// Persistent instance ID for local G-counter buckets and sync protocol.
-    instance_id: InstanceId,
+    ///
+    /// Cached copy of the `instance_id` metadata key. Interior-mutable so
+    /// `remint_instance_id` (feature `sync`) can flip it in step with the
+    /// persisted value; every other path only reads it.
+    instance_id: RwLock<InstanceId>,
 }
 
 impl RedbStorage {
+    /// The instance identity currently cached for this store.
+    ///
+    /// A poisoned lock is recovered rather than propagated: the guarded value
+    /// is a plain `Copy` id that is always written whole, so a panic elsewhere
+    /// cannot have left it half-updated.
+    fn current_instance_id(&self) -> InstanceId {
+        *self
+            .instance_id
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Opens or creates a database at the given path.
     ///
     /// If the database doesn't exist, it will be created and initialized
@@ -1024,7 +1041,7 @@ impl RedbStorage {
             db,
             metadata,
             path,
-            instance_id,
+            instance_id: RwLock::new(instance_id),
         })
     }
 
@@ -1324,7 +1341,7 @@ impl RedbStorage {
             db,
             metadata,
             path,
-            instance_id,
+            instance_id: RwLock::new(instance_id),
         })
     }
 
@@ -2988,7 +3005,10 @@ impl StorageEngine for RedbStorage {
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             drop(entry);
 
-            let bucket = experience.applications.entry(self.instance_id).or_insert(0);
+            let bucket = experience
+                .applications
+                .entry(self.current_instance_id())
+                .or_insert(0);
             *bucket = bucket.saturating_add(1);
             experience.last_reinforced = Timestamp::now();
             let new_count = experience.applications();
@@ -3732,7 +3752,32 @@ impl StorageEngine for RedbStorage {
 
     #[cfg(feature = "sync")]
     fn instance_id(&self) -> crate::sync::InstanceId {
-        self.instance_id
+        self.current_instance_id()
+    }
+
+    #[cfg(feature = "sync")]
+    fn remint_instance_id(&self) -> Result<crate::sync::InstanceId> {
+        // Hold the cache lock across the whole transaction so no reader can
+        // observe the new persisted id paired with the old cached one (or the
+        // reverse). redb serializes writers, so this adds no contention beyond
+        // the store's own single-writer rule.
+        let mut cached = self
+            .instance_id
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let old = *cached;
+        let new = InstanceId::new();
+
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        {
+            let mut meta_table = write_txn.open_table(METADATA_TABLE)?;
+            meta_table.insert(INSTANCE_ID_KEY, new.as_bytes().as_slice())?;
+        }
+        write_txn.commit().map_err(StorageError::from)?;
+
+        *cached = new;
+        debug!(old = %old, new = %new, "Instance identity reminted in metadata");
+        Ok(new)
     }
 
     #[cfg(feature = "sync")]

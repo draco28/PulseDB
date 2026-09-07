@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Sync identity API (`sync` feature): `PulseDB::instance_id()` + `PulseDB::remint_instance_id()`.** `instance_id()` exposes the store's persistent `InstanceId`. `remint_instance_id()` gives a *restored file copy* of a store a fresh identity in one write transaction so the original and the copy stop sharing a per-instance reinforcement bucket — the exact-total guarantee of the G-counter merge (FR-031) holds only across distinct ids. Old buckets are left untouched (totals preserved); no WAL or sync event is emitted; the remint is a `tracing::info!` carrying the old and new ids; read-only stores return `PulseDBError::ReadOnly`. Call it **before** constructing a `SyncManager`. Explicit API only — no heuristic clone detection. `StorageEngine` gains the matching `remint_instance_id` port method. Closes #10.
+- **Real-fixture sentinel-merge test.** `test_create_collision_sentinel_merge_does_not_double_count` now migrates two copies of the committed `real-v0.4.0.redb` (schema v2, scalar `applications`) through the genuine v2→v3 path and syncs them, proving the `{LEGACY}` sentinel bucket merges once rather than doubling. The fixture-copy helper moved to `tests/common/mod.rs`. Closes #11.
+
 ### Changed
 - **MSRV 1.89 → 1.90.** Required by redb 4.2 (`rust-version = "1.90"`); the CI job is now named `MSRV` (version-agnostic). Recorded in ADR-008.
 

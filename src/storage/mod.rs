@@ -559,6 +559,20 @@ pub trait StorageEngine: Send + Sync {
     #[cfg(feature = "sync")]
     fn instance_id(&self) -> crate::sync::InstanceId;
 
+    /// Replaces the persisted instance ID with a freshly minted one and
+    /// returns it.
+    ///
+    /// One write transaction: the new id is written under the instance-id
+    /// metadata key and the in-memory copy [`instance_id`](Self::instance_id)
+    /// reports is updated in the same step. Nothing else changes — existing
+    /// `applications` buckets keyed by the old id stay exactly as they are,
+    /// and no WAL/sync event is recorded (identity is not replicated state).
+    ///
+    /// Used by `PulseDB::remint_instance_id` to give a restored file copy of a
+    /// store a distinct sync identity before it reinforces anything.
+    #[cfg(feature = "sync")]
+    fn remint_instance_id(&self) -> Result<crate::sync::InstanceId>;
+
     /// Saves a sync cursor for a peer instance.
     ///
     /// Upserts the cursor in the `SYNC_CURSORS_TABLE`.
