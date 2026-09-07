@@ -7,8 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Sync request byte cap (#26).** `SyncConfig::max_request_bytes` (default 16 MiB, `validate()` rejects 0) bounds every body the sync server accepts: `SyncServer::handle_{handshake,push,pull}_bytes` compare `bytes.len()` **before** the wire-preamble read and before any postcard decode, refusing an oversized body with the new typed `SyncError::PayloadTooLarge { size, max }` (`is_payload_too_large()` for a `413` mapping). `HttpSyncTransport` applies the same cap to response bodies — a `Content-Length` above the cap is refused unread, a chunked body is read bounded — tunable via `with_max_response_bytes()`. `sync` / `sync-http` features only.
+- **Typed protocol-version mismatch on the sync client (#12).** `SyncManager` now checks the peer's `protocol_version` before mapping a soft `accepted: false` handshake, so a version-mismatched server reaches callers as `SyncError::ProtocolVersion { local, remote }` instead of a reason string inside `SyncError::Handshake`. The handshake capability list remains informational (advertised, never negotiated) — documented in the `sync` module.
+- **Clock-skew visibility for reinforcement timestamps (#13).** `SyncConfig::max_clock_skew_ms` (default 300 000) and a local-only `SyncStats { skewed_timestamps }` exposed through `SyncManager::stats()` and `SyncServer::stats()`. An incoming `last_reinforced` beyond `now + max_clock_skew_ms` is logged at `warn` (peer, experience id, skew) and counted at both apply sites; the value is merged **unchanged** — FR-031's max-merge is never clamped, rejected or re-timestamped, so convergence is untouched. The bound is advisory until protocol v5 carries a record-level time reference. `SyncStats` is not a wire type; `SYNC_PROTOCOL_VERSION` stays at 4.
+
 ### Changed
 - **MSRV 1.89 → 1.90.** Required by redb 4.2 (`rust-version = "1.90"`); the CI job is now named `MSRV` (version-agnostic). Recorded in ADR-008.
+
+### Breaking
+- **`SyncConfig` gains `max_request_bytes` and `max_clock_skew_ms`.** Struct literals without `..Default::default()` must add the new fields. (`sync` feature.)
+- **New `SyncError::PayloadTooLarge` variant** — exhaustive matches on `SyncError` must handle it. (`sync` feature.)
 
 ## [0.7.0] - 2026-08-09
 

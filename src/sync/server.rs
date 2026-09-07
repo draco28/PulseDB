@@ -19,13 +19,28 @@
 //! }
 //!
 //! async fn handle_handshake(State(server): State<Arc<SyncServer>>, body: Bytes) -> Result<Vec<u8>, StatusCode> {
-//!     server.handle_handshake_bytes(&body).map_err(|_| StatusCode::BAD_REQUEST)
+//!     server.handle_handshake_bytes(&body).map_err(|e| {
+//!         if e.is_payload_too_large() {
+//!             StatusCode::PAYLOAD_TOO_LARGE
+//!         } else {
+//!             StatusCode::BAD_REQUEST
+//!         }
+//!     })
 //! }
 //! ```
+//!
+//! # Request byte cap
+//!
+//! Every `handle_*_bytes` method compares the raw body length against
+//! [`SyncConfig::max_request_bytes`] **before** reading the wire preamble or
+//! handing the body to postcard, and refuses an oversized body with the typed
+//! [`SyncError::PayloadTooLarge`]. PulseDB builds no router, so this is the
+//! cap it owns at the network edge (ADR-009); the consumer's framework body
+//! limit stacks on top of it.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use crate::db::PulseDB;
 use crate::watch::ChangePoller;
@@ -35,7 +50,7 @@ use super::config::SyncConfig;
 use super::error::SyncError;
 use super::types::{
     HandshakeRequest, HandshakeResponse, InstanceId, PullRequest, PullResponse, PushResponse,
-    SyncChange, SyncCursor,
+    SyncChange, SyncCursor, SyncStats,
 };
 use super::{read_wire_preamble, write_wire_preamble, SYNC_PROTOCOL_VERSION};
 
@@ -50,6 +65,7 @@ pub struct SyncServer {
     db: Arc<PulseDB>,
     instance_id: InstanceId,
     config: SyncConfig,
+    stats: Mutex<SyncStats>,
 }
 
 impl SyncServer {
@@ -60,12 +76,22 @@ impl SyncServer {
             db,
             instance_id,
             config,
+            stats: Mutex::new(SyncStats::default()),
         }
     }
 
     /// Returns the server's instance ID.
     pub fn instance_id(&self) -> InstanceId {
         self.instance_id
+    }
+
+    /// Returns a snapshot of the local-only sync counters accumulated over
+    /// every change pushed to this server.
+    ///
+    /// See [`SyncStats::skewed_timestamps`] for the #13 skew counter. These
+    /// counters never travel on the wire — `PushResponse` is unchanged.
+    pub fn stats(&self) -> SyncStats {
+        *self.stats.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     // ─── High-level handlers (typed) ─────────────────────────────────
@@ -108,11 +134,13 @@ impl SyncServer {
 
         let applier = RemoteChangeApplier::new(Arc::clone(&self.db), self.config.clone());
         let result = applier.apply_batch(changes)?;
+        result.record_into(&self.stats);
 
         debug!(
             accepted = result.applied,
             skipped = result.skipped,
             conflicts = result.conflicts,
+            skewed_timestamps = result.skewed_timestamps,
             "Handled push"
         );
 
@@ -183,9 +211,32 @@ impl SyncServer {
 
     // ─── Byte-level handlers (postcard in/out for HTTP) ──────────────
 
+    /// Refuses a body longer than [`SyncConfig::max_request_bytes`].
+    ///
+    /// This is the first thing every byte-level handler does — a pure
+    /// `len()` comparison, so an oversized body costs nothing beyond the bytes
+    /// the framework already buffered and never reaches the preamble read or
+    /// the postcard decoder.
+    fn check_request_size(&self, body: &[u8]) -> Result<(), SyncError> {
+        let max = self.config.max_request_bytes;
+        if body.len() > max {
+            warn!(
+                size = body.len(),
+                max_request_bytes = max,
+                "Refusing oversized sync request before decode"
+            );
+            return Err(SyncError::PayloadTooLarge {
+                size: body.len(),
+                max,
+            });
+        }
+        Ok(())
+    }
+
     /// Handles a handshake from raw wire bytes.
     ///
-    /// The handshake is the ONLY body that carries the serializer-independent
+    /// The body length is checked against `max_request_bytes` first. The
+    /// handshake is then the ONLY body that carries the serializer-independent
     /// wire preamble. The preamble is parsed by **raw byte-slicing of
     /// `body[..3]` BEFORE** the body is deserialized (see
     /// [`read_wire_preamble`]), so a serializer/version mismatch surfaces as a
@@ -193,6 +244,8 @@ impl SyncServer {
     /// and not the soft in-band `accepted: false` path. The response is framed
     /// with the same preamble so the *client* can fail loud on the way back too.
     pub fn handle_handshake_bytes(&self, body: &[u8]) -> Result<Vec<u8>, SyncError> {
+        // 0. Byte cap on the raw body — before the preamble, before any decode.
+        self.check_request_size(body)?;
         // 1. Validate the preamble by raw byte-slice BEFORE any deserialize.
         let payload = read_wire_preamble(body)?;
         // 2. Only now is it safe to deserialize the framed body.
@@ -206,9 +259,11 @@ impl SyncServer {
 
     /// Handles a push from raw postcard bytes.
     ///
-    /// Push bodies carry NO preamble — they are reached only after a successful
+    /// The body length is checked against `max_request_bytes` first. Push
+    /// bodies carry NO preamble — they are reached only after a successful
     /// handshake pinned the wire version, so a straight postcard decode is safe.
     pub fn handle_push_bytes(&self, body: &[u8]) -> Result<Vec<u8>, SyncError> {
+        self.check_request_size(body)?;
         let changes: Vec<SyncChange> = postcard::from_bytes(body).map_err(SyncError::from)?;
         let response = self.handle_push(changes)?;
         postcard::to_allocvec(&response).map_err(|e| SyncError::serialization(e.to_string()))
@@ -216,8 +271,10 @@ impl SyncServer {
 
     /// Handles a pull from raw postcard bytes.
     ///
-    /// Pull bodies carry NO preamble (same rationale as push).
+    /// The body length is checked against `max_request_bytes` first. Pull
+    /// bodies carry NO preamble (same rationale as push).
     pub fn handle_pull_bytes(&self, body: &[u8]) -> Result<Vec<u8>, SyncError> {
+        self.check_request_size(body)?;
         let request: PullRequest = postcard::from_bytes(body).map_err(SyncError::from)?;
         let response = self.handle_pull(request)?;
         postcard::to_allocvec(&response).map_err(|e| SyncError::serialization(e.to_string()))

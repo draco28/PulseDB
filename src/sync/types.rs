@@ -239,6 +239,30 @@ pub enum SyncStatus {
 }
 
 // ============================================================================
+// SyncStats — Local-only counters (never on the wire)
+// ============================================================================
+
+/// Local-only counters accumulated over the changes a peer has applied —
+/// by a [`SyncManager`](super::SyncManager) on the pull side and by a
+/// `SyncServer` on the push side.
+///
+/// This type is **not** a wire type: it deliberately derives neither
+/// `Serialize` nor `Deserialize`, so a new counter never changes the shape of
+/// `PushResponse`/`PullResponse` or moves
+/// [`SYNC_PROTOCOL_VERSION`](super::SYNC_PROTOCOL_VERSION).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SyncStats {
+    /// Number of applied changes whose incoming `last_reinforced` lay beyond
+    /// `now + SyncConfig::max_clock_skew_ms` (#13).
+    ///
+    /// Each one is logged at `warn` with the peer, the experience id and the
+    /// skew, and then merged **unchanged** — FR-031's max-merge is never
+    /// clamped, rejected or re-timestamped (r1 veto fold C2). The bound is
+    /// advisory until protocol v5 carries a record-level time reference.
+    pub skewed_timestamps: u64,
+}
+
+// ============================================================================
 // Handshake messages
 // ============================================================================
 
@@ -432,6 +456,18 @@ mod tests {
         assert_eq!(update.archived, restored.archived);
         assert_eq!(update.applications, restored.applications);
         assert_eq!(update.last_reinforced, restored.last_reinforced);
+    }
+
+    #[test]
+    fn test_sync_stats_default_is_zero() {
+        let stats = SyncStats::default();
+        assert_eq!(stats.skewed_timestamps, 0);
+        assert_eq!(
+            stats,
+            SyncStats {
+                skewed_timestamps: 0
+            }
+        );
     }
 
     #[test]

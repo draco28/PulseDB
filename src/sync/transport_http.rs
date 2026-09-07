@@ -8,6 +8,12 @@
 //! cross-version peer fails loud in BOTH directions; push/pull bodies carry no
 //! preamble (they are reached only after the handshake pinned the version).
 //!
+//! Response bodies are capped (default [`DEFAULT_MAX_REQUEST_BYTES`], the same
+//! cap the server applies to requests): a `Content-Length` above the cap is
+//! refused without reading the body, and a body without one is read bounded
+//! and refused the moment it crosses the cap — either way as the typed
+//! [`SyncError::PayloadTooLarge`], before any postcard decode.
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -16,12 +22,15 @@
 //! let transport = HttpSyncTransport::new("http://server:3000");
 //! // or with authentication:
 //! let transport = HttpSyncTransport::with_auth("https://server:3000", "my-secret-token");
+//! // or with a tighter response-body cap:
+//! let transport = HttpSyncTransport::new("http://server:3000").with_max_response_bytes(4 * 1024 * 1024);
 //! ```
 
 use async_trait::async_trait;
-use reqwest::Client;
-use tracing::debug;
+use reqwest::{Client, Response};
+use tracing::{debug, warn};
 
+use super::config::DEFAULT_MAX_REQUEST_BYTES;
 use super::error::SyncError;
 use super::transport::SyncTransport;
 use super::types::{
@@ -47,6 +56,7 @@ pub struct HttpSyncTransport {
     client: Client,
     base_url: String,
     auth_token: Option<String>,
+    max_response_bytes: usize,
 }
 
 impl HttpSyncTransport {
@@ -59,6 +69,7 @@ impl HttpSyncTransport {
             client: Client::new(),
             base_url: base_url.into(),
             auth_token: None,
+            max_response_bytes: DEFAULT_MAX_REQUEST_BYTES,
         }
     }
 
@@ -70,14 +81,72 @@ impl HttpSyncTransport {
             client: Client::new(),
             base_url: base_url.into(),
             auth_token: Some(token.into()),
+            max_response_bytes: DEFAULT_MAX_REQUEST_BYTES,
         }
+    }
+
+    /// Sets the response-body byte cap (default [`DEFAULT_MAX_REQUEST_BYTES`]).
+    ///
+    /// Mirrors the server's `SyncConfig::max_request_bytes` on the client
+    /// side: a response whose `Content-Length` exceeds the cap is refused
+    /// without reading the body, and a response without a `Content-Length` is
+    /// read bounded and refused once it crosses the cap. Both surface as the
+    /// typed [`SyncError::PayloadTooLarge`] before any postcard decode.
+    pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
+        self.max_response_bytes = max_response_bytes;
+        self
+    }
+
+    /// Returns the response-body byte cap in force.
+    pub fn max_response_bytes(&self) -> usize {
+        self.max_response_bytes
+    }
+
+    /// Reads a response body under the byte cap.
+    ///
+    /// A declared `Content-Length` above the cap is refused before a single
+    /// body byte is read; otherwise the body is accumulated chunk by chunk and
+    /// refused as soon as it would exceed the cap. No streaming decode — the
+    /// caller receives either the whole (in-cap) body or the typed error.
+    async fn read_body_bounded(mut response: Response, max: usize) -> Result<Vec<u8>, SyncError> {
+        if let Some(declared) = response.content_length() {
+            if declared > max as u64 {
+                let size = usize::try_from(declared).unwrap_or(usize::MAX);
+                warn!(
+                    size,
+                    max_response_bytes = max,
+                    "Refusing oversized sync response (Content-Length) before decode"
+                );
+                return Err(SyncError::PayloadTooLarge { size, max });
+            }
+        }
+
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| SyncError::transport(format!("Failed to read response body: {}", e)))?
+        {
+            let size = body.len().saturating_add(chunk.len());
+            if size > max {
+                warn!(
+                    size,
+                    max_response_bytes = max,
+                    "Refusing oversized sync response (bounded read) before decode"
+                );
+                return Err(SyncError::PayloadTooLarge { size, max });
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     }
 
     /// Sends a POST with a raw byte body and returns the raw response bytes.
     ///
     /// This is the framing-agnostic transport leg: it knows nothing about
     /// postcard or the wire preamble. The handshake call layers preamble
-    /// framing/validation on top; push/pull layer plain postcard on top.
+    /// framing/validation on top; push/pull layer plain postcard on top. The
+    /// response body is read under [`Self::max_response_bytes`].
     async fn post_raw(&self, path: &str, body: Vec<u8>) -> Result<Vec<u8>, SyncError> {
         let url = format!("{}{}", self.base_url, path);
 
@@ -103,7 +172,12 @@ impl HttpSyncTransport {
 
         let status = response.status();
         if !status.is_success() {
-            let body_text = response.text().await.unwrap_or_else(|_| "unknown".into());
+            // Error bodies are read under the same cap; an unreadable or
+            // oversized one degrades to "unknown" rather than masking the status.
+            let body_text = Self::read_body_bounded(response, self.max_response_bytes)
+                .await
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_else(|_| "unknown".into());
             return Err(if status.is_client_error() {
                 SyncError::invalid_payload(format!("HTTP {}: {}", status, body_text))
             } else {
@@ -111,11 +185,7 @@ impl HttpSyncTransport {
             });
         }
 
-        response
-            .bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| SyncError::transport(format!("Failed to read response body: {}", e)))
+        Self::read_body_bounded(response, self.max_response_bytes).await
     }
 
     /// Sends a POST with a postcard body and deserializes the postcard response.

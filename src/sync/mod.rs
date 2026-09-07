@@ -50,6 +50,40 @@
 //! Call [`PulseDB::compact_wal()`](crate::PulseDB::compact_wal) periodically
 //! to trim events that all peers have already synced. Compaction uses the
 //! min-cursor strategy: only events below the oldest peer's cursor are removed.
+//!
+//! # Wire hygiene
+//!
+//! The sync server is the network edge of PulseDB's trust boundary (ADR-009),
+//! and PulseDB builds no router of its own — so the edge checks below are the
+//! ones it owns, and a consumer's framework limits stack on top of them.
+//!
+//! **Request byte cap (#26).** Every byte-level server handler
+//! (`SyncServer::handle_{handshake,push,pull}_bytes`, `sync-http`) compares
+//! `bytes.len()` against [`SyncConfig::max_request_bytes`] (default 16 MiB)
+//! **before** the wire preamble is read and before any postcard decode. An
+//! oversized body is refused with the typed
+//! [`SyncError::PayloadTooLarge`]`{ size, max }` — never a decode error, never
+//! a partial decode; [`SyncError::is_payload_too_large`] is the hook for a
+//! `413 Payload Too Large` mapping. The HTTP transport client applies the same
+//! cap to response bodies (a `Content-Length` above the cap is refused unread,
+//! a chunked body is read bounded). There is no streaming or chunked decode.
+//!
+//! **Protocol version and capabilities (#12).** The handshake carries a
+//! `protocol_version` that is *checked*: a mismatch reaches the client as the
+//! typed [`SyncError::ProtocolVersion`]`{ local, remote }`, never as a reason
+//! string inside `SyncError::Handshake`. The handshake's capability list, by
+//! contrast, is **informational only** — see
+//! [`SYNC_CAPABILITY_GCOUNTER_APPLICATIONS`]. Peers advertise capabilities;
+//! nothing is negotiated from them and nothing is refused because of them.
+//!
+//! **Reinforcement clock skew (#13).** An incoming `last_reinforced` beyond
+//! `now + `[`SyncConfig::max_clock_skew_ms`] (default 5 minutes) is logged at
+//! `warn` with the peer, the experience id and the skew, and counted in the
+//! local-only [`SyncStats::skewed_timestamps`] (`SyncManager::stats()`,
+//! `SyncServer::stats()`). It is **never** clamped, rejected or re-timestamped:
+//! FR-031's max-merge stores the value byte-for-byte, so convergence is
+//! untouched. The bound is advisory until protocol v5 carries a record-level
+//! time reference (Release 2).
 
 pub mod applier;
 pub mod config;
@@ -79,6 +113,14 @@ pub mod types;
 pub const SYNC_PROTOCOL_VERSION: u32 = 4;
 
 /// Capability advertised by peers that sync reinforcement G-counter fields.
+///
+/// The handshake capability list is **informational and not negotiated**: a
+/// peer advertises what it speaks so that operators and logs can see it, but
+/// no capability is required, matched, or used to refuse a handshake, and no
+/// behaviour is switched on its presence. Compatibility is decided solely by
+/// [`SYNC_PROTOCOL_VERSION`] (checked, typed) and the wire preamble
+/// ([`WIRE_FORMAT_VERSION`], checked, typed). A capability-driven
+/// negotiation would be a protocol change.
 pub const SYNC_CAPABILITY_GCOUNTER_APPLICATIONS: &str = "gcounter-applications";
 
 // ============================================================================
@@ -175,5 +217,6 @@ pub use transport_http::HttpSyncTransport;
 pub use transport_mem::InMemorySyncTransport;
 pub use types::{
     HandshakeRequest, HandshakeResponse, InstanceId, PullRequest, PullResponse, PushResponse,
-    SerializableExperienceUpdate, SyncChange, SyncCursor, SyncEntityType, SyncPayload, SyncStatus,
+    SerializableExperienceUpdate, SyncChange, SyncCursor, SyncEntityType, SyncPayload, SyncStats,
+    SyncStatus,
 };

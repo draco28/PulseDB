@@ -67,6 +67,26 @@ pub enum SyncError {
         got: Option<u8>,
     },
 
+    /// A request or response body exceeded the configured byte cap and was
+    /// refused **before** any decode.
+    ///
+    /// Raised by the server-side byte handlers (`SyncServer::handle_*_bytes`)
+    /// when `body.len()` exceeds
+    /// [`SyncConfig::max_request_bytes`](super::config::SyncConfig::max_request_bytes),
+    /// and by the HTTP transport client when a response body exceeds its cap.
+    /// `size` is the observed body length — for a bounded read without a
+    /// `Content-Length`, the byte count at which the cap was crossed — and
+    /// `max` is the cap in force. The body never reaches postcard, so this is
+    /// distinct from a decode-side [`SyncError::Serialization`].
+    #[error("Sync payload too large: {size} bytes exceeds the {max}-byte cap")]
+    PayloadTooLarge {
+        /// Observed body length in bytes (or the length at which a bounded
+        /// read crossed the cap).
+        size: usize,
+        /// The byte cap in force.
+        max: usize,
+    },
+
     /// Received an invalid or unrecognized payload.
     #[error("Invalid sync payload: {0}")]
     InvalidPayload(String),
@@ -152,6 +172,12 @@ impl SyncError {
     pub fn is_wire_format_mismatch(&self) -> bool {
         matches!(self, Self::WireFormatMismatch { .. })
     }
+
+    /// Returns true if a body was refused for exceeding the byte cap before
+    /// decode — the signal a consumer maps to `413 Payload Too Large`.
+    pub fn is_payload_too_large(&self) -> bool {
+        matches!(self, Self::PayloadTooLarge { .. })
+    }
 }
 
 impl From<postcard::Error> for SyncError {
@@ -197,6 +223,18 @@ mod tests {
         let postcard_err = postcard::from_bytes::<(u64, u64)>(&bad_bytes).unwrap_err();
         let sync_err: SyncError = postcard_err.into();
         assert!(matches!(sync_err, SyncError::Serialization(_)));
+    }
+
+    #[test]
+    fn test_payload_too_large_typed_and_distinct() {
+        let err = SyncError::PayloadTooLarge { size: 65, max: 64 };
+        assert!(err.is_payload_too_large());
+        assert!(!err.is_wire_format_mismatch());
+        assert!(!SyncError::serialization("x").is_payload_too_large());
+        assert_eq!(
+            err.to_string(),
+            "Sync payload too large: 65 bytes exceeds the 64-byte cap"
+        );
     }
 
     #[test]
