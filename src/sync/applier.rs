@@ -37,18 +37,21 @@ pub struct ApplyResult {
     pub skipped: usize,
     /// Number of changes where conflict resolution was used.
     pub conflicts: usize,
-    /// Highest sequence that is safe to acknowledge: every change at or below
-    /// it was applied, resolved, or idempotently skipped. `None` when the very
-    /// first change failed.
+    /// Highest sequence at or below which EVERY change in this batch was
+    /// applied, resolved, or idempotently skipped. `None` when no sequence
+    /// satisfies that.
     ///
-    /// A change that *errored* stops this advancing, and nothing after it
-    /// counts either — the peer must be able to retry it, and the sender's
-    /// `push_sequence` (which is what `compact_wal` trusts) is derived from
-    /// this value.
+    /// A change that *errored* bounds this value: the peer must be able to
+    /// retry it, and the sender's `push_sequence` (which is what `compact_wal`
+    /// trusts) is derived from it, so acknowledging past a failure would let
+    /// the sender delete a WAL event this peer never stored.
     ///
-    /// It is a running maximum over the sequences handled before the halt, so
-    /// a batch a remote peer ordered arbitrarily still reports the *highest*
-    /// safe sequence rather than the last one seen.
+    /// **The batch's order is not trusted** — a remote peer chooses it. The
+    /// bound is therefore by *sequence*, not by position: the value is the
+    /// highest handled sequence lying strictly below the LOWEST sequence that
+    /// failed anywhere in the batch. A batch arriving as `[9 ok, 3 err]`
+    /// reports `None` (9 sits above the failure); `[1 ok, 5 ok, 3 err]`
+    /// reports `1`; an ascending `[1 ok, 2 ok, 3 err]` reports `2`.
     pub safe_through: Option<u64>,
     /// Number of changes in this batch whose incoming `last_reinforced` lay
     /// beyond `now + SyncConfig::max_clock_skew_ms` (#13).
@@ -94,11 +97,21 @@ impl RemoteChangeApplier {
         // the sender derives its push position from `safe_through`, and
         // compaction deletes below that position.
         //
-        // `safe_through` is kept as a running MAXIMUM, not the last sequence
-        // handled: a remote peer controls the batch's order, so a batch whose
-        // sequences are not ascending would otherwise report the last one
-        // rather than the highest, contradicting the field's contract.
+        // "At or after it" is a statement about SEQUENCES, not about positions
+        // in this vector — a remote peer chooses the order, so a lower sequence
+        // can arrive after a higher one. Neither the last sequence handled nor
+        // the running maximum of them is sound: `[9 ok, 3 err]` yields 9 under
+        // both, acknowledging a change (3) that never applied. So the failures
+        // set a FLOOR — the lowest sequence that failed anywhere in the batch,
+        // still updated after the halt — the successes are recorded, and
+        // `safe_through` is the highest recorded success strictly below that
+        // floor. Any batch change at or below that value that had failed would
+        // have to sit below the floor, contradicting the floor's definition.
         let mut halted = false;
+        let mut failure_floor: Option<u64> = None;
+        // Bounded by the poller's batch limit (`SyncConfig::batch_size` on the
+        // push path, `PullRequest::batch_size` on the pull path).
+        let mut succeeded: Vec<u64> = Vec::new();
 
         // #13 skew is reported ONCE per batch, not once per change: the peer's
         // clock does not self-correct (the value is deliberately merged
@@ -122,34 +135,43 @@ impl RemoteChangeApplier {
                 Ok(ApplyOutcome::Applied) => {
                     result.applied += 1;
                     if !halted {
-                        result.safe_through =
-                            Some(result.safe_through.map_or(sequence, |s| s.max(sequence)));
+                        succeeded.push(sequence);
                     }
                 }
                 Ok(ApplyOutcome::Skipped) => {
                     result.skipped += 1;
                     if !halted {
-                        result.safe_through =
-                            Some(result.safe_through.map_or(sequence, |s| s.max(sequence)));
+                        succeeded.push(sequence);
                     }
                 }
                 Ok(ApplyOutcome::ConflictResolved) => {
                     result.applied += 1;
                     result.conflicts += 1;
                     if !halted {
-                        result.safe_through =
-                            Some(result.safe_through.map_or(sequence, |s| s.max(sequence)));
+                        succeeded.push(sequence);
                     }
                 }
                 Err(e) => {
                     warn!(sequence, "Failed to apply sync change: {}", e);
                     // Continue applying the rest — a later change may be
-                    // independent — but never acknowledge past this one.
+                    // independent — but never acknowledge at or past this one.
+                    // The floor keeps updating AFTER the halt: a lower failing
+                    // sequence arriving later in the batch must still pull the
+                    // acknowledgement down.
                     halted = true;
+                    failure_floor = Some(failure_floor.map_or(sequence, |f| f.min(sequence)));
                     result.skipped += 1;
                 }
             }
         }
+
+        // The highest success strictly below the failure floor (every success,
+        // when nothing failed). `None` when no recorded success qualifies —
+        // which is the honest answer for `[9 ok, 3 err]`.
+        result.safe_through = succeeded
+            .into_iter()
+            .filter(|sequence| failure_floor.is_none_or(|floor| *sequence < floor))
+            .max();
 
         if let Some((peer, max_skew_ms)) = worst_skew {
             warn!(
@@ -556,6 +578,99 @@ mod tests {
         assert_eq!(result.skipped, 1, "the rejected change counts as skipped");
     }
 
+    /// An `applications` map one bucket past [`MAX_SYNC_APPLICATION_BUCKETS`]:
+    /// the payload the applier refuses, used to fail one change of a batch.
+    fn poison_update() -> SerializableExperienceUpdate {
+        let mut buckets = BTreeMap::new();
+        for i in 0..=(MAX_SYNC_APPLICATION_BUCKETS as u128) {
+            buckets.insert(InstanceId::from_bytes(i.to_le_bytes()), 1u32);
+        }
+        SerializableExperienceUpdate {
+            applications: Some(buckets),
+            ..Default::default()
+        }
+    }
+
+    /// A remote peer chooses the batch's order, so a success may arrive AHEAD
+    /// of a failure at a lower sequence. Acknowledging the higher sequence
+    /// would let the sender's `compact_wal` delete the change that failed.
+    #[test]
+    fn a_success_above_a_later_failure_acknowledges_nothing() {
+        let (db, _dir) = open_db();
+        let cid = db.create_collective("applier-ack-unordered").unwrap();
+        let good = db.record_experience(minimal_exp(cid)).unwrap();
+        let benign = SerializableExperienceUpdate {
+            importance: Some(0.5),
+            ..Default::default()
+        };
+
+        let at = |seq: u64, update| {
+            let mut c = change(
+                SyncPayload::ExperienceUpdated {
+                    id: good,
+                    update,
+                    timestamp: Timestamp::from_millis(0),
+                },
+                cid,
+            );
+            c.sequence = seq;
+            c
+        };
+
+        let applier = RemoteChangeApplier::new(Arc::clone(&db), SyncConfig::default());
+        let result = applier
+            .apply_batch(vec![at(9, benign), at(3, poison_update())])
+            .unwrap();
+
+        assert_eq!(
+            result.safe_through, None,
+            "no sequence in this batch is safe: 9 applied but 3 failed, and \
+             acknowledging 9 would discard the peer's WAL event 3"
+        );
+    }
+
+    /// The bound is the LOWEST failing sequence, not the whole batch: a success
+    /// genuinely below it stays acknowledged, so an unordered batch does not
+    /// throw away progress it really made.
+    #[test]
+    fn a_success_below_the_lowest_failure_is_still_acknowledged() {
+        let (db, _dir) = open_db();
+        let cid = db.create_collective("applier-ack-floor").unwrap();
+        let good = db.record_experience(minimal_exp(cid)).unwrap();
+        let benign = SerializableExperienceUpdate {
+            importance: Some(0.5),
+            ..Default::default()
+        };
+
+        let at = |seq: u64, update| {
+            let mut c = change(
+                SyncPayload::ExperienceUpdated {
+                    id: good,
+                    update,
+                    timestamp: Timestamp::from_millis(0),
+                },
+                cid,
+            );
+            c.sequence = seq;
+            c
+        };
+
+        let applier = RemoteChangeApplier::new(Arc::clone(&db), SyncConfig::default());
+        let result = applier
+            .apply_batch(vec![
+                at(1, benign.clone()),
+                at(5, benign),
+                at(3, poison_update()),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            result.safe_through,
+            Some(1),
+            "1 applied and is below the failing 3, so it is safe; 5 is not"
+        );
+    }
+
     #[test]
     fn oversized_application_bucket_map_is_rejected() {
         let (db, _dir) = open_db();
@@ -718,8 +833,9 @@ mod tests {
 
     /// `safe_through` is documented as "the highest sequence at or below which
     /// every change was applied". A remote peer controls the batch's order, so
-    /// a batch whose sequences are not ascending must still report the highest
-    /// one — reporting the last would rewind the sender's push position.
+    /// a batch whose sequences are not ascending and where NOTHING failed must
+    /// still report the highest one — reporting the last would rewind the
+    /// sender's push position.
     #[test]
     fn safe_through_is_the_highest_sequence_not_the_last_one() {
         let (db, _dir) = open_db();
@@ -752,7 +868,8 @@ mod tests {
         assert_eq!(
             result.safe_through,
             Some(9),
-            "the running maximum, not the last sequence handled"
+            "with no failure to bound it, the highest sequence handled — not \
+             the last one handled"
         );
     }
 }

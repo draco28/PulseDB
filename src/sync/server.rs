@@ -126,11 +126,15 @@ impl SyncServer {
 
     /// Handles a push request — applies remote changes locally.
     ///
-    /// The acknowledged position is the highest sequence the applier handled
-    /// safely, **not** the highest sequence received: the sender turns this
-    /// into its `push_sequence`, and `compact_wal` deletes below it, so
-    /// acknowledging a change that failed to apply would let the sender
-    /// discard a WAL event this peer never stored.
+    /// The acknowledged position is
+    /// [`ApplyResult::safe_through`](super::applier::ApplyResult::safe_through)
+    /// — the highest sequence at or below which every change in the batch was
+    /// applied, resolved or idempotently skipped — **not** the highest sequence
+    /// received and not the highest one that happened to succeed: the sender
+    /// turns this into its `push_sequence`, and `compact_wal` deletes below it,
+    /// so acknowledging past a change that failed to apply would let the sender
+    /// discard a WAL event this peer never stored. The batch's order is the
+    /// sender's choice, so the bound is by sequence, not by position.
     #[instrument(skip(self, changes), fields(count = changes.len()))]
     pub fn handle_push(&self, changes: Vec<SyncChange>) -> Result<PushResponse, SyncError> {
         let source = changes
