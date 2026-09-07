@@ -64,7 +64,7 @@ use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // Copy-through tables, mirrored from the current `src/storage/schema.rs`.
 const EMBEDDINGS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("embeddings");

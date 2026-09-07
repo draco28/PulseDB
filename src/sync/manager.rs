@@ -22,7 +22,9 @@ use super::error::SyncError;
 use super::progress::SyncProgressCallback;
 use super::pusher::LocalChangePusher;
 use super::transport::SyncTransport;
-use super::types::{HandshakeRequest, InstanceId, PullRequest, SyncPosition, SyncStats, SyncStatus};
+use super::types::{
+    HandshakeRequest, InstanceId, PullRequest, SyncPosition, SyncStats, SyncStatus,
+};
 use super::{SYNC_CAPABILITY_GCOUNTER_APPLICATIONS, SYNC_PROTOCOL_VERSION};
 
 /// Orchestrator for sync operations between two PulseDB instances.
