@@ -56,12 +56,15 @@
 //! `redb = "4.1"` dev-dependency — the same technique 4.01's generator used. The
 //! guarantee is identical; the inspector is named `raw_table_bytes` per the AC.
 
+mod common;
+
+use common::{copy_fixture, fixtures_dir};
 use pulsedb::{CollectiveId, Config, ExperienceId, InsightId, PulseDB, RelationId};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 // Copy-through tables, mirrored from the current `src/storage/schema.rs`.
 const EMBEDDINGS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("embeddings");
@@ -76,10 +79,6 @@ const SUBSTRATE_MARKER: [u8; 3] = [b'P', b'S', 2];
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
-
-fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
-}
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -111,15 +110,6 @@ fn load_manifest(name: &str) -> Value {
     let s = std::fs::read_to_string(fixtures_dir().join(name))
         .unwrap_or_else(|e| panic!("read manifest {name}: {e}"));
     serde_json::from_str(&s).unwrap_or_else(|e| panic!("parse manifest {name}: {e}"))
-}
-
-/// Copy the committed fixture to a fresh temp path (redb's v2→v3 `upgrade()` is
-/// destructive/in-place — the checked-in blob must never be mutated by a run).
-fn copy_fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let dst = dir.path().join(name);
-    std::fs::copy(fixtures_dir().join(name), &dst).unwrap_or_else(|e| panic!("copy {name}: {e}"));
-    (dir, dst)
 }
 
 fn to_uuid(s: &str) -> uuid::Uuid {

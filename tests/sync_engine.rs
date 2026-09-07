@@ -6,16 +6,18 @@
 
 #![cfg(feature = "sync")]
 
+mod common;
+
 use std::sync::Arc;
 
+use common::{copy_fixture, fixtures_dir, sync_both_ways};
 use pulsedb::sync::config::{ConflictResolution, SyncConfig, SyncDirection};
-use pulsedb::sync::guard::SyncApplyGuard;
 use pulsedb::sync::manager::SyncManager;
 use pulsedb::sync::transport_mem::InMemorySyncTransport;
 use pulsedb::sync::SyncStatus;
 use pulsedb::{
-    CollectiveId, Config, ExperienceUpdate, InsightType, NewDerivedInsight, NewExperience,
-    NewExperienceRelation, PulseDB, RelationType,
+    CollectiveId, Config, ExperienceId, ExperienceUpdate, InsightType, NewDerivedInsight,
+    NewExperience, NewExperienceRelation, PulseDB, RelationType,
 };
 use tempfile::tempdir;
 
@@ -503,73 +505,114 @@ async fn test_bidirectional_reinforcement_gcounter_converges_exact_total() {
     assert_eq!(exp_a.applications, exp_b.applications);
 }
 
+/// The reserved bucket the v2→v3 migration files a store's scalar
+/// `applications` count under. Mirrors the private
+/// `legacy_applications_instance_id()` in `src/storage/redb.rs`: a fixed,
+/// non-UUIDv7 key that every migrated store shares, so two independently
+/// migrated copies of one v0.4.0 store merge their legacy counts under
+/// per-key max (one bucket) instead of summing them (two buckets).
+fn legacy_sentinel() -> pulsedb::InstanceId {
+    pulsedb::InstanceId::from_bytes(*b"PULSEDB_LEGACY__")
+}
+
+/// Issue #11: the sentinel-merge proof runs on two REAL v0.4.0 stores
+/// (schema v2, scalar `applications`), each migrated through the genuine
+/// v2→v3 path on open, then synced bidirectionally. Every experience collides
+/// on create, and the merged total must equal the legacy count — not twice it.
 #[tokio::test]
 async fn test_create_collision_sentinel_merge_does_not_double_count() {
     use std::collections::BTreeMap;
 
-    let (db_a, _dir_a) = open_db();
-    let (db_b, _dir_b) = open_db();
-    let (transport_a, transport_b) = InMemorySyncTransport::new_pair();
+    // Two independent restores of the same real v0.4.0 store, each migrated
+    // by its own open (the checked-in blob is never opened directly).
+    let (_tmp_a, path_a) = copy_fixture("real-v0.4.0.redb");
+    let (_tmp_b, path_b) = copy_fixture("real-v0.4.0.redb");
+    let db_a = Arc::new(PulseDB::open(&path_a, Config::default()).unwrap());
+    let db_b = Arc::new(PulseDB::open(&path_b, Config::default()).unwrap());
 
-    let mut manager_a = SyncManager::new(
-        Arc::clone(&db_a),
-        Box::new(transport_a),
-        SyncConfig {
-            direction: SyncDirection::PushOnly,
-            ..sync_config()
-        },
+    // v0.4.0 persisted no identity, so each copy minted its own on migration:
+    // the two stores are distinct sync actors, exactly as two restores are.
+    let id_a = db_a.instance_id();
+    let id_b = db_b.instance_id();
+    assert_ne!(id_a, id_b, "each migrated copy mints its own identity");
+
+    // Oracle: the manifest's captured pre-migration scalar counts.
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fixtures_dir().join("real-v0.4.0.manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["schema_version"], 2,
+        "fixture must be a schema-v2 store"
     );
-    let mut manager_b = SyncManager::new(
-        Arc::clone(&db_b),
-        Box::new(transport_b),
-        SyncConfig {
-            direction: SyncDirection::PullOnly,
-            ..sync_config()
-        },
-    );
+    let legacy: Vec<(ExperienceId, u32)> = manifest["experiences"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            let id = ExperienceId(uuid::Uuid::parse_str(e["id"].as_str().unwrap()).unwrap());
+            let count = u32::try_from(e["applications"].as_u64().unwrap()).unwrap();
+            (id, count)
+        })
+        .collect();
+    assert!(!legacy.is_empty(), "fixture carries experiences");
 
-    let cid = db_a.create_collective("sentinel-collision").unwrap();
-    let exp_id = db_a.record_experience(minimal_exp(cid)).unwrap();
-    manager_a.sync_once().await.unwrap();
-    manager_b.sync_once().await.unwrap();
+    // Post-migration, pre-sync: the scalar count landed in the sentinel bucket
+    // on both copies, and nowhere else.
+    for (id, count) in &legacy {
+        for db in [&db_a, &db_b] {
+            let exp = db.get_experience(*id).unwrap().unwrap();
+            assert_eq!(
+                exp.applications,
+                BTreeMap::from([(legacy_sentinel(), *count)]),
+                "experience {id}: v2 scalar must migrate into exactly the sentinel bucket"
+            );
+        }
+    }
 
-    let legacy_key = pulsedb::InstanceId::nil();
-    let remote_key = pulsedb::InstanceId::new();
-    let mut remote = db_a.get_experience(exp_id).unwrap().unwrap();
-    remote.applications = BTreeMap::from([(legacy_key, 5), (remote_key, 7)]);
-    let mut local = db_b.get_experience(exp_id).unwrap().unwrap();
-    local.applications = BTreeMap::from([(legacy_key, 5)]);
+    // Sync both ways. Every collective and experience already exists on the
+    // other side, so each ExperienceCreated is a create collision that goes
+    // through the G-counter merge — the sentinel must merge by key, not add.
+    sync_both_ways(&db_a, &db_b).await;
 
-    let guard = SyncApplyGuard::enter();
-    db_a.apply_synced_experience(remote).unwrap();
-    db_b.apply_synced_experience(local).unwrap();
-    drop(guard);
+    for (id, count) in &legacy {
+        for db in [&db_a, &db_b] {
+            let exp = db.get_experience(*id).unwrap().unwrap();
+            assert_eq!(
+                exp.applications(),
+                *count,
+                "experience {id}: merged total must equal the legacy count, not twice it"
+            );
+            assert_eq!(
+                exp.applications,
+                BTreeMap::from([(legacy_sentinel(), *count)]),
+                "experience {id}: still exactly one sentinel bucket after sync"
+            );
+        }
+    }
 
-    let (collision_push, collision_pull) = InMemorySyncTransport::new_pair();
-    let mut collision_sender = SyncManager::new(
-        Arc::clone(&db_a),
-        Box::new(collision_push),
-        SyncConfig {
-            direction: SyncDirection::PushOnly,
-            ..sync_config()
-        },
-    );
-    let mut collision_receiver = SyncManager::new(
-        Arc::clone(&db_b),
-        Box::new(collision_pull),
-        SyncConfig {
-            direction: SyncDirection::PullOnly,
-            ..sync_config()
-        },
-    );
+    // Fresh reinforcements on each migrated copy land in each copy's own
+    // minted bucket and sum exactly on top of the sentinel. This part bites
+    // whatever the fixture's scalar values are: a sentinel renamed, or minted
+    // per store, would surface here as an extra bucket.
+    let (probe, probe_legacy) = legacy[0];
+    for _ in 0..2 {
+        db_a.reinforce_experience(probe).unwrap();
+    }
+    for _ in 0..3 {
+        db_b.reinforce_experience(probe).unwrap();
+    }
+    sync_both_ways(&db_a, &db_b).await;
 
-    collision_sender.sync_once().await.unwrap();
-    collision_receiver.sync_once().await.unwrap();
-
-    let merged = db_b.get_experience(exp_id).unwrap().unwrap();
-    assert_eq!(merged.applications.get(&legacy_key), Some(&5));
-    assert_eq!(merged.applications.get(&remote_key), Some(&7));
-    assert_eq!(merged.applications(), 12);
+    let expected = BTreeMap::from([(legacy_sentinel(), probe_legacy), (id_a, 2), (id_b, 3)]);
+    for db in [&db_a, &db_b] {
+        let exp = db.get_experience(probe).unwrap().unwrap();
+        assert_eq!(
+            exp.applications, expected,
+            "sentinel + one bucket per migrated copy"
+        );
+        assert_eq!(exp.applications(), probe_legacy + 5);
+    }
 }
 
 // ============================================================================

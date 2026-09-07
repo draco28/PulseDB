@@ -55,7 +55,8 @@ pub struct SyncServer {
 impl SyncServer {
     /// Creates a new SyncServer for the given database.
     pub fn new(db: Arc<PulseDB>, config: SyncConfig) -> Self {
-        let instance_id = db.storage_for_test().instance_id();
+        // Read once, here — same pre-construction rule as `SyncManager`.
+        let instance_id = db.instance_id();
         Self {
             db,
             instance_id,

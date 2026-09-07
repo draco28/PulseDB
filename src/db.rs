@@ -3237,6 +3237,66 @@ impl PulseDB {
     }
 
     // =========================================================================
+    // Sync Identity (feature: sync)
+    // =========================================================================
+
+    /// Returns this store's persistent sync identity.
+    ///
+    /// The `InstanceId` is minted once when the store file is created and is
+    /// persisted inside it, so it is stable across reopens. It keys this
+    /// instance's bucket in every experience's per-instance `applications`
+    /// counter and identifies the instance in the sync protocol. A file-level
+    /// copy of the store carries the *same* id — see
+    /// [`remint_instance_id`](Self::remint_instance_id).
+    #[cfg(feature = "sync")]
+    pub fn instance_id(&self) -> InstanceId {
+        self.storage.instance_id()
+    }
+
+    /// Gives this store a fresh sync identity and returns the new `InstanceId`.
+    ///
+    /// # Why
+    ///
+    /// `applications` is a per-instance G-counter: the exact-total guarantee
+    /// of its sync merge (per-key max, then sum) holds only while every
+    /// replica reinforces under a *distinct* id. Because the id lives in the
+    /// store file, a backup restore, snapshot or plain `cp` of a store yields
+    /// two replicas that share one id; their increments then collide under
+    /// max and are silently lost. Remint the copy before its first reinforce
+    /// and the original and the copy count separately again.
+    ///
+    /// # What it does
+    ///
+    /// One write transaction replaces the persisted id with a fresh UUID and
+    /// updates the value [`instance_id`](Self::instance_id) reports. Existing
+    /// `applications` buckets under the old id are left exactly as they are —
+    /// from this instance's point of view they are now just another peer's
+    /// buckets, so totals are preserved. No WAL event and no sync event is
+    /// emitted; the remint is recorded as a `tracing::info!` carrying the old
+    /// and new ids.
+    ///
+    /// # Ordering
+    ///
+    /// Call this **before constructing** a `SyncManager` (or `SyncServer`)
+    /// over this database: they read the identity once, at construction.
+    /// Behaviour when a manager is already live is unspecified — PulseDB does
+    /// not track managers and applies no runtime guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PulseDBError::ReadOnly`] on a read-only store; the identity
+    /// is left unchanged.
+    #[cfg(feature = "sync")]
+    #[instrument(skip(self))]
+    pub fn remint_instance_id(&self) -> Result<InstanceId> {
+        self.check_writable()?;
+        let old = self.storage.instance_id();
+        let new = self.storage.remint_instance_id()?;
+        info!(old = %old, new = %new, "Instance identity reminted");
+        Ok(new)
+    }
+
+    // =========================================================================
     // Sync WAL Compaction (feature: sync)
     // =========================================================================
 

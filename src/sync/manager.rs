@@ -64,7 +64,9 @@ impl SyncManager {
     /// Does NOT start sync — call [`start()`](Self::start) or
     /// [`sync_once()`](Self::sync_once) to begin.
     pub fn new(db: Arc<PulseDB>, transport: Box<dyn SyncTransport>, config: SyncConfig) -> Self {
-        let local_instance_id = db.storage_for_test().instance_id();
+        // Read once, here: a `PulseDB::remint_instance_id()` after this point
+        // is not observed by this manager (documented pre-manager rule).
+        let local_instance_id = db.instance_id();
         Self {
             db,
             transport: Arc::from(transport),
