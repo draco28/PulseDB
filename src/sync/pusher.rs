@@ -40,9 +40,10 @@ impl LocalChangePusher {
     /// sync batch". Left on [`ChangePoller`]'s own default (1000, for
     /// non-sync callers) the pusher would collect up to 1000 events whatever
     /// `batch_size` said, and `SyncConfig::validate`'s
-    /// `max_request_bytes >= batch_size * MAX_CONTENT_SIZE` floor would be
-    /// computed against a number this path never used — passing the check while
-    /// the body it builds is refused by the peer's cap on every cycle, forever.
+    /// `max_request_bytes >= batch_size * MAX_EXPERIENCE_WIRE_BYTES_EXCLUDING_APPLICATIONS`
+    /// floor would be computed against a number this path never used — passing
+    /// the check while the body it builds is refused by the peer's cap on every
+    /// cycle, forever.
     pub fn new(
         db: Arc<PulseDB>,
         transport: Arc<dyn SyncTransport>,

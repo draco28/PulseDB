@@ -499,7 +499,7 @@ fn test_sync_config_defaults_are_valid() {
     assert!(config.validate().is_ok());
     assert_eq!(config.direction, SyncDirection::Bidirectional);
     assert_eq!(config.conflict_resolution, ConflictResolution::ServerWins);
-    assert_eq!(config.batch_size, 500);
+    assert_eq!(config.batch_size, 250);
 }
 
 #[test]

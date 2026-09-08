@@ -41,11 +41,15 @@ fn minimal_exp(cid: CollectiveId) -> NewExperience {
 }
 
 fn sync_config() -> SyncConfig {
-    SyncConfig {
+    let config = SyncConfig {
         direction: SyncDirection::Bidirectional,
-        batch_size: 500,
+        batch_size: 250,
         ..Default::default()
-    }
+    };
+    // 500 was the pre-0.8.0 default and no longer validates against the default
+    // byte cap; these tests are supposed to model a supported configuration.
+    config.validate().expect("the test config must be valid");
+    config
 }
 
 /// Create two PulseDB instances with paired transports and SyncManagers.

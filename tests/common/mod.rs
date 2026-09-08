@@ -48,7 +48,7 @@ pub async fn sync_both_ways(
 
     let cfg = |direction| SyncConfig {
         direction,
-        batch_size: 500,
+        batch_size: 250,
         ..Default::default()
     };
     let (a_push, b_pull) = InMemorySyncTransport::new_pair();

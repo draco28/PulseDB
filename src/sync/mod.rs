@@ -69,6 +69,16 @@
 //! cap to response bodies (a `Content-Length` above the cap is refused unread,
 //! a chunked body is read bounded). There is no streaming or chunked decode.
 //!
+//! `SyncConfig::validate` floors the cap at `batch_size` x
+//! `MAX_EXPERIENCE_WIRE_BYTES_EXCLUDING_APPLICATIONS` (`sync::config`), the
+//! largest batch of bounded fields a `batch_size` can build. That floor is
+//! necessary, **not sufficient**: `applications` sits outside the bound, and an
+//! experience carrying roughly 4 300 or more G-counter buckets takes a
+//! default-size batch past the default cap even though the pair validated. A
+//! batch that overruns the cap is refused with `PayloadTooLarge`, and with no
+//! byte-aware splitting and no shrink-and-retry the next cycle rebuilds the
+//! identical batch and is refused again — see that constant, and issue #98.
+//!
 //! **Protocol version and capabilities (#12).** The handshake carries a
 //! `protocol_version` that is *checked*: a mismatch reaches the client as the
 //! typed [`SyncError::ProtocolVersion`]`{ local, remote }`, never as a reason

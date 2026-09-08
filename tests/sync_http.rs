@@ -687,6 +687,11 @@ async fn test_http_handshake_happy_path_carries_preamble() {
 // ============================================================================
 
 /// Builds an in-process `SyncServer` with an explicit request byte cap.
+///
+/// The caps here are bytes, not megabytes — far below any value
+/// `SyncConfig::validate` would accept beside a non-zero `batch_size`. That is
+/// the point: these tests exercise the byte-cap refusal itself, so the config is
+/// constructed directly and deliberately never validated.
 fn in_process_server_with_cap(max_request_bytes: usize) -> (Arc<SyncServer>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let db = Arc::new(PulseDB::open(dir.path().join("server.db"), Config::default()).unwrap());
@@ -1005,7 +1010,8 @@ fn wide_batch_config(batch_size: usize) -> SyncConfig {
     let config = SyncConfig {
         direction: SyncDirection::PullOnly,
         batch_size,
-        max_request_bytes: batch_size * pulsedb::storage::schema::MAX_CONTENT_SIZE,
+        max_request_bytes: batch_size
+            * pulsedb::sync::config::MAX_EXPERIENCE_WIRE_BYTES_EXCLUDING_APPLICATIONS,
         ..SyncConfig::default()
     };
     config
