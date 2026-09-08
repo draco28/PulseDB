@@ -71,10 +71,18 @@
 //!
 //! `SyncConfig::validate` floors the cap at `batch_size` x
 //! `MAX_EXPERIENCE_WIRE_BYTES_EXCLUDING_APPLICATIONS` (`sync::config`), the
-//! largest batch of bounded fields a `batch_size` can build. That floor is
-//! necessary, **not sufficient**: `applications` sits outside the bound, and an
-//! experience carrying roughly 4 300 or more G-counter buckets takes a
-//! default-size batch past the default cap even though the pair validated. A
+//! largest batch of bounded fields a `batch_size` can build. That floor is a
+//! conservative guard sized **above** the measured encoder, not a prediction of
+//! encoded size — a `batch_size` it refuses is not thereby one that would have
+//! overrun the cap — and it is necessary but **not sufficient**: `applications`
+//! sits outside the bound, and it spends the **batch's** headroom. Roughly
+//! 1.08 million G-counter buckets across a default-size batch — about 4 300 on
+//! each of its 250 changes, or about 17 changes at the applier's 65 536
+//! maximum — take it past the default cap even though the pair validated. At
+//! the default no single experience can (65 536 buckets is ~1.44 MB against
+//! ~23.8 MB of batch headroom); near the `batch_size` ceiling, where ~258 KB
+//! remains, one experience with ~11 700 buckets is enough. (Estimates, at ~22
+//! bytes a bucket.) A
 //! batch that overruns the cap is refused with `PayloadTooLarge`, and with no
 //! byte-aware splitting and no shrink-and-retry the next cycle rebuilds the
 //! identical batch and is refused again — see that constant, and issue #98.

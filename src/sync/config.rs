@@ -77,13 +77,28 @@ const EXPERIENCE_WIRE_ENVELOPE_BYTES: usize = 1024;
 /// `MAX_SYNC_APPLICATION_BUCKETS` (65 536) of them on a single incoming
 /// experience. Each bucket costs about 22 bytes encoded (a 16-byte `InstanceId`
 /// with its length prefix, plus a varint `u32`), so **an experience carrying
-/// enough buckets exceeds this bound on its own, and a batch of them still
-/// exceeds `max_request_bytes` even though the pair passed `validate()`.**
+/// enough buckets exceeds this bound on its own, and a batch of them can exceed
+/// `max_request_bytes` even though the pair passed `validate()`.**
 ///
-/// It does not take the applier's maximum to get there. At the default
+/// **The budget it eats is the BATCH's, not one experience's.** At the default
 /// `batch_size` the measured batch above leaves 23 811 862 bytes of headroom
-/// under the default cap — about 95 KB per experience, or roughly **4 300**
-/// distinct peer instances each. That is the real threshold, not 65 536.
+/// under the default cap. At ~22 bytes a bucket that is roughly **1.08 million
+/// buckets across the whole batch** — about **4 300 on each of the 250
+/// changes**, or about **17 changes** each carrying the applier's full 65 536,
+/// or any distribution summing to the same total. Every figure here is an
+/// estimate resting on the ~22-byte bucket, which is itself an estimate.
+///
+/// At the default `batch_size`, **no single experience can do it alone**: the
+/// applier's own limit caps one incoming experience at 65 536 x ~22 =
+/// ~1.44 MB of buckets, about a sixteenth of the ~23.8 MB the default batch
+/// leaves spare. That is a fact about the default's headroom, **not a property
+/// of the design**, and it stops holding as `batch_size` approaches what
+/// `validate()` admits. At the ceiling of 386 the same per-change measurement
+/// scales to roughly 66.85 MB encoded, leaving only about 258 KB: there ONE
+/// experience carrying roughly **11 700** buckets overruns the cap by itself,
+/// and one at the accepted 65 536 maximum exceeds that remaining headroom
+/// about five and a half times over. See [`SyncConfig::batch_size`], whose
+/// near-ceiling note is this same edge.
 ///
 /// It is excluded anyway because folding it in puts the per-experience bound at
 /// ~1.54 MiB, which a 64 MiB cap covers for a `batch_size` of only 41 — a more
@@ -120,11 +135,22 @@ pub const MAX_EXPERIENCE_WIRE_BYTES_EXCLUDING_APPLICATIONS: usize = MAX_CONTENT_
 /// 43 297 002 bytes. 64 MiB (67 108 864 bytes) clears that with ~22.7 MiB to
 /// spare, while still refusing a runaway or hostile body long before it can
 /// exhaust memory. At this cap `validate()` admits a `batch_size` up to **386**.
+/// That ceiling is where the **floor** crosses this cap, not where the encoder
+/// does: 387 x 173 680 = 67 214 160 is over it, while 387 maximum-field changes
+/// are estimated to encode to ~67.02 MB — some 85 KB **under** it. The floor is
+/// a guard deliberately sized above the measured encoder, not a prediction of
+/// encoded size.
 ///
 /// **It is not a bound on every valid batch.** `applications` is outside the
-/// per-experience bound (see that constant), so an experience carrying roughly
-/// 4 300 or more G-counter buckets can take a default batch past this cap even
-/// though the configuration validates. There is then no byte-aware splitting and
+/// per-experience bound (see that constant), and what it eats is the **batch's**
+/// headroom: roughly 1.08 million G-counter buckets spread across a default
+/// batch — about 4 300 on each of its 250 changes, or about 17 changes at the
+/// applier's 65 536 maximum — take it past this cap even though the
+/// configuration validates. At the default no *single* experience can, since
+/// the applier caps one at ~1.44 MB of buckets against ~23.8 MB of batch
+/// headroom; near the `batch_size` ceiling that headroom nearly vanishes
+/// (~258 KB at 386) and one experience with ~11 700 buckets is enough. (All
+/// estimates, at ~22 bytes a bucket.) There is then no byte-aware splitting and
 /// no shrink-and-retry: the request is refused with
 /// [`SyncError::PayloadTooLarge`](super::error::SyncError::PayloadTooLarge), the
 /// next cycle rebuilds the identical batch and is refused again, and sync stops
@@ -246,12 +272,30 @@ pub struct SyncConfig {
     /// content alone, and 500 of those is ~86.8 MB against a 64 MiB cap — a
     /// batch the default configuration could build and no peer would accept.
     /// At the default cap the largest `batch_size` that validates is **386**.
+    /// **386 is where the validation floor crosses the cap, not where the
+    /// encoder does.** 387 is refused because `387 x 173 680 = 67 214 160`
+    /// exceeds the 64 MiB cap; 387 maximum-field changes are estimated to
+    /// *encode* to ~67.02 MB, roughly 85 KB under it. The floor carries a 1 KiB
+    /// per-experience framing allowance against a measured 532 bytes, so it
+    /// sits about 492 bytes per change above the encoder — a conservative guard
+    /// by construction, and the gap is intentional headroom rather than an
+    /// error term.
     ///
     /// **A batch that validates can still overrun the cap.**
-    /// `applications` is outside that per-experience bound: an experience
-    /// carrying roughly 4 300 or more G-counter buckets takes a default batch
-    /// past 64 MiB even though the pair passed `validate()`. When it does, the
-    /// peer refuses the request with
+    /// `applications` is outside that per-experience bound, and it spends the
+    /// **batch's** headroom rather than one experience's: roughly 1.08 million
+    /// G-counter buckets across a default batch — about 4 300 on each of its
+    /// 250 changes, or about 17 changes at the applier's 65 536 maximum — take
+    /// it past 64 MiB even though the pair passed `validate()`. At the default
+    /// no single experience can do that alone, because the applier refuses more
+    /// than 65 536 buckets on one experience (~1.44 MB) against ~23.8 MB of
+    /// batch headroom. **That protection is the default's headroom, not the
+    /// design's**, and it thins out as `batch_size` rises toward 386: at the
+    /// ceiling the estimated encode is ~66.85 MB, leaving ~258 KB, so ONE
+    /// experience with roughly 11 700 buckets overruns the cap by itself and
+    /// one at the 65 536 maximum exceeds what is left several times over. (All
+    /// estimates, resting on the ~22-byte-per-bucket figure.) When a batch does
+    /// overrun, the peer refuses the request with
     /// [`SyncError::PayloadTooLarge`](super::error::SyncError::PayloadTooLarge),
     /// and with no byte-aware splitting and no shrink-and-retry every following
     /// cycle rebuilds the identical batch and is refused again — sync stops
@@ -310,10 +354,23 @@ pub struct SyncConfig {
     /// refuses the pair. Before 0.8.0 that floor counted `content` alone, which
     /// let the shipped defaults build an ~86.8 MB batch against this 64 MiB cap.
     ///
+    /// The floor is deliberately **above** the measured encoder rather than a
+    /// prediction of it (a 1 KiB per-experience framing allowance against a
+    /// measured 532 bytes), so a `batch_size` it refuses — 387 at the default
+    /// cap — is not thereby a batch that would have overrun the cap: 387
+    /// maximum-field changes are estimated to encode to ~67.02 MB, under the
+    /// 67 108 864-byte cap. The gap is intentional guard, not error.
+    ///
     /// **The floor is not a guarantee that every valid batch fits.**
-    /// `applications` is deliberately outside the per-experience bound, so an
-    /// experience carrying roughly 4 300 or more G-counter buckets takes a
-    /// default-size batch past this cap even though the configuration validated.
+    /// `applications` is deliberately outside the per-experience bound, and it
+    /// spends the **batch's** headroom: roughly 1.08 million G-counter buckets
+    /// across a default-size batch — about 4 300 on each of its 250 changes, or
+    /// about 17 changes at the applier's 65 536 maximum — take it past this cap
+    /// even though the configuration validated. At the default no single
+    /// experience can (the applier caps one at ~1.44 MB of buckets against
+    /// ~23.8 MB of batch headroom); at a `batch_size` near the ceiling, where
+    /// that headroom falls to ~258 KB, one experience with ~11 700 buckets is
+    /// enough on its own. (Estimates, at ~22 bytes a bucket.)
     /// There is no byte-aware batch splitting and no shrink-and-retry: the
     /// request is refused with
     /// [`SyncError::PayloadTooLarge`](super::error::SyncError::PayloadTooLarge),
@@ -429,9 +486,15 @@ impl SyncConfig {
     ///
     /// That last floor covers every bounded field **except `applications`**,
     /// which is unbounded for this purpose — the applier accepts up to
-    /// `MAX_SYNC_APPLICATION_BUCKETS` (65 536) G-counter buckets per experience
-    /// and roughly 4 300 of them is already enough to take a default-size batch
-    /// past the default cap. A configuration that passes here can therefore
+    /// `MAX_SYNC_APPLICATION_BUCKETS` (65 536) G-counter buckets per experience,
+    /// and roughly 1.08 million of them *across a default-size batch* (about
+    /// 4 300 on each of its 250 changes, or about 17 changes at that 65 536
+    /// maximum) is enough to take it past the default cap. At the default no
+    /// single experience can manage it — 65 536 buckets is only ~1.44 MB
+    /// against ~23.8 MB of batch headroom — but that margin shrinks with
+    /// `batch_size`, and near the ceiling (~258 KB of headroom at 386) one
+    /// experience with ~11 700 buckets suffices. (Estimates, at ~22 bytes a
+    /// bucket.) A configuration that passes here can therefore
     /// still build a batch its peer refuses with
     /// [`SyncError::PayloadTooLarge`](super::error::SyncError::PayloadTooLarge),
     /// and with no byte-aware splitting and no shrink-and-retry every following
@@ -596,6 +659,15 @@ mod tests {
 
     /// The ceiling is a boundary, so test it as one: the largest `batch_size`
     /// the default cap admits passes, and one more fails.
+    ///
+    /// What this pins is `validate()`'s **floor**, not the encoder. 387 is
+    /// refused because `387 x 173 680 = 67 214 160` crosses the 64 MiB cap —
+    /// **not** because 387 changes encode past it. Scaling the measured
+    /// maximum-field encode (43 297 002 bytes for 250, ~173 188 a change) puts
+    /// 387 of them at roughly 67.02 MB, some 85 KB *under* the cap. The floor
+    /// carries a 1 KiB per-experience framing allowance against a measured 532
+    /// bytes, so it deliberately sits ~492 bytes per change above the encoder;
+    /// that gap is the guard doing its job, not a mis-estimate.
     #[test]
     fn test_sync_config_validate_batch_size_ceiling_is_exact() {
         let ceiling = DEFAULT_MAX_REQUEST_BYTES / MAX_EXPERIENCE_WIRE_BYTES_EXCLUDING_APPLICATIONS;
@@ -607,7 +679,7 @@ mod tests {
         };
         at_ceiling
             .validate()
-            .expect("the largest batch_size the default cap covers must be accepted");
+            .expect("the largest batch_size the default cap admits must be accepted");
 
         let over_ceiling = SyncConfig {
             batch_size: ceiling + 1,
@@ -616,7 +688,7 @@ mod tests {
         let err = over_ceiling.validate().unwrap_err();
         assert!(
             matches!(err, ValidationError::InvalidField { ref field, .. } if field == "max_request_bytes"),
-            "one past the ceiling must be refused, got {err:?}"
+            "one past the ceiling must be refused BY THE FLOOR, got {err:?}"
         );
     }
 
@@ -812,9 +884,13 @@ mod tests {
     /// derived bound must come in under the cap.
     ///
     /// `applications` is left EMPTY on purpose. It is outside the bound (see the
-    /// constant), and the residual it leaves — roughly 4 300 buckets per
-    /// experience is enough to overrun the cap at this batch size — is what
-    /// issue #98 fixes.
+    /// constant), and the residual it leaves is a **batch** budget: the ~23.8 MB
+    /// this measurement leaves under the cap is roughly 1.08 million buckets
+    /// across the batch — about 4 300 on each of these 250 changes, or about 17
+    /// of them at the applier's 65 536 maximum. One experience cannot spend it
+    /// alone at this batch size (65 536 buckets is only ~1.44 MB), though it can
+    /// at a `batch_size` near the validation ceiling, where ~258 KB is all that
+    /// is left. That is what issue #98 fixes.
     #[test]
     fn test_a_maximum_field_default_batch_fits_the_default_cap() {
         use std::collections::BTreeMap;
