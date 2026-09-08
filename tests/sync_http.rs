@@ -21,7 +21,7 @@ use pulsedb::sync::manager::SyncManager;
 use pulsedb::sync::server::SyncServer;
 use pulsedb::sync::transport::SyncTransport;
 use pulsedb::sync::transport_http::HttpSyncTransport;
-use pulsedb::sync::types::{HandshakeRequest, InstanceId, PullRequest, SyncPosition};
+use pulsedb::sync::types::{HandshakeRequest, InstanceId, PullRequest, PullResponse, SyncPosition};
 use pulsedb::sync::{
     read_wire_preamble, write_wire_preamble, SYNC_PROTOCOL_VERSION, SYNC_WIRE_MAGIC,
     SYNC_WIRE_PREAMBLE_LEN, WIRE_FORMAT_VERSION,
@@ -955,4 +955,266 @@ async fn server_stats_count_skewed_last_reinforced() {
     let stored = server.db.get_experience(exp_id).unwrap().unwrap();
     assert_eq!(stored.last_reinforced, skewed, "counted, not clamped");
     assert_eq!(stored.applications.get(&peer), Some(&3));
+}
+
+// ============================================================================
+// Pull page saturation (PR #88 review, class Q)
+// ============================================================================
+
+/// WAL events one server-side pull polls in a single page.
+///
+/// Mirrors `SyncServer`'s own `PULL_PAGE_EVENT_LIMIT`, which is private to the
+/// server: a fixture that reaches this many events is exercising a FULL poll
+/// page, the only state from which `has_more` cannot be read off the batch.
+const SERVER_PULL_PAGE_EVENTS: usize = 1000;
+
+/// Fills a store's WAL with `count` collective-create events, in WAL order.
+///
+/// A collective create is the cheapest write that still yields a `SyncChange`
+/// (no embedding, no vector on the wire), and it is the payload that survives a
+/// serializing transport intact — issue #96 keeps experiences off it — so one
+/// fixture serves both the `handle_pull` assertions and the catch-up that runs
+/// over real HTTP.
+fn fill_wal_with_collectives(db: &PulseDB, count: usize) -> Vec<CollectiveId> {
+    (0..count)
+        .map(|i| db.create_collective(&format!("page-fill-{i}")).unwrap())
+        .collect()
+}
+
+/// One pull straight at the server handler, bypassing HTTP.
+fn pull_page(
+    server: &SyncServer,
+    from: u64,
+    batch_size: usize,
+    collectives: Option<Vec<CollectiveId>>,
+) -> PullResponse {
+    server
+        .handle_pull(PullRequest {
+            cursor: SyncPosition::new(server.instance_id(), from),
+            batch_size,
+            collectives,
+        })
+        .expect("handle_pull")
+}
+
+/// A pull-only client whose `batch_size` sits at or above the server's poll
+/// page. `validate()` is asserted here because it is the point of the class:
+/// this is a SUPPORTED configuration, not an exotic one — it only needs a
+/// `max_request_bytes` that matches the batch it can produce.
+fn wide_batch_config(batch_size: usize) -> SyncConfig {
+    let config = SyncConfig {
+        direction: SyncDirection::PullOnly,
+        batch_size,
+        max_request_bytes: batch_size * pulsedb::storage::schema::MAX_CONTENT_SIZE,
+        ..SyncConfig::default()
+    };
+    config
+        .validate()
+        .expect("a wide batch_size with a matching byte cap is a supported configuration");
+    config
+}
+
+fn open_client() -> (Arc<PulseDB>, tempfile::TempDir) {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(PulseDB::open(dir.path().join("client.db"), Config::default()).unwrap());
+    (db, dir)
+}
+
+/// Class Q: a FULL poll page must report `has_more`, even when every event it
+/// polled turned into a change.
+///
+/// With `batch_size` at or above the poll page the two caps coincide —
+/// `events.len() == changes.len() == 1000` — so a `has_more` computed from the
+/// batch alone reads "exhausted" while the WAL still holds events. `initial_sync`
+/// breaks on `!has_more` and returns `Ok(())`, which under the contract this PR
+/// introduced means the catch-up COMPLETED. It had not: the changes past the
+/// page were never fetched.
+#[tokio::test]
+async fn a_full_poll_page_reports_more_even_when_every_event_yielded_a_change() {
+    let server = start_test_server().await;
+    let ids = fill_wal_with_collectives(&server.db, SERVER_PULL_PAGE_EVENTS + 5);
+    let batch_size = 2 * SERVER_PULL_PAGE_EVENTS;
+
+    let response = pull_page(&server.server, 0, batch_size, None);
+    assert_eq!(
+        response.changes.len(),
+        SERVER_PULL_PAGE_EVENTS,
+        "the poll page, not batch_size, is what bounds this batch"
+    );
+    assert!(
+        response.has_more,
+        "a full poll page with events behind it must report more — the batch \
+         count cannot tell exhaustion from saturation when the two caps coincide"
+    );
+
+    // The consequence, end to end: `Ok(())` from `initial_sync` has to mean the
+    // catch-up completed.
+    let (db_client, _dir_client) = open_client();
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_client),
+        Box::new(HttpSyncTransport::new(&server.base_url)),
+        wide_batch_config(batch_size),
+    );
+    manager
+        .initial_sync(None)
+        .await
+        .expect("every change applies, so the catch-up completes");
+
+    let missing = ids
+        .iter()
+        .filter(|id| db_client.get_collective(**id).unwrap().is_none())
+        .count();
+    assert_eq!(
+        missing,
+        0,
+        "`Ok(())` means the catch-up completed, but {missing} of {} collectives \
+         never arrived",
+        ids.len()
+    );
+}
+
+/// The other side of the rule: a WAL that ends EXACTLY on the poll limit.
+///
+/// One poll cannot tell that page from a saturated one, so the server reports
+/// `has_more` conservatively. This test pins that over-reporting as harmless —
+/// the follow-up pull comes back empty with `has_more: false` and an unadvanced
+/// cursor, which `initial_sync`'s existing guard reads as the ordinary
+/// caught-up end and returns `Ok(())`.
+#[tokio::test]
+async fn a_page_that_exactly_exhausts_the_wal_over_reports_and_still_completes() {
+    let server = start_test_server().await;
+    let ids = fill_wal_with_collectives(&server.db, SERVER_PULL_PAGE_EVENTS);
+    assert_eq!(
+        server.db.get_current_sequence().unwrap(),
+        SERVER_PULL_PAGE_EVENTS as u64,
+        "the fixture must leave the WAL ending exactly on the poll limit"
+    );
+    let batch_size = 2 * SERVER_PULL_PAGE_EVENTS;
+
+    let first = pull_page(&server.server, 0, batch_size, None);
+    assert_eq!(first.changes.len(), SERVER_PULL_PAGE_EVENTS);
+    assert!(
+        first.has_more,
+        "a full page is reported as possibly-more: nothing in this poll could \
+         have told the server the WAL ended on the limit"
+    );
+
+    let second = pull_page(&server.server, first.new_cursor.sequence, batch_size, None);
+    assert!(
+        second.changes.is_empty(),
+        "there was nothing beyond the page after all"
+    );
+    assert!(
+        !second.has_more,
+        "the short page is the evidence of exhaustion, and this one is empty"
+    );
+    assert_eq!(
+        second.new_cursor.sequence, first.new_cursor.sequence,
+        "an empty batch leaves the cursor exactly where it was"
+    );
+
+    let (db_client, _dir_client) = open_client();
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_client),
+        Box::new(HttpSyncTransport::new(&server.base_url)),
+        wide_batch_config(batch_size),
+    );
+    manager
+        .initial_sync(None)
+        .await
+        .expect("the conservative has_more costs one empty pull, not the completion");
+
+    let missing = ids
+        .iter()
+        .filter(|id| db_client.get_collective(**id).unwrap().is_none())
+        .count();
+    assert_eq!(missing, 0, "{missing} collectives never arrived");
+}
+
+/// A page SHORT of the poll limit is untouched by the saturation rule: the
+/// default `batch_size` still reports exhaustion when it drains the page, and a
+/// `batch_size` below the page still reports more.
+#[tokio::test]
+async fn a_short_poll_page_reports_exactly_what_it_did_before() {
+    let server = start_test_server().await;
+    let ids = fill_wal_with_collectives(&server.db, 5);
+    assert!(ids.len() < SERVER_PULL_PAGE_EVENTS);
+
+    let drained = pull_page(&server.server, 0, SyncConfig::default().batch_size, None);
+    assert_eq!(drained.changes.len(), 5);
+    assert!(
+        !drained.has_more,
+        "a short page with every event emitted is the exhausted WAL"
+    );
+    assert_eq!(drained.new_cursor.sequence, 5);
+
+    let capped = pull_page(&server.server, 0, 2, None);
+    assert_eq!(capped.changes.len(), 2, "batch_size caps this batch");
+    assert!(
+        capped.has_more,
+        "the page held more events than batch_size emitted"
+    );
+    assert_eq!(capped.new_cursor.sequence, 2);
+
+    let rest = pull_page(&server.server, capped.new_cursor.sequence, 2, None);
+    assert_eq!(rest.changes.len(), 2);
+    assert!(rest.has_more);
+    let last = pull_page(&server.server, rest.new_cursor.sequence, 2, None);
+    assert_eq!(last.changes.len(), 1);
+    assert!(
+        !last.has_more,
+        "the remainder drains the page and reports exhaustion"
+    );
+}
+
+/// The behaviour issue #90 tracks, at the real server: a page where the
+/// `collectives` filter removed every event returns an empty batch with an
+/// UNADVANCED cursor and `has_more: true`, and `initial_sync` turns that stall
+/// into `CatchUpIncomplete` rather than spinning on the identical request.
+///
+/// The saturation rule must not disturb this — a short page that emitted fewer
+/// changes than it polled still reports more.
+#[tokio::test]
+async fn a_fully_filtered_page_still_stalls_the_catch_up() {
+    let server = start_test_server().await;
+    fill_wal_with_collectives(&server.db, 3);
+    let unrelated = CollectiveId::new();
+
+    let response = pull_page(&server.server, 0, 500, Some(vec![unrelated]));
+    assert!(
+        response.changes.is_empty(),
+        "every event belongs to a collective the filter excludes"
+    );
+    assert!(
+        response.has_more,
+        "the page held events this batch did not emit"
+    );
+    assert_eq!(
+        response.new_cursor.sequence, 0,
+        "an empty batch does not advance the cursor"
+    );
+
+    let (db_client, _dir_client) = open_client();
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_client),
+        Box::new(HttpSyncTransport::new(&server.base_url)),
+        SyncConfig {
+            direction: SyncDirection::PullOnly,
+            collectives: Some(vec![unrelated]),
+            ..SyncConfig::default()
+        },
+    );
+
+    let error = manager
+        .initial_sync(None)
+        .await
+        .expect_err("a peer that promises more and will not advance has not caught us up");
+    assert!(
+        error.is_catch_up_incomplete(),
+        "the stall must surface as the typed catch-up error, got: {error}"
+    );
+    assert!(
+        error.to_string().contains("did not advance the cursor"),
+        "the error must name what stopped it, got: {error}"
+    );
 }

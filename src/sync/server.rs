@@ -54,6 +54,15 @@ use super::types::{
 };
 use super::{read_wire_preamble, write_wire_preamble, SYNC_PROTOCOL_VERSION};
 
+/// WAL events one pull reads from the store in a single page.
+///
+/// The server states the page size it wants instead of inheriting
+/// [`ChangePoller`]'s private default, because `handle_pull` has to tell a FULL
+/// page (the WAL may hold more) from a short one (the WAL is exhausted) and a
+/// limit it did not set is a limit it cannot see. The value is the poller's own
+/// default, so the page size is exactly what it has always been.
+const PULL_PAGE_EVENT_LIMIT: usize = 1000;
+
 /// Server-side sync handler.
 ///
 /// Processes incoming sync requests from remote peers. Framework-agnostic —
@@ -162,10 +171,16 @@ impl SyncServer {
     }
 
     /// Handles a pull request — serves local changes to the remote peer.
+    ///
+    /// `has_more` is a claim about the WAL, not about the batch: it is false
+    /// only when this pull proved the WAL exhausted, which one poll can only do
+    /// by coming back SHORT of [`PULL_PAGE_EVENT_LIMIT`]. See the comment at the
+    /// computation for why the two caps are not interchangeable.
     #[instrument(skip(self, request))]
     pub fn handle_pull(&self, request: PullRequest) -> Result<PullResponse, SyncError> {
         let storage = self.db.storage_for_test();
-        let mut poller = ChangePoller::from_sequence(request.cursor.sequence);
+        let mut poller = ChangePoller::from_sequence(request.cursor.sequence)
+            .with_batch_limit(PULL_PAGE_EVENT_LIMIT);
 
         let events = poller
             .poll_sync_events(storage)
@@ -190,7 +205,23 @@ impl SyncServer {
             }
         }
 
-        let has_more = events.len() > changes.len();
+        // Exhaustion is a property of the POLL, never of the emitted batch. The
+        // only evidence this pull has that the WAL holds nothing beyond the page
+        // is a poll that came back SHORT of its limit; a FULL page may be
+        // followed by more events whatever the change count says — which is why
+        // `request.batch_size` cannot stand in for the poll limit here. Emitting
+        // fewer changes than were polled (the `batch_size` cap, the
+        // `collectives` filter, or a record `build_change_from_record` no longer
+        // resolves to an entity) is a separate condition that also means more
+        // was available.
+        //
+        // Over-reporting is the safe direction: the follow-up pull comes back
+        // empty with `has_more: false`, the ordinary caught-up end that
+        // `initial_sync` already handles. Under-reporting is a catch-up that
+        // claims completion over a peer that still holds events, which is the
+        // lie `SyncError::CatchUpIncomplete` exists to prevent.
+        let poll_page_was_full = events.len() >= PULL_PAGE_EVENT_LIMIT;
+        let has_more = poll_page_was_full || changes.len() < events.len();
         let new_seq = changes
             .last()
             .map(|c| c.sequence)
