@@ -1704,3 +1704,374 @@ fn poison_change(sequence: u64, collective: CollectiveId) -> pulsedb::sync::type
         timestamp: pulsedb::Timestamp::now(),
     }
 }
+
+// ============================================================================
+// Peer identity: a remote remint invalidates the cached identity
+// ============================================================================
+
+/// A sync endpoint that can be **replaced mid-session by a restored copy of
+/// itself**: a fresh `InstanceId` and none of the changes it was previously
+/// sent. That is exactly what an operator produces by restoring a store from an
+/// older snapshot and calling `PulseDB::remint_instance_id` on it — a
+/// *different* peer holding *less* data behind the same address.
+///
+/// The push acknowledgement deliberately mirrors `SyncServer::handle_push`,
+/// which fills `new_cursor.instance_id` with the **sender's**
+/// `source_instance` (the acknowledged position is a position in the sender's
+/// WAL). A manager that tried to read the peer's identity off a push response
+/// would therefore see its own id here, which is why the pull response is the
+/// only usable detection point.
+struct RestorableEndpoint {
+    peer: std::sync::Mutex<pulsedb::sync::types::InstanceId>,
+    /// Experiences the endpoint currently holds — emptied by `restore()`.
+    held: std::sync::Mutex<std::collections::HashSet<ExperienceId>>,
+    /// The endpoint's own WAL, as offered on a pull. Replaced by `restore()`,
+    /// because a restored copy's WAL is a different WAL.
+    offers: std::sync::Mutex<Vec<pulsedb::sync::types::SyncChange>>,
+    handshakes: std::sync::atomic::AtomicUsize,
+    pulls: std::sync::atomic::AtomicUsize,
+}
+
+impl RestorableEndpoint {
+    fn new(offers: Vec<pulsedb::sync::types::SyncChange>) -> Arc<Self> {
+        Arc::new(Self {
+            peer: std::sync::Mutex::new(pulsedb::sync::types::InstanceId::new()),
+            held: std::sync::Mutex::new(std::collections::HashSet::new()),
+            offers: std::sync::Mutex::new(offers),
+            handshakes: std::sync::atomic::AtomicUsize::new(0),
+            pulls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn peer(&self) -> pulsedb::sync::types::InstanceId {
+        *self.peer.lock().unwrap()
+    }
+
+    /// Restore from an older snapshot and remint: a new identity, none of the
+    /// changes it was sent, and its own (different) WAL.
+    fn restore(
+        &self,
+        offers: Vec<pulsedb::sync::types::SyncChange>,
+    ) -> pulsedb::sync::types::InstanceId {
+        let fresh = pulsedb::sync::types::InstanceId::new();
+        *self.peer.lock().unwrap() = fresh;
+        self.held.lock().unwrap().clear();
+        *self.offers.lock().unwrap() = offers;
+        fresh
+    }
+
+    fn holds(&self, ids: &[ExperienceId]) -> bool {
+        let held = self.held.lock().unwrap();
+        ids.iter().all(|id| held.contains(id))
+    }
+
+    fn handshakes(&self) -> usize {
+        self.handshakes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn pulls(&self) -> usize {
+        self.pulls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+struct RestorableTransport(Arc<RestorableEndpoint>);
+
+#[async_trait::async_trait]
+impl pulsedb::sync::transport::SyncTransport for RestorableTransport {
+    async fn handshake(
+        &self,
+        _request: pulsedb::sync::types::HandshakeRequest,
+    ) -> Result<pulsedb::sync::types::HandshakeResponse, pulsedb::sync::SyncError> {
+        self.0
+            .handshakes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(pulsedb::sync::types::HandshakeResponse {
+            instance_id: self.0.peer(),
+            protocol_version: pulsedb::sync::SYNC_PROTOCOL_VERSION,
+            accepted: true,
+            reason: None,
+        })
+    }
+
+    async fn push_changes(
+        &self,
+        changes: Vec<pulsedb::sync::types::SyncChange>,
+    ) -> Result<pulsedb::sync::types::PushResponse, pulsedb::sync::SyncError> {
+        let source = changes
+            .first()
+            .map(|c| c.source_instance)
+            .unwrap_or_else(pulsedb::sync::types::InstanceId::nil);
+        let accepted = changes.len();
+        let max_seq = changes.iter().map(|c| c.sequence).max().unwrap_or(0);
+
+        let mut held = self.0.held.lock().unwrap();
+        for change in &changes {
+            if let pulsedb::sync::types::SyncPayload::ExperienceCreated(exp) = &change.payload {
+                held.insert(exp.id);
+            }
+        }
+
+        Ok(pulsedb::sync::types::PushResponse {
+            accepted,
+            rejected: 0,
+            // The SENDER's id, as `SyncServer::handle_push` does.
+            new_cursor: pulsedb::sync::types::SyncPosition::new(source, max_seq),
+        })
+    }
+
+    async fn pull_changes(
+        &self,
+        request: pulsedb::sync::types::PullRequest,
+    ) -> Result<pulsedb::sync::types::PullResponse, pulsedb::sync::SyncError> {
+        self.0
+            .pulls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let offers = self.0.offers.lock().unwrap();
+        let changes: Vec<pulsedb::sync::types::SyncChange> = offers
+            .iter()
+            .filter(|c| c.sequence > request.cursor.sequence)
+            .cloned()
+            .collect();
+        // An honest server echoes the requested position when it has nothing
+        // above it (`SyncServer::handle_pull`).
+        let new_seq = changes
+            .last()
+            .map_or(request.cursor.sequence, |c| c.sequence);
+
+        Ok(pulsedb::sync::types::PullResponse {
+            changes,
+            has_more: false,
+            // The PEER's id, as `SyncServer::handle_pull` does — a pull position
+            // is a position in the peer's WAL.
+            new_cursor: pulsedb::sync::types::SyncPosition::new(self.0.peer(), new_seq),
+        })
+    }
+
+    async fn health_check(&self) -> Result<(), pulsedb::sync::SyncError> {
+        Ok(())
+    }
+}
+
+fn cursor_row(
+    db: &Arc<PulseDB>,
+    peer: pulsedb::sync::types::InstanceId,
+) -> Option<pulsedb::sync::types::SyncCursor> {
+    db.storage_for_test().load_sync_cursor(&peer).unwrap()
+}
+
+/// Records a collective and three experiences, then syncs them to `endpoint`
+/// so the manager is a live session with an ADVANCED push cursor — the state
+/// the defect needs.
+fn established_session(
+    endpoint: &Arc<RestorableEndpoint>,
+    config: SyncConfig,
+) -> (
+    Arc<PulseDB>,
+    tempfile::TempDir,
+    Vec<ExperienceId>,
+    SyncManager,
+) {
+    let (db, dir) = open_db();
+    let cid = db.create_collective("remint-resync").unwrap();
+    let ids: Vec<ExperienceId> = (0..3)
+        .map(|_| db.record_experience(minimal_exp(cid)).unwrap())
+        .collect();
+
+    let manager = SyncManager::new(
+        Arc::clone(&db),
+        Box::new(RestorableTransport(Arc::clone(endpoint))),
+        config,
+    );
+
+    (db, dir, ids, manager)
+}
+
+/// The class: a peer that remints mid-session is a DIFFERENT peer holding LESS
+/// data, and both directions have to start from that peer's own cursor.
+///
+/// Before the fix the manager kept the identity the handshake returned. On the
+/// push side it loaded the old peer's cursor — already at the local WAL head —
+/// and sent nothing, so the restored endpoint never got back the changes it had
+/// lost. On the pull side it asked from the old peer's position, which sits
+/// ABOVE most of the restored peer's shorter WAL, so those changes were never
+/// fetched — and the position that came back, a position in the NEW peer's WAL,
+/// was written into the OLD peer's row.
+#[tokio::test]
+async fn a_reminted_peer_is_resynced_from_its_own_cursor() {
+    // The endpoint's own WAL before the restore: one change at sequence 5.
+    let before = CollectiveId::new();
+    let endpoint = RestorableEndpoint::new(vec![collective_change(5, before, "pre-restore")]);
+    let (db, _dir, ids, mut manager) = established_session(&endpoint, sync_config());
+    let original = endpoint.peer();
+
+    manager.sync_once().await.unwrap();
+    assert!(
+        endpoint.holds(&ids),
+        "the established session must have pushed everything once"
+    );
+    assert!(db.get_collective(before).unwrap().is_some());
+
+    let head = db.get_current_sequence().unwrap();
+    let old_row = cursor_row(&db, original).expect("the original peer is on record");
+    assert_eq!(
+        old_row.push_sequence, head,
+        "the session must start with an ADVANCED push cursor, or the defect cannot bite"
+    );
+    assert_eq!(
+        old_row.pull_sequence, 5,
+        "and with a non-zero pull position, which is what the restored peer's \
+         shorter WAL then sits below"
+    );
+
+    // The endpoint is restored from an older snapshot and reminted. Its WAL is a
+    // DIFFERENT WAL: two changes below where the old cursor points, and one
+    // above it from activity since the restore.
+    let low_a = CollectiveId::new();
+    let low_b = CollectiveId::new();
+    let high = CollectiveId::new();
+    let restored = endpoint.restore(vec![
+        collective_change(2, low_a, "restored-2"),
+        collective_change(3, low_b, "restored-3"),
+        collective_change(9, high, "restored-9"),
+    ]);
+    assert_ne!(restored, original);
+    assert!(!endpoint.holds(&ids), "the restored copy lost the changes");
+
+    manager.sync_once().await.unwrap();
+
+    // (a) The observable consequence, push side: the restored endpoint has the
+    // changes back.
+    assert!(
+        endpoint.holds(&ids),
+        "a restored peer must be re-sent the changes it is missing — a re-push of \
+         changes it already had is absorbed by the applier's idempotent skip path, \
+         while skipping ones it lacks is silent data loss"
+    );
+    // And pull side: the restored peer's whole WAL is read, not just the tail
+    // above a cursor that belongs to a different instance.
+    for (id, what) in [(low_a, "seq 2"), (low_b, "seq 3"), (high, "seq 9")] {
+        assert!(
+            db.get_collective(id).unwrap().is_some(),
+            "the restored peer's change at {what} must be pulled — its WAL is read \
+             from the new identity's own position, not from the old peer's"
+        );
+    }
+
+    // (b) Nothing was filed under the wrong identity, and the old row is retained.
+    let old_after = cursor_row(&db, original).expect("the old identity's row is retained");
+    assert_eq!(
+        old_after, old_row,
+        "no position for the new identity may be written into the old identity's row"
+    );
+    let new_row = cursor_row(&db, restored).expect("the restored identity gets its OWN row");
+    assert_eq!(new_row.instance_id, restored);
+    assert_eq!(
+        new_row.push_sequence, head,
+        "the retransmission is acknowledged under the new identity"
+    );
+    assert_eq!(
+        new_row.pull_sequence, 9,
+        "and the pull position for the new peer's WAL is stored under the new key"
+    );
+}
+
+/// The background task captures the peer identity when it starts, so it needs
+/// its own coverage: the same remint, detected and repaired by the loop.
+#[tokio::test]
+async fn the_background_loop_resyncs_a_reminted_peer() {
+    let before = CollectiveId::new();
+    let endpoint = RestorableEndpoint::new(vec![collective_change(5, before, "bg-pre-restore")]);
+    // Tight intervals so the loop turns several times inside the timeout.
+    let config = SyncConfig {
+        push_interval_ms: 20,
+        pull_interval_ms: 20,
+        ..sync_config()
+    };
+    config.validate().unwrap();
+    let (db, _dir, ids, mut manager) = established_session(&endpoint, config);
+    let original = endpoint.peer();
+
+    manager.start().await.unwrap();
+    await_until(
+        || endpoint.holds(&ids),
+        "the background loop pushes the backlog",
+    )
+    .await;
+
+    let head = db.get_current_sequence().unwrap();
+    let old_row = cursor_row(&db, original).expect("the original peer is on record");
+    assert_eq!(old_row.push_sequence, head);
+    assert_eq!(old_row.pull_sequence, 5);
+
+    let high = CollectiveId::new();
+    let restored = endpoint.restore(vec![collective_change(9, high, "bg-restored-9")]);
+    await_until(
+        || endpoint.holds(&ids),
+        "the background loop must detect the remint and resend, not keep using the \
+         identity it was spawned with",
+    )
+    .await;
+    await_until(
+        || db.get_collective(high).unwrap().is_some(),
+        "and must pull the restored peer's WAL from the new identity's own position",
+    )
+    .await;
+
+    manager.stop().await.unwrap();
+
+    let old_after = cursor_row(&db, original).expect("the old identity's row is retained");
+    assert_eq!(
+        old_after, old_row,
+        "the background path must not write the new identity's position into the old row"
+    );
+    let new_row = cursor_row(&db, restored).expect("the restored identity gets its OWN row");
+    assert_eq!(new_row.instance_id, restored);
+    assert_eq!(new_row.push_sequence, head);
+    assert_eq!(new_row.pull_sequence, 9);
+}
+
+/// A stable peer costs nothing extra: the binding is still cached, so the
+/// handshake happens once however many cycles run, and each cycle makes exactly
+/// one pull.
+#[tokio::test]
+async fn a_stable_peer_identity_is_never_re_handshaked() {
+    let endpoint = RestorableEndpoint::new(Vec::new());
+    let (db, _dir, ids, mut manager) = established_session(&endpoint, sync_config());
+    let peer = endpoint.peer();
+    let cid = db.create_collective("stable-identity").unwrap();
+
+    for _ in 0..3 {
+        db.record_experience(minimal_exp(cid)).unwrap();
+        manager.sync_once().await.unwrap();
+    }
+
+    assert!(endpoint.holds(&ids));
+    assert_eq!(
+        endpoint.handshakes(),
+        1,
+        "detection must not cost a handshake per cycle — only a detected mismatch \
+         re-establishes the identity"
+    );
+    assert_eq!(
+        endpoint.pulls(),
+        3,
+        "one pull per cycle: the identity check rides on the pull that was \
+         happening anyway, it does not add a request"
+    );
+
+    let row = cursor_row(&db, peer).expect("the peer is on record");
+    assert_eq!(row.push_sequence, db.get_current_sequence().unwrap());
+}
+
+/// Polls `condition` until it holds, or fails the test after 5 seconds.
+async fn await_until(condition: impl Fn() -> bool, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if condition() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting: {what}");
+}
