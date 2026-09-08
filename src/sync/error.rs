@@ -107,8 +107,11 @@ pub enum SyncError {
     ///   request would be byte-identical — but the changes beyond that page were
     ///   never reached. Repairing the server's pagination so the cursor advances
     ///   over a fully-filtered page is tracked in issue #90.
-    /// - **apply failure**: a change in the run did not apply, so the store is
-    ///   not caught up even if the last page was exhausted.
+    /// - **apply failure**: a change in the run was still unapplied when the
+    ///   loop stopped, so the store is not caught up even if the last page was
+    ///   exhausted. Only failures left OUTSTANDING count: the catch-up loop
+    ///   retries, so a change that errored on one page and applied on a later
+    ///   attempt in the same run is not one of these.
     ///
     /// `position` is the pull position the run stopped at — where the next
     /// attempt resumes. Retrying is reasonable for the second shape (the
@@ -194,8 +197,12 @@ impl SyncError {
         }
     }
 
-    /// Creates a [`SyncError::CatchUpIncomplete`] for a catch-up in which
-    /// `failed` changes did not apply, whatever the peer said about more pages.
+    /// Creates a [`SyncError::CatchUpIncomplete`] for a catch-up that left
+    /// `failed` changes unapplied, whatever the peer said about more pages.
+    ///
+    /// `failed` counts the changes STILL unapplied when the run stopped, not
+    /// the attempts it made: a change that errored once and applied on a later
+    /// retry within the same run is not counted.
     pub fn catch_up_apply_failed(peer: InstanceId, position: u64, failed: usize) -> Self {
         Self::CatchUpIncomplete {
             peer,

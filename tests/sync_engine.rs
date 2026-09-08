@@ -1325,6 +1325,314 @@ async fn initial_sync_refuses_completion_when_a_change_failed_to_apply() {
     );
 }
 
+// ============================================================================
+// initial_sync counts failures still OUTSTANDING, not attempts (PR #88, class R)
+// ============================================================================
+
+/// A pull transport that serves a SCRIPT of pages, front to back.
+///
+/// This is the lever for a change that FAILS on its first delivery and APPLIES
+/// on a retry: the same sequence appears on two pages, carried by a change the
+/// applier refuses the first time and one it accepts the second. The page queue
+/// is the only state — nothing here depends on timing, which matters because
+/// `initial_sync`'s awaits all resolve immediately and a timer on a
+/// current-thread runtime would never be polled.
+///
+/// Once the script is spent the peer answers empty and exhausted from whatever
+/// position it was asked, so a regression cannot spin; the tripwire below turns
+/// one into an assertion anyway.
+struct ScriptedPagesTransport {
+    peer: pulsedb::sync::types::InstanceId,
+    pages:
+        std::sync::Mutex<std::collections::VecDeque<(Vec<pulsedb::sync::types::SyncChange>, bool)>>,
+    requested: Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+impl ScriptedPagesTransport {
+    /// More pulls than a correct `initial_sync` can issue against any script
+    /// these tests write.
+    const SPIN_TRIPWIRE: usize = 8;
+
+    fn new(
+        peer: pulsedb::sync::types::InstanceId,
+        requested: &Arc<std::sync::Mutex<Vec<u64>>>,
+        pages: Vec<(Vec<pulsedb::sync::types::SyncChange>, bool)>,
+    ) -> Self {
+        Self {
+            peer,
+            pages: std::sync::Mutex::new(pages.into()),
+            requested: Arc::clone(requested),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl pulsedb::sync::transport::SyncTransport for ScriptedPagesTransport {
+    async fn handshake(
+        &self,
+        _request: pulsedb::sync::types::HandshakeRequest,
+    ) -> Result<pulsedb::sync::types::HandshakeResponse, pulsedb::sync::SyncError> {
+        Ok(pulsedb::sync::types::HandshakeResponse {
+            instance_id: self.peer,
+            protocol_version: pulsedb::sync::SYNC_PROTOCOL_VERSION,
+            accepted: true,
+            reason: None,
+        })
+    }
+
+    async fn push_changes(
+        &self,
+        _changes: Vec<pulsedb::sync::types::SyncChange>,
+    ) -> Result<pulsedb::sync::types::PushResponse, pulsedb::sync::SyncError> {
+        unreachable!("initial_sync never pushes");
+    }
+
+    async fn pull_changes(
+        &self,
+        request: pulsedb::sync::types::PullRequest,
+    ) -> Result<pulsedb::sync::types::PullResponse, pulsedb::sync::SyncError> {
+        let from = request.cursor.sequence;
+        {
+            let mut asked = self.requested.lock().unwrap();
+            asked.push(from);
+            if asked.len() > Self::SPIN_TRIPWIRE {
+                return Err(pulsedb::sync::SyncError::transport(
+                    "initial_sync is spinning",
+                ));
+            }
+        }
+
+        let (changes, has_more) = self
+            .pages
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| (Vec::new(), false));
+        // An honest server names the highest sequence it served, and echoes the
+        // requested position when it served nothing.
+        let new_seq = changes
+            .iter()
+            .map(|change| change.sequence)
+            .max()
+            .unwrap_or(from);
+        Ok(pulsedb::sync::types::PullResponse {
+            changes,
+            has_more,
+            new_cursor: pulsedb::sync::types::SyncPosition::new(self.peer, new_seq),
+        })
+    }
+
+    async fn health_check(&self) -> Result<(), pulsedb::sync::SyncError> {
+        Ok(())
+    }
+}
+
+/// Builds a manager pulling from a scripted multi-page peer.
+fn scripted_catchup_manager(
+    db: &Arc<PulseDB>,
+    peer: pulsedb::sync::types::InstanceId,
+    requested: &Arc<std::sync::Mutex<Vec<u64>>>,
+    pages: Vec<(Vec<pulsedb::sync::types::SyncChange>, bool)>,
+) -> SyncManager {
+    SyncManager::new(
+        Arc::clone(db),
+        Box::new(ScriptedPagesTransport::new(peer, requested, pages)),
+        SyncConfig {
+            direction: SyncDirection::PullOnly,
+            ..sync_config()
+        },
+    )
+}
+
+/// The persisted pull position for `peer`.
+fn pull_position(db: &Arc<PulseDB>, peer: pulsedb::sync::types::InstanceId) -> u64 {
+    db.storage_for_test()
+        .load_sync_cursor(&peer)
+        .unwrap()
+        .expect("the peer must be on record")
+        .pull_sequence
+}
+
+/// A change that fails on one page and APPLIES on a retry later in the SAME
+/// run has not left the catch-up incomplete.
+///
+/// `safe_through` stops the position strictly below a batch's lowest failure
+/// rather than stalling on it, so `[1 ok, 2 ok, 3 err, 4 ok]` advances to 2 and
+/// the next iteration re-requests 3. A transient failure applies on that
+/// retry — and counting ATTEMPTS made the run report `CatchUpIncomplete` on a
+/// catch-up that reached the peer's last page with everything applied. A false
+/// failure is worse than no contract: it teaches the operator to ignore the
+/// error that also fires for real reasons.
+#[tokio::test]
+async fn initial_sync_completes_when_a_later_retry_applies_the_failed_change() {
+    let (db, _dir) = open_db();
+    let peer = pulsedb::sync::types::InstanceId::new();
+    let requested = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let first = CollectiveId::new();
+    let second = CollectiveId::new();
+    let third = CollectiveId::new();
+    let fourth = CollectiveId::new();
+
+    let mut manager = scripted_catchup_manager(
+        &db,
+        peer,
+        &requested,
+        vec![
+            // Sequence 3 is refused here — the position stops at 2, below it.
+            (
+                vec![
+                    collective_change(1, first, "retry-1"),
+                    collective_change(2, second, "retry-2"),
+                    poison_change(3, second),
+                    collective_change(4, fourth, "retry-4"),
+                ],
+                true,
+            ),
+            // The re-request from 2 delivers 3 again, and this time it applies.
+            // 4 comes back too and is an idempotent skip.
+            (
+                vec![
+                    collective_change(3, third, "retry-3"),
+                    collective_change(4, fourth, "retry-4"),
+                ],
+                false,
+            ),
+        ],
+    );
+
+    manager
+        .initial_sync(None)
+        .await
+        .expect("a failure a later retry applied is not an incomplete catch-up");
+
+    assert_eq!(
+        *requested.lock().unwrap(),
+        vec![0, 2],
+        "the run must re-request from the position below the failure"
+    );
+    for (id, label) in [(first, "1"), (second, "2"), (third, "3"), (fourth, "4")] {
+        assert!(
+            db.get_collective(id).unwrap().is_some(),
+            "change {label} must be in the store"
+        );
+    }
+    assert_eq!(
+        pull_position(&db, peer),
+        4,
+        "the run reached the peer's last page with everything applied"
+    );
+}
+
+/// The boundary of the same rule: the failed change is the peer's LAST event,
+/// and its successful retry ends the run exactly AT that sequence.
+///
+/// The pull position is INCLUSIVE — it is a `safe_through`, the highest
+/// sequence at or below which everything was handled — so a final position of
+/// `s` means `s` itself applied. Resolving failures with `sequence >= position`
+/// instead of `sequence > position` would call this run incomplete and
+/// reintroduce the false failure one sequence to the left.
+#[tokio::test]
+async fn initial_sync_completes_when_the_retry_lands_on_the_final_sequence() {
+    let (db, _dir) = open_db();
+    let peer = pulsedb::sync::types::InstanceId::new();
+    let requested = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let first = CollectiveId::new();
+    let last = CollectiveId::new();
+
+    let mut manager = scripted_catchup_manager(
+        &db,
+        peer,
+        &requested,
+        vec![
+            (
+                vec![
+                    collective_change(1, first, "boundary-1"),
+                    poison_change(2, first),
+                ],
+                true,
+            ),
+            // Nothing follows 2, so the run ends with the position exactly on
+            // the sequence that had failed.
+            (vec![collective_change(2, last, "boundary-2")], false),
+        ],
+    );
+
+    manager
+        .initial_sync(None)
+        .await
+        .expect("a failure retried at the peer's last sequence completed the catch-up");
+
+    assert_eq!(*requested.lock().unwrap(), vec![0, 1]);
+    assert!(db.get_collective(last).unwrap().is_some());
+    assert_eq!(
+        pull_position(&db, peer),
+        2,
+        "the position ends ON the sequence that failed and then applied"
+    );
+}
+
+/// The other side of the boundary: a change that is STILL failing when the loop
+/// terminates leaves the catch-up incomplete, whatever it did on earlier pages.
+///
+/// It is also the de-duplication case — sequence 2 fails on both attempts, and
+/// the error must report ONE outstanding change rather than two, because it
+/// counts changes left unapplied, not attempts.
+#[tokio::test]
+async fn initial_sync_reports_incomplete_when_the_retry_fails_again() {
+    let (db, _dir) = open_db();
+    let peer = pulsedb::sync::types::InstanceId::new();
+    let requested = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let first = CollectiveId::new();
+    let beyond = CollectiveId::new();
+
+    let mut manager = scripted_catchup_manager(
+        &db,
+        peer,
+        &requested,
+        vec![
+            (
+                vec![
+                    collective_change(1, first, "stuck-1"),
+                    poison_change(2, first),
+                ],
+                true,
+            ),
+            // The retry of 2 fails again. 3 applies but sits above the failure,
+            // so the position cannot move and the loop stops here.
+            (
+                vec![
+                    poison_change(2, first),
+                    collective_change(3, beyond, "stuck-3"),
+                ],
+                true,
+            ),
+        ],
+    );
+
+    let error = manager
+        .initial_sync(None)
+        .await
+        .expect_err("a change still failing at the end is not a completed catch-up");
+
+    assert!(
+        error.is_catch_up_incomplete(),
+        "an unresolved apply failure must surface as the typed catch-up error, got: {error}"
+    );
+    assert!(
+        error.to_string().contains("1 change(s) failed to apply"),
+        "one change is outstanding across two failed attempts, not two, got: {error}"
+    );
+    assert_eq!(*requested.lock().unwrap(), vec![0, 1]);
+    assert_eq!(
+        pull_position(&db, peer),
+        1,
+        "the position stays below the change that never applied"
+    );
+}
+
 /// A `CollectiveCreated` change at `sequence`.
 fn collective_change(
     sequence: u64,

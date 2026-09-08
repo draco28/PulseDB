@@ -45,11 +45,35 @@ pub struct ApplyResult {
     /// `skipped - failed` is the idempotent part.
     ///
     /// An idempotent skip is a successful outcome: it is the ordinary shape of
-    /// a re-sync. A one-shot catch-up ([`SyncManager::initial_sync`]) uses this
-    /// field, not `skipped`, to decide whether it may report completion.
+    /// a re-sync — which is why a one-shot catch-up
+    /// ([`SyncManager::initial_sync`]) reads the failures, not `skipped`, to
+    /// decide whether it may report completion. It reads
+    /// [`failed_sequences`](Self::failed_sequences) rather than this count,
+    /// because a count cannot say whether a later retry fixed anything.
     ///
     /// [`SyncManager::initial_sync`]: super::manager::SyncManager::initial_sync
     pub failed: usize,
+    /// The sequence of every change this batch FAILED to apply — the same
+    /// changes [`failed`](Self::failed) counts, named rather than tallied.
+    ///
+    /// Arrival order, not sorted: a remote peer chooses the batch's order and
+    /// this field does not reorder it.
+    ///
+    /// A caller that retries a batch needs the identities, not the count. A
+    /// count only ever accumulates, so across several attempts it cannot
+    /// distinguish "three changes are broken" from "one change failed three
+    /// times" from "one change failed, then applied" — which is how
+    /// [`SyncManager::initial_sync`] came to report a failure on a catch-up
+    /// whose retry had succeeded. With the sequences named, a failure is
+    /// resolved once the pull position has moved to or past it, since
+    /// [`safe_through`](Self::safe_through) only names a sequence at or below
+    /// which everything was handled.
+    ///
+    /// The lowest of these is also the batch's failure floor, the bound
+    /// `safe_through` is computed against.
+    ///
+    /// [`SyncManager::initial_sync`]: super::manager::SyncManager::initial_sync
+    pub failed_sequences: Vec<u64>,
     /// Number of changes where conflict resolution was used.
     pub conflicts: usize,
     /// Highest sequence at or below which EVERY change in this batch was
@@ -130,9 +154,14 @@ impl RemoteChangeApplier {
         // arrive after a failure would report `None` for `[5 err, 1 ok]`, even
         // though 1 applied and lies below the floor — and a peer that always
         // sends that order could then never persist any progress at all.
-        let mut failure_floor: Option<u64> = None;
-        // Bounded by the poller's batch limit (`SyncConfig::batch_size` on the
-        // push path, `PullRequest::batch_size` on the pull path).
+        //
+        // The floor is derived after the loop, as the minimum of the failed
+        // sequences the batch collected — the same value a running fold would
+        // reach, read off the field callers get to keep.
+        //
+        // Both vectors are bounded by the poller's batch limit
+        // (`SyncConfig::batch_size` on the push path, `PullRequest::batch_size`
+        // on the pull path).
         let mut succeeded: Vec<u64> = Vec::new();
 
         // #13 skew is reported ONCE per batch, not once per change: the peer's
@@ -171,15 +200,20 @@ impl RemoteChangeApplier {
                     warn!(sequence, "Failed to apply sync change: {}", e);
                     // Continue applying the rest — a later change may be
                     // independent — but never acknowledge at or past this one.
-                    // The floor keeps sinking as the batch runs: a lower
-                    // failing sequence arriving later must still pull the
-                    // acknowledgement down.
-                    failure_floor = Some(failure_floor.map_or(sequence, |f| f.min(sequence)));
+                    // Recording the sequence is what lets the floor sink: a
+                    // lower failing sequence arriving later must still pull the
+                    // acknowledgement down, and a caller retrying the batch
+                    // needs to know WHICH change to look for.
+                    result.failed_sequences.push(sequence);
                     result.failed += 1;
                     result.skipped += 1;
                 }
             }
         }
+
+        // The LOWEST sequence that failed anywhere in the batch — a minimum
+        // over the whole set, because arrival order decides nothing.
+        let failure_floor = result.failed_sequences.iter().copied().min();
 
         // The highest success strictly below the failure floor (every success,
         // when nothing failed). `None` when no success qualifies — which is the
@@ -726,6 +760,61 @@ mod tests {
             Some(1),
             "1 applied and is strictly below the failing 5, so it is safe — \
              the batch's order must not decide what is recorded"
+        );
+    }
+
+    /// `failed_sequences` NAMES the changes that errored, and the floor
+    /// `safe_through` is bound by is the LOWEST of them wherever it arrived.
+    ///
+    /// The names are what a retrying caller needs: a count only accumulates, so
+    /// across attempts it cannot tell "two changes are broken" from "one change
+    /// failed twice" from "one change failed, then applied". `initial_sync`
+    /// resolves each named sequence against the position it finally reached.
+    #[test]
+    fn failed_sequences_name_the_failures_and_the_lowest_sets_the_floor() {
+        let (db, _dir) = open_db();
+        let cid = db.create_collective("applier-failed-sequences").unwrap();
+        let good = db.record_experience(minimal_exp(cid)).unwrap();
+        let benign = SerializableExperienceUpdate {
+            importance: Some(0.5),
+            ..Default::default()
+        };
+
+        let at = |seq: u64, update| {
+            let mut c = change(
+                SyncPayload::ExperienceUpdated {
+                    id: good,
+                    update,
+                    timestamp: Timestamp::from_millis(0),
+                },
+                cid,
+            );
+            c.sequence = seq;
+            c
+        };
+
+        let applier = RemoteChangeApplier::new(Arc::clone(&db), SyncConfig::default());
+        // The lower failure (4) arrives LAST, so a floor read off the first
+        // failure alone would acknowledge 5 — a change that never applied.
+        let result = applier
+            .apply_batch(vec![
+                at(2, benign.clone()),
+                at(7, poison_update()),
+                at(5, benign),
+                at(4, poison_update()),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            result.failed_sequences,
+            vec![7, 4],
+            "the failures are named in arrival order, not sorted or tallied"
+        );
+        assert_eq!(result.failed, 2, "the count still agrees with the names");
+        assert_eq!(
+            result.safe_through,
+            Some(2),
+            "the floor is the lowest failure (4), so only 2 is safe — 5 is not"
         );
     }
 

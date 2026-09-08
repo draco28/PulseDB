@@ -8,6 +8,7 @@
 //! - Error recovery with exponential backoff
 //! - Graceful shutdown
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::Notify;
@@ -198,11 +199,21 @@ impl SyncManager {
     /// skipped. Anything short of that is
     /// [`SyncError::CatchUpIncomplete`] — the peer stalled (it reported more
     /// changes while handing back an unadvanced cursor, the shape a
-    /// fully-filtered server page produces), or a change failed to apply. Both
-    /// leave the pull position persisted where the run stopped, so a later
+    /// fully-filtered server page produces), or a change was left unapplied.
+    /// Both leave the pull position persisted where the run stopped, so a later
     /// `initial_sync` or a background cycle resumes from there; neither is a
     /// reason to discard local state. Transport and handshake failures surface
     /// as their own variants, as before.
+    ///
+    /// "Left unapplied" is about the END of the run, not about attempts made
+    /// along the way. This loop retries: an apply failure holds the position
+    /// strictly below the failing sequence, so the next iteration re-requests
+    /// that change, and a transient failure — a storage error, a contended lock
+    /// — applies on the retry. Only a sequence still ABOVE the final pull
+    /// position was never applied; the position is inclusive, so one at or
+    /// below it was handled (and is a sequence this cursor would never fetch
+    /// again in any case). A catch-up that stumbled and recovered reports
+    /// `Ok(())`.
     ///
     /// This strictness is specific to `initial_sync`, a one-shot "catch me up"
     /// call whose `Ok` a caller is entitled to trust. A single background cycle
@@ -226,11 +237,20 @@ impl SyncManager {
 
         let mut total_pulled = 0usize;
         let mut position = SyncPosition::new(peer_id, self.load_pull_sequence(peer_id)?);
-        // Changes that ERRORED (never the idempotent skips, which are ordinary
-        // successful re-sync outcomes — see `ApplyResult::failed`). A catch-up
-        // that left one of these behind did not catch up, whatever the peer said
-        // about further pages.
-        let mut failed_changes = 0usize;
+        // The SEQUENCES of the changes that ERRORED (never the idempotent
+        // skips, which are ordinary successful re-sync outcomes — see
+        // `ApplyResult::failed`). A catch-up that left one of these behind did
+        // not catch up, whatever the peer said about further pages.
+        //
+        // Sequences, not a count, because a failure here is an ATTEMPT and this
+        // loop retries: `safe_through` stops the position strictly below the
+        // batch's lowest failure, so the next iteration re-requests from there
+        // and receives the failed change again. A transient failure — a storage
+        // error, a contended lock — then applies, and a count carried from the
+        // first attempt would report a catch-up that in fact completed as
+        // incomplete. Which sequences failed is resolved at termination against
+        // the final position (below).
+        let mut failed_sequences: BTreeSet<u64> = BTreeSet::new();
         // Set when the loop stops on an unadvanced position that the peer
         // claimed to have more changes beyond.
         let mut stalled_with_more = false;
@@ -253,7 +273,7 @@ impl SyncManager {
             let next = if batch_size > 0 {
                 let result = applier.apply_batch(response.changes)?;
                 result.record_into(&self.stats);
-                failed_changes += result.failed;
+                failed_sequences.extend(result.failed_sequences.iter().copied());
                 result.safe_through.unwrap_or(requested)
             } else {
                 response.new_cursor.sequence
@@ -318,11 +338,23 @@ impl SyncManager {
 
         // Stopping short is not completion. Both shapes leave the pull position
         // persisted where the run stopped, so a retry resumes from there.
-        if failed_changes > 0 {
+        //
+        // A failure only counts if it is STILL UNRESOLVED here. The pull
+        // position is INCLUSIVE — it is a `safe_through`, the highest sequence
+        // at or below which every change was applied, resolved or idempotently
+        // skipped — so a failed sequence at or below where the run ended was
+        // handled by a later attempt in this same run, and is also a sequence
+        // this cursor will never fetch again. Only `sequence > position` is
+        // outstanding.
+        let unresolved = failed_sequences
+            .iter()
+            .filter(|sequence| **sequence > position.sequence)
+            .count();
+        if unresolved > 0 {
             return Err(SyncError::catch_up_apply_failed(
                 peer_id,
                 position.sequence,
-                failed_changes,
+                unresolved,
             ));
         }
         if stalled_with_more {
