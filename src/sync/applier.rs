@@ -35,6 +35,21 @@ pub struct ApplyResult {
     pub applied: usize,
     /// Number of changes skipped (idempotent / filtered).
     pub skipped: usize,
+    /// Number of changes that FAILED to apply — the applier's error arm alone.
+    ///
+    /// Distinct from [`skipped`](Self::skipped), which counts every change that
+    /// left the store unchanged: the idempotent no-ops (a create whose entity
+    /// already exists, a delete whose entity is already gone) **and** these
+    /// failures, which it has always counted too. So `skipped > 0` says nothing
+    /// about whether anything went wrong — `failed > 0` does, and
+    /// `skipped - failed` is the idempotent part.
+    ///
+    /// An idempotent skip is a successful outcome: it is the ordinary shape of
+    /// a re-sync. A one-shot catch-up ([`SyncManager::initial_sync`]) uses this
+    /// field, not `skipped`, to decide whether it may report completion.
+    ///
+    /// [`SyncManager::initial_sync`]: super::manager::SyncManager::initial_sync
+    pub failed: usize,
     /// Number of changes where conflict resolution was used.
     pub conflicts: usize,
     /// Highest sequence at or below which EVERY change in this batch was
@@ -160,6 +175,7 @@ impl RemoteChangeApplier {
                     // acknowledgement down.
                     halted = true;
                     failure_floor = Some(failure_floor.map_or(sequence, |f| f.min(sequence)));
+                    result.failed += 1;
                     result.skipped += 1;
                 }
             }
@@ -186,6 +202,7 @@ impl RemoteChangeApplier {
         debug!(
             applied = result.applied,
             skipped = result.skipped,
+            failed = result.failed,
             conflicts = result.conflicts,
             skewed_timestamps = result.skewed_timestamps,
             safe_through = result.safe_through,

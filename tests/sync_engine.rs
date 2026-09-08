@@ -1023,12 +1023,14 @@ async fn pull_position_does_not_advance_past_a_change_that_failed_to_apply() {
 
 // ============================================================================
 // initial_sync terminates on a stalled position (PR #88 review, class B)
+// and reports completion only when it achieved it (class L)
 // ============================================================================
 
 /// A server that filtered every event it polled returns `changes: []`,
 /// `has_more: true` and an UNADVANCED cursor. `initial_sync` must read the
 /// stalled position as "no progress" and stop, not re-issue the identical
-/// request forever.
+/// request forever — and must report the stop as an error, because the changes
+/// beyond that page were never reached.
 ///
 /// The transport fails the request once it has been asked more times than the
 /// guard should ever allow, so a regression surfaces as a failed assertion
@@ -1107,14 +1109,286 @@ async fn initial_sync_terminates_on_an_empty_batch_that_claims_more() {
         },
     );
 
-    manager
+    let error = manager
         .initial_sync(None)
         .await
-        .expect("initial_sync must stop at the unadvanced cursor, not spin");
+        .expect_err("a peer that promises more and will not advance has not caught us up");
 
+    assert!(
+        error.is_catch_up_incomplete(),
+        "the stall must surface as the typed catch-up error, got: {error}"
+    );
+    assert!(
+        error.to_string().contains("did not advance the cursor"),
+        "the error must name what stopped it, got: {error}"
+    );
     assert_eq!(
         pulls.load(Ordering::SeqCst),
         1,
         "one request is enough to learn the position will not move"
     );
+}
+
+/// A pull transport that serves ONE scripted page and then reports itself
+/// exhausted, with the same bounded tripwire as the stall test above: it fails
+/// the request once it has been asked more times than a correct `initial_sync`
+/// can ask, so a regression surfaces as an assertion rather than a hang.
+struct ScriptedPullTransport {
+    peer: pulsedb::sync::types::InstanceId,
+    pulls: Arc<std::sync::atomic::AtomicUsize>,
+    page: std::sync::Mutex<Vec<pulsedb::sync::types::SyncChange>>,
+    has_more: bool,
+}
+
+impl ScriptedPullTransport {
+    /// More pulls than a correct `initial_sync` can issue against one page.
+    const SPIN_TRIPWIRE: usize = 8;
+
+    fn new(
+        peer: pulsedb::sync::types::InstanceId,
+        pulls: &Arc<std::sync::atomic::AtomicUsize>,
+        page: Vec<pulsedb::sync::types::SyncChange>,
+        has_more: bool,
+    ) -> Self {
+        Self {
+            peer,
+            pulls: Arc::clone(pulls),
+            page: std::sync::Mutex::new(page),
+            has_more,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl pulsedb::sync::transport::SyncTransport for ScriptedPullTransport {
+    async fn handshake(
+        &self,
+        _request: pulsedb::sync::types::HandshakeRequest,
+    ) -> Result<pulsedb::sync::types::HandshakeResponse, pulsedb::sync::SyncError> {
+        Ok(pulsedb::sync::types::HandshakeResponse {
+            instance_id: self.peer,
+            protocol_version: pulsedb::sync::SYNC_PROTOCOL_VERSION,
+            accepted: true,
+            reason: None,
+        })
+    }
+
+    async fn push_changes(
+        &self,
+        _changes: Vec<pulsedb::sync::types::SyncChange>,
+    ) -> Result<pulsedb::sync::types::PushResponse, pulsedb::sync::SyncError> {
+        unreachable!("initial_sync never pushes");
+    }
+
+    async fn pull_changes(
+        &self,
+        request: pulsedb::sync::types::PullRequest,
+    ) -> Result<pulsedb::sync::types::PullResponse, pulsedb::sync::SyncError> {
+        use std::sync::atomic::Ordering;
+
+        if self.pulls.fetch_add(1, Ordering::SeqCst) >= Self::SPIN_TRIPWIRE {
+            return Err(pulsedb::sync::SyncError::transport(
+                "initial_sync is spinning",
+            ));
+        }
+        let page = std::mem::take(&mut *self.page.lock().unwrap());
+        // Once the page is served the peer is exhausted, whatever it said the
+        // first time.
+        let has_more = !page.is_empty() && self.has_more;
+        let new_seq = page
+            .last()
+            .map_or(request.cursor.sequence, |change| change.sequence);
+        Ok(pulsedb::sync::types::PullResponse {
+            changes: page,
+            has_more,
+            new_cursor: pulsedb::sync::types::SyncPosition::new(self.peer, new_seq),
+        })
+    }
+
+    async fn health_check(&self) -> Result<(), pulsedb::sync::SyncError> {
+        Ok(())
+    }
+}
+
+/// Builds a manager pulling from a one-page scripted peer.
+fn catchup_manager(
+    db: &Arc<PulseDB>,
+    peer: pulsedb::sync::types::InstanceId,
+    pulls: &Arc<std::sync::atomic::AtomicUsize>,
+    page: Vec<pulsedb::sync::types::SyncChange>,
+    has_more: bool,
+) -> SyncManager {
+    SyncManager::new(
+        Arc::clone(db),
+        Box::new(ScriptedPullTransport::new(peer, pulls, page, has_more)),
+        SyncConfig {
+            direction: SyncDirection::PullOnly,
+            ..sync_config()
+        },
+    )
+}
+
+/// A page the peer reports as its last, with every change applying, IS a
+/// completed catch-up.
+#[tokio::test]
+async fn initial_sync_completes_on_an_exhausted_page() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (db, _dir) = open_db();
+    let pulls = Arc::new(AtomicUsize::new(0));
+    let collective = CollectiveId::new();
+    let mut manager = catchup_manager(
+        &db,
+        pulsedb::sync::types::InstanceId::new(),
+        &pulls,
+        vec![collective_change(1, collective, "catchup-complete")],
+        false,
+    );
+
+    manager
+        .initial_sync(None)
+        .await
+        .expect("an exhausted page with everything applied is a completed catch-up");
+
+    assert!(db.get_collective(collective).unwrap().is_some());
+    assert_eq!(pulls.load(Ordering::SeqCst), 1);
+}
+
+/// An idempotent SKIP is a successful outcome — it is the ordinary shape of a
+/// re-sync — so a page of nothing but skips still completes. This is the
+/// distinction `ApplyResult::failed` exists to draw: `skipped` counts these too.
+#[tokio::test]
+async fn initial_sync_completes_on_a_page_of_idempotent_skips() {
+    use std::sync::atomic::AtomicUsize;
+
+    let (db, _dir) = open_db();
+    let pulls = Arc::new(AtomicUsize::new(0));
+    // Deleting an experience this store never had is the idempotent skip.
+    let absent = ExperienceId::new();
+    let peer = pulsedb::sync::types::InstanceId::new();
+    let mut manager = catchup_manager(&db, peer, &pulls, vec![delete_change(1, absent)], false);
+
+    manager
+        .initial_sync(None)
+        .await
+        .expect("a page of idempotent skips is a completed catch-up, not a failure");
+
+    let cursor = db
+        .storage_for_test()
+        .load_sync_cursor(&peer)
+        .unwrap()
+        .expect("the peer must be on record");
+    assert_eq!(
+        cursor.pull_sequence, 1,
+        "the skipped change was handled, so the position moves past it"
+    );
+}
+
+/// An exhausted page is not enough: a change that FAILED to apply means the
+/// store is not caught up, so `initial_sync` must not report success.
+#[tokio::test]
+async fn initial_sync_refuses_completion_when_a_change_failed_to_apply() {
+    use std::sync::atomic::AtomicUsize;
+
+    let (db, _dir) = open_db();
+    let pulls = Arc::new(AtomicUsize::new(0));
+    let collective = CollectiveId::new();
+    let page = vec![
+        collective_change(1, collective, "catchup-partial"),
+        poison_change(2, collective),
+    ];
+    let peer = pulsedb::sync::types::InstanceId::new();
+    let mut manager = catchup_manager(&db, peer, &pulls, page, false);
+
+    let error = manager
+        .initial_sync(None)
+        .await
+        .expect_err("a change that never applied is not a completed catch-up");
+
+    assert!(
+        error.is_catch_up_incomplete(),
+        "an apply failure must surface as the typed catch-up error, got: {error}"
+    );
+    assert!(
+        error.to_string().contains("failed to apply"),
+        "the error must name what stopped it, got: {error}"
+    );
+    let cursor = db
+        .storage_for_test()
+        .load_sync_cursor(&peer)
+        .unwrap()
+        .expect("the peer must be on record");
+    assert_eq!(
+        cursor.pull_sequence, 1,
+        "the position stops at the last change that applied, so the failed one \
+         is fetched again"
+    );
+}
+
+/// A `CollectiveCreated` change at `sequence`.
+fn collective_change(
+    sequence: u64,
+    id: CollectiveId,
+    name: &str,
+) -> pulsedb::sync::types::SyncChange {
+    pulsedb::sync::types::SyncChange {
+        sequence,
+        source_instance: pulsedb::sync::types::InstanceId::new(),
+        collective_id: id,
+        entity_type: pulsedb::sync::types::SyncEntityType::Collective,
+        payload: pulsedb::sync::types::SyncPayload::CollectiveCreated(pulsedb::Collective {
+            id,
+            name: name.to_string(),
+            owner_id: None,
+            embedding_dimension: 384,
+            created_at: pulsedb::Timestamp::now(),
+            updated_at: pulsedb::Timestamp::now(),
+        }),
+        timestamp: pulsedb::Timestamp::now(),
+    }
+}
+
+/// An `ExperienceDeleted` change at `sequence` — an idempotent skip when the
+/// experience is absent locally.
+fn delete_change(sequence: u64, id: ExperienceId) -> pulsedb::sync::types::SyncChange {
+    pulsedb::sync::types::SyncChange {
+        sequence,
+        source_instance: pulsedb::sync::types::InstanceId::new(),
+        collective_id: CollectiveId::new(),
+        entity_type: pulsedb::sync::types::SyncEntityType::Experience,
+        payload: pulsedb::sync::types::SyncPayload::ExperienceDeleted {
+            id,
+            timestamp: pulsedb::Timestamp::from_millis(0),
+        },
+        timestamp: pulsedb::Timestamp::now(),
+    }
+}
+
+/// A change the applier REFUSES: more `applications` G-counter buckets than it
+/// accepts from a peer.
+fn poison_change(sequence: u64, collective: CollectiveId) -> pulsedb::sync::types::SyncChange {
+    use std::collections::BTreeMap;
+
+    let mut buckets = BTreeMap::new();
+    for i in 0..=65_536u128 {
+        buckets.insert(
+            pulsedb::sync::types::InstanceId::from_bytes(i.to_le_bytes()),
+            1u32,
+        );
+    }
+    pulsedb::sync::types::SyncChange {
+        sequence,
+        source_instance: pulsedb::sync::types::InstanceId::new(),
+        collective_id: collective,
+        entity_type: pulsedb::sync::types::SyncEntityType::Experience,
+        payload: pulsedb::sync::types::SyncPayload::ExperienceUpdated {
+            id: ExperienceId::new(),
+            update: pulsedb::sync::types::SerializableExperienceUpdate {
+                applications: Some(buckets),
+                ..Default::default()
+            },
+            timestamp: pulsedb::Timestamp::from_millis(0),
+        },
+        timestamp: pulsedb::Timestamp::now(),
+    }
 }

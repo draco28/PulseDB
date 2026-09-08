@@ -190,6 +190,24 @@ impl SyncManager {
     /// Performs initial sync — pulls all remote changes in batches.
     ///
     /// Call this before `start()` to catch up from a cold start.
+    ///
+    /// # Errors
+    ///
+    /// `Ok(())` means the catch-up COMPLETED: a page the peer reported as its
+    /// last was pulled, and every change in the run applied or was idempotently
+    /// skipped. Anything short of that is
+    /// [`SyncError::CatchUpIncomplete`] — the peer stalled (it reported more
+    /// changes while handing back an unadvanced cursor, the shape a
+    /// fully-filtered server page produces), or a change failed to apply. Both
+    /// leave the pull position persisted where the run stopped, so a later
+    /// `initial_sync` or a background cycle resumes from there; neither is a
+    /// reason to discard local state. Transport and handshake failures surface
+    /// as their own variants, as before.
+    ///
+    /// This strictness is specific to `initial_sync`, a one-shot "catch me up"
+    /// call whose `Ok` a caller is entitled to trust. A single background cycle
+    /// ([`sync_once`](Self::sync_once)) still returns `Ok` with a change left
+    /// unapplied — there the next cycle retries it, which is the design.
     #[instrument(skip(self, progress))]
     pub async fn initial_sync(
         &mut self,
@@ -208,6 +226,14 @@ impl SyncManager {
 
         let mut total_pulled = 0usize;
         let mut position = SyncPosition::new(peer_id, self.load_pull_sequence(peer_id)?);
+        // Changes that ERRORED (never the idempotent skips, which are ordinary
+        // successful re-sync outcomes — see `ApplyResult::failed`). A catch-up
+        // that left one of these behind did not catch up, whatever the peer said
+        // about further pages.
+        let mut failed_changes = 0usize;
+        // Set when the loop stops on an unadvanced position that the peer
+        // claimed to have more changes beyond.
+        let mut stalled_with_more = false;
 
         loop {
             let pull_request = PullRequest {
@@ -227,6 +253,7 @@ impl SyncManager {
             let next = if batch_size > 0 {
                 let result = applier.apply_batch(response.changes)?;
                 result.record_into(&self.stats);
+                failed_changes += result.failed;
                 result.safe_through.unwrap_or(requested)
             } else {
                 response.new_cursor.sequence
@@ -273,6 +300,7 @@ impl SyncManager {
                          the server returned no changes at this position)"
                     );
                 }
+                stalled_with_more = response.has_more;
                 break;
             }
 
@@ -281,7 +309,26 @@ impl SyncManager {
             }
         }
 
+        // The status transition is the same one the success path makes: the
+        // manager is no longer syncing either way, and a stopped catch-up must
+        // not leave it wedged in `Syncing`. The error is what tells the caller
+        // what happened. (Transport failures above still return through `?`
+        // without a transition — pre-existing, untouched here.)
         self.set_status(SyncStatus::Idle);
+
+        // Stopping short is not completion. Both shapes leave the pull position
+        // persisted where the run stopped, so a retry resumes from there.
+        if failed_changes > 0 {
+            return Err(SyncError::catch_up_apply_failed(
+                peer_id,
+                position.sequence,
+                failed_changes,
+            ));
+        }
+        if stalled_with_more {
+            return Err(SyncError::catch_up_stalled(peer_id, position.sequence));
+        }
+
         info!(total_pulled, "Initial sync complete");
         Ok(())
     }

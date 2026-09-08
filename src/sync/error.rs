@@ -91,6 +91,42 @@ pub enum SyncError {
     #[error("Invalid sync payload: {0}")]
     InvalidPayload(String),
 
+    /// A one-shot catch-up ([`SyncManager::initial_sync`]) stopped before it had
+    /// pulled everything the peer holds, so its completion cannot be claimed.
+    ///
+    /// Raised **only** by `initial_sync`, which is a "catch me up" call: a
+    /// caller that gets `Ok(())` from it is entitled to believe the catch-up
+    /// finished. The background loop and `sync_once` are unaffected — a failed
+    /// change there is correctly left for the next cycle to retry, with the
+    /// pull position deliberately not advanced past it. Two shapes reach this:
+    ///
+    /// - **stalled**: the peer answered `has_more: true` while handing back a
+    ///   cursor that did not advance, which is what `SyncServer::handle_pull`
+    ///   returns when a `collectives` filter (or an entity deleted since its WAL
+    ///   event) emptied the whole page it polled. The loop must stop — the next
+    ///   request would be byte-identical — but the changes beyond that page were
+    ///   never reached. Repairing the server's pagination so the cursor advances
+    ///   over a fully-filtered page is tracked in issue #90.
+    /// - **apply failure**: a change in the run did not apply, so the store is
+    ///   not caught up even if the last page was exhausted.
+    ///
+    /// `position` is the pull position the run stopped at — where the next
+    /// attempt resumes. Retrying is reasonable for the second shape (the
+    /// failure may be transient); the first repeats until the peer changes.
+    ///
+    /// [`SyncManager::initial_sync`]: super::manager::SyncManager::initial_sync
+    #[error(
+        "Initial sync with peer {peer} stopped at position {position} without completing: {reason}"
+    )]
+    CatchUpIncomplete {
+        /// The peer being caught up with.
+        peer: InstanceId,
+        /// The pull position the catch-up stopped at (and resumes from).
+        position: u64,
+        /// What stopped it — see the variant docs for the two shapes.
+        reason: String,
+    },
+
     /// No cursor found for the specified peer instance.
     #[error("No sync cursor found for instance {instance}")]
     CursorNotFound {
@@ -146,6 +182,28 @@ impl SyncError {
         }
     }
 
+    /// Creates a [`SyncError::CatchUpIncomplete`] for a **stalled** peer: it
+    /// reported more changes while handing back a cursor that did not advance.
+    pub fn catch_up_stalled(peer: InstanceId, position: u64) -> Self {
+        Self::CatchUpIncomplete {
+            peer,
+            position,
+            reason: "the peer reported more changes but did not advance the cursor \
+                     (a fully-filtered page; see issue #90)"
+                .to_string(),
+        }
+    }
+
+    /// Creates a [`SyncError::CatchUpIncomplete`] for a catch-up in which
+    /// `failed` changes did not apply, whatever the peer said about more pages.
+    pub fn catch_up_apply_failed(peer: InstanceId, position: u64, failed: usize) -> Self {
+        Self::CatchUpIncomplete {
+            peer,
+            position,
+            reason: format!("{failed} change(s) failed to apply"),
+        }
+    }
+
     /// Returns true if this is a transport error.
     pub fn is_transport(&self) -> bool {
         matches!(self, Self::Transport(_))
@@ -177,6 +235,14 @@ impl SyncError {
     /// decode — the signal a consumer maps to `413 Payload Too Large`.
     pub fn is_payload_too_large(&self) -> bool {
         matches!(self, Self::PayloadTooLarge { .. })
+    }
+
+    /// Returns true if a one-shot catch-up stopped short (stalled peer OR a
+    /// change that failed to apply) — the typed signal that
+    /// [`SyncManager::initial_sync`](super::manager::SyncManager::initial_sync)
+    /// did not finish, as distinct from a transport failure.
+    pub fn is_catch_up_incomplete(&self) -> bool {
+        matches!(self, Self::CatchUpIncomplete { .. })
     }
 }
 
@@ -214,6 +280,28 @@ mod tests {
         assert!(SyncError::Timeout.is_timeout());
         assert!(SyncError::ConnectionLost.is_connection_lost());
         assert!(SyncError::Shutdown.is_shutdown());
+    }
+
+    #[test]
+    fn test_catch_up_incomplete_typed_and_distinct() {
+        let peer = InstanceId::new();
+        let stalled = SyncError::catch_up_stalled(peer, 42);
+        let failed = SyncError::catch_up_apply_failed(peer, 42, 3);
+
+        // Both shapes are the typed catch-up signal, not a transport failure.
+        assert!(stalled.is_catch_up_incomplete());
+        assert!(failed.is_catch_up_incomplete());
+        assert!(!stalled.is_transport());
+        assert!(!SyncError::transport("x").is_catch_up_incomplete());
+
+        // Each names the peer, where it stopped, and what stopped it.
+        for error in [&stalled, &failed] {
+            let text = error.to_string();
+            assert!(text.contains(&peer.to_string()), "{text}");
+            assert!(text.contains("42"), "{text}");
+        }
+        assert!(stalled.to_string().contains("did not advance the cursor"));
+        assert!(failed.to_string().contains("3 change(s) failed to apply"));
     }
 
     #[test]

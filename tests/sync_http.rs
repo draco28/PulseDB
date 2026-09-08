@@ -200,8 +200,28 @@ async fn test_http_push_and_pull_roundtrip() {
     assert!(pull_response.changes.len() >= 2); // collective + experience at minimum
 }
 
+/// **This test PINS A DEFECT, not desired behaviour — issue #96.** A catch-up
+/// over HTTP pulls the server's data and reports honestly that it did NOT
+/// complete, because one change cannot apply on this transport.
+///
+/// `Experience::embedding` is `#[serde(skip)]` (embeddings live in their own
+/// table and the storage layer rejoins them on read), so an `ExperienceCreated`
+/// crossing any SERIALIZING transport arrives with an empty vector and the
+/// applier's create fails the collective's dimension check. In-memory sync is
+/// unaffected — it hands the struct over without a serialize step, which is why
+/// the engine tests do not see this.
+///
+/// The failure is pre-existing; what is new (PR #88 class L) is that
+/// `initial_sync` no longer reports `Ok(())` over the top of it. The client is
+/// left holding the experience RECORD but no vector for it, so it is not
+/// searchable — pinned below so the gap cannot be mistaken for a full sync.
+///
+/// This test is #96's tripwire. When the sync payload carries embeddings, it
+/// goes RED here: FLIP the expectations back — `initial_sync` to `Ok(())` and
+/// the search to a hit — rather than deleting the test, which is what proves
+/// the fix landed.
 #[tokio::test]
-async fn test_http_full_sync_via_manager() {
+async fn test_http_full_sync_via_manager_pins_the_missing_embedding_defect() {
     let server = start_test_server().await;
     let dir_client = tempdir().unwrap();
     let db_client =
@@ -216,7 +236,77 @@ async fn test_http_full_sync_via_manager() {
     let exp_id = server.db.record_experience(minimal_exp(cid)).unwrap();
 
     // Client does initial sync to pull all server data
-    manager.initial_sync(None).await.unwrap();
+    let error = manager
+        .initial_sync(None)
+        .await
+        .expect_err("the experience cannot apply without its embedding");
+    assert!(
+        error.is_catch_up_incomplete(),
+        "an unappliable change must surface, not be reported as a completed \
+         catch-up, got: {error}"
+    );
+    assert!(
+        error.to_string().contains("failed to apply"),
+        "the error must name what stopped it, got: {error}"
+    );
+
+    // What DID arrive: the collective, and the experience record without its
+    // vector — so a semantic search over the synced collective finds nothing.
+    assert!(
+        db_client.get_collective(cid).unwrap().is_some(),
+        "Collective should sync via HTTP"
+    );
+    assert!(
+        db_client.get_experience(exp_id).unwrap().is_some(),
+        "Experience should sync via HTTP"
+    );
+    assert_eq!(
+        db_client
+            .search_similar(cid, &vec![0.1f32; 384], 5)
+            .unwrap()
+            .len(),
+        0,
+        "the experience arrived without its embedding, so it is not searchable \
+         — the sync payload does not carry embeddings"
+    );
+}
+
+/// **Acceptance test for issue #96 — FAILING BY DESIGN, so `#[ignore]`d.**
+///
+/// This is what an HTTP catch-up is supposed to do, and what the test above
+/// asserted before it was rewritten to pin the defect: pull the collective and
+/// the experience, report `Ok(())`, and leave the experience findable by
+/// semantic search on the client.
+///
+/// It fails today because `Experience::embedding` is `#[serde(skip)]`, so the
+/// experience crosses the wire without its vector, the applier's create fails
+/// the dimension check, and the record lands unsearchable.
+///
+/// Whoever fixes #96 REMOVES the `#[ignore]` here and flips the expectations of
+/// the characterization test above back to success. Neither test is to be
+/// deleted: this one proves the fix works, that one proves the defect is gone.
+#[tokio::test]
+#[ignore = "issue #96: experiences lose their embeddings over any serializing \
+            transport; un-ignore when the sync payload carries them"]
+async fn acceptance_96_http_catch_up_delivers_a_searchable_experience() {
+    let server = start_test_server().await;
+    let dir_client = tempdir().unwrap();
+    let db_client =
+        Arc::new(PulseDB::open(dir_client.path().join("client.db"), Config::default()).unwrap());
+
+    let transport = HttpSyncTransport::new(&server.base_url);
+    let config = SyncConfig::default();
+    let mut manager = SyncManager::new(Arc::clone(&db_client), Box::new(transport), config);
+
+    // Create data on server
+    let cid = server.db.create_collective("full-sync").unwrap();
+    let exp_id = server.db.record_experience(minimal_exp(cid)).unwrap();
+
+    // Client does initial sync to pull all server data
+    manager
+        .initial_sync(None)
+        .await
+        .expect("a catch-up that pulled everything must report completion");
 
     // Client should have the collective and experience
     assert!(
@@ -226,6 +316,15 @@ async fn test_http_full_sync_via_manager() {
     assert!(
         db_client.get_experience(exp_id).unwrap().is_some(),
         "Experience should sync via HTTP"
+    );
+    // ...and the experience must arrive WITH its embedding, so it is findable.
+    let hits = db_client
+        .search_similar(cid, &vec![0.1f32; 384], 5)
+        .unwrap();
+    assert!(
+        hits.iter().any(|hit| hit.experience.id == exp_id),
+        "the synced experience must be searchable on the client, which needs \
+         its embedding to have crossed the wire"
     );
 }
 
