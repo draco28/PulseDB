@@ -64,9 +64,12 @@ pub struct ApplyResult {
     /// **The batch's order is not trusted** — a remote peer chooses it. The
     /// bound is therefore by *sequence*, not by position: the value is the
     /// highest handled sequence lying strictly below the LOWEST sequence that
-    /// failed anywhere in the batch. A batch arriving as `[9 ok, 3 err]`
-    /// reports `None` (9 sits above the failure); `[1 ok, 5 ok, 3 err]`
-    /// reports `1`; an ascending `[1 ok, 2 ok, 3 err]` reports `2`.
+    /// failed anywhere in the batch. Position decides nothing, on either side
+    /// of the rule — every success counts, whether it arrived before or after
+    /// a failure. A batch arriving as `[9 ok, 3 err]` reports `None` (9 sits
+    /// above the failure); `[1 ok, 5 ok, 3 err]` reports `1`; `[5 err, 1 ok]`
+    /// also reports `1`, because 1 still lies below the floor; an ascending
+    /// `[1 ok, 2 ok, 3 err]` reports `2`.
     pub safe_through: Option<u64>,
     /// Number of changes in this batch whose incoming `last_reinforced` lay
     /// beyond `now + SyncConfig::max_clock_skew_ms` (#13).
@@ -117,12 +120,16 @@ impl RemoteChangeApplier {
         // can arrive after a higher one. Neither the last sequence handled nor
         // the running maximum of them is sound: `[9 ok, 3 err]` yields 9 under
         // both, acknowledging a change (3) that never applied. So the failures
-        // set a FLOOR — the lowest sequence that failed anywhere in the batch,
-        // still updated after the halt — the successes are recorded, and
-        // `safe_through` is the highest recorded success strictly below that
-        // floor. Any batch change at or below that value that had failed would
-        // have to sit below the floor, contradicting the floor's definition.
-        let mut halted = false;
+        // set a FLOOR — the lowest sequence that failed anywhere in the batch —
+        // EVERY success is recorded whatever its position, and `safe_through`
+        // is the highest recorded success strictly below that floor. Any batch
+        // change at or below that value that had failed would have to sit below
+        // the floor, contradicting the floor's definition.
+        //
+        // Position must not gate the recording either: dropping successes that
+        // arrive after a failure would report `None` for `[5 err, 1 ok]`, even
+        // though 1 applied and lies below the floor — and a peer that always
+        // sends that order could then never persist any progress at all.
         let mut failure_floor: Option<u64> = None;
         // Bounded by the poller's batch limit (`SyncConfig::batch_size` on the
         // push path, `PullRequest::batch_size` on the pull path).
@@ -149,31 +156,24 @@ impl RemoteChangeApplier {
             match self.apply_single(change) {
                 Ok(ApplyOutcome::Applied) => {
                     result.applied += 1;
-                    if !halted {
-                        succeeded.push(sequence);
-                    }
+                    succeeded.push(sequence);
                 }
                 Ok(ApplyOutcome::Skipped) => {
                     result.skipped += 1;
-                    if !halted {
-                        succeeded.push(sequence);
-                    }
+                    succeeded.push(sequence);
                 }
                 Ok(ApplyOutcome::ConflictResolved) => {
                     result.applied += 1;
                     result.conflicts += 1;
-                    if !halted {
-                        succeeded.push(sequence);
-                    }
+                    succeeded.push(sequence);
                 }
                 Err(e) => {
                     warn!(sequence, "Failed to apply sync change: {}", e);
                     // Continue applying the rest — a later change may be
                     // independent — but never acknowledge at or past this one.
-                    // The floor keeps updating AFTER the halt: a lower failing
-                    // sequence arriving later in the batch must still pull the
+                    // The floor keeps sinking as the batch runs: a lower
+                    // failing sequence arriving later must still pull the
                     // acknowledgement down.
-                    halted = true;
                     failure_floor = Some(failure_floor.map_or(sequence, |f| f.min(sequence)));
                     result.failed += 1;
                     result.skipped += 1;
@@ -182,8 +182,8 @@ impl RemoteChangeApplier {
         }
 
         // The highest success strictly below the failure floor (every success,
-        // when nothing failed). `None` when no recorded success qualifies —
-        // which is the honest answer for `[9 ok, 3 err]`.
+        // when nothing failed). `None` when no success qualifies — which is the
+        // honest answer for `[9 ok, 3 err]`.
         result.safe_through = succeeded
             .into_iter()
             .filter(|sequence| failure_floor.is_none_or(|floor| *sequence < floor))
@@ -685,6 +685,47 @@ mod tests {
             result.safe_through,
             Some(1),
             "1 applied and is below the failing 3, so it is safe; 5 is not"
+        );
+    }
+
+    /// A success arriving AFTER a higher-sequence failure is still real
+    /// progress: it sits below the failure floor, so it is safe to acknowledge.
+    /// Recording successes only until the first failure would discard it and
+    /// leave a peer that always sends this order stuck at `None` forever,
+    /// replaying the same lower change on every cycle.
+    #[test]
+    fn a_success_after_a_higher_failure_is_still_acknowledged() {
+        let (db, _dir) = open_db();
+        let cid = db.create_collective("applier-ack-late-success").unwrap();
+        let good = db.record_experience(minimal_exp(cid)).unwrap();
+        let benign = SerializableExperienceUpdate {
+            importance: Some(0.5),
+            ..Default::default()
+        };
+
+        let at = |seq: u64, update| {
+            let mut c = change(
+                SyncPayload::ExperienceUpdated {
+                    id: good,
+                    update,
+                    timestamp: Timestamp::from_millis(0),
+                },
+                cid,
+            );
+            c.sequence = seq;
+            c
+        };
+
+        let applier = RemoteChangeApplier::new(Arc::clone(&db), SyncConfig::default());
+        let result = applier
+            .apply_batch(vec![at(5, poison_update()), at(1, benign)])
+            .unwrap();
+
+        assert_eq!(
+            result.safe_through,
+            Some(1),
+            "1 applied and is strictly below the failing 5, so it is safe — \
+             the batch's order must not decide what is recorded"
         );
     }
 
