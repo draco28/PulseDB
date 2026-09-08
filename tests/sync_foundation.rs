@@ -311,6 +311,9 @@ fn test_no_op_cursor_update_does_not_touch_the_store() {
     storage.update_pull_cursor(&peer_id, 7).unwrap();
 
     let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    // mtime alone is a coarse witness — a filesystem with second granularity
+    // records no change for ten writes inside one tick — so compare the bytes.
+    let before_bytes = std::fs::read(&path).unwrap();
 
     // Ten idle cycles' worth of "persist the position we already have".
     for _ in 0..10 {
@@ -319,9 +322,26 @@ fn test_no_op_cursor_update_does_not_touch_the_store() {
     }
 
     let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let after_bytes = std::fs::read(&path).unwrap();
     assert_eq!(
         before, after,
         "a cursor update that changes nothing must not commit a write transaction"
+    );
+    assert_eq!(
+        before_bytes.len(),
+        after_bytes.len(),
+        "the store file changed size across ten no-op cursor updates"
+    );
+    // Compared by hand rather than `assert_eq!` on the vectors: a mismatch must
+    // report the offset, not dump the whole store.
+    let first_difference = before_bytes
+        .iter()
+        .zip(after_bytes.iter())
+        .position(|(before, after)| before != after);
+    assert_eq!(
+        first_difference, None,
+        "a cursor update that changes nothing must leave the store byte-identical; \
+         first differing offset shown"
     );
 
     let loaded = storage.load_sync_cursor(&peer_id).unwrap().unwrap();
