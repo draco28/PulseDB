@@ -3378,12 +3378,53 @@ impl PulseDB {
     ///
     /// Writes the full experience to storage and inserts into HNSW.
     /// Caller must hold `SyncApplyGuard` to suppress WAL recording.
+    ///
+    /// # Ordering, and what it does and does not guarantee (#96)
+    ///
+    /// The embedding is checked against the collective's vector index BEFORE
+    /// anything is written. That is what closes the case this method was
+    /// corrupting the store with: `Experience::embedding` is `#[serde(skip)]`,
+    /// so a create crossing a serializing transport arrives with a zero-length
+    /// vector, and saving the record first left a row `get_experience` could
+    /// find and `search_similar` never could — which then made the failure
+    /// one-shot, because the applier's create arm short-circuits on an existing
+    /// record and every retry resolved as applied.
+    ///
+    /// This is NOT atomicity. There is no transaction spanning the storage
+    /// write and the in-memory HNSW index, so what remains possible is:
+    ///
+    /// - the insert can still fail AFTER the record is saved — the state lock
+    ///   can be poisoned, or the collective's index can be replaced between the
+    ///   check and the insert — and nothing undoes the save. The error says so
+    ///   and is logged at `error!`; the row is left with no vector.
+    /// - a collective with no index yet takes the record with no vector at all,
+    ///   which is the long-standing behaviour of the `if let Some(index)` arm
+    ///   and is unchanged here.
+    ///
+    /// A genuine all-or-nothing apply needs a storage transaction that spans
+    /// the record and the vector index (or a create-if-absent storage primitive
+    /// to make a compensating delete provably remove only the row this call
+    /// wrote). Neither exists today, and a compensating delete without one can
+    /// race a concurrent writer and remove somebody else's record — a worse
+    /// defect than the one being fixed. See #96.
     #[cfg(feature = "sync")]
     #[allow(dead_code)] // Called by sync applier (Phase 3)
     pub fn apply_synced_experience(&self, experience: Experience) -> Result<()> {
         let collective_id = experience.collective_id;
         let id = experience.id;
         let embedding = experience.embedding.clone();
+
+        // Reject BEFORE the write: an embedding this index cannot take must
+        // leave no record, no secondary index entry and no WAL event behind.
+        {
+            let vectors = self
+                .vectors
+                .read()
+                .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
+            if let Some(index) = vectors.get(&collective_id) {
+                index.validate_embedding(&embedding)?;
+            }
+        }
 
         self.storage.save_experience(&experience)?;
 
@@ -3393,7 +3434,21 @@ impl PulseDB {
             .read()
             .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
         if let Some(index) = vectors.get(&collective_id) {
-            index.insert_experience(id, &embedding)?;
+            if let Err(e) = index.insert_experience(id, &embedding) {
+                // The record is already committed and nothing here can take it
+                // back safely, so say plainly what was left behind rather than
+                // returning a bare index error.
+                tracing::error!(
+                    id = %id,
+                    collective_id = %collective_id,
+                    "Synced experience saved but NOT indexed; the record has no \
+                     vector and is not searchable: {e}"
+                );
+                return Err(PulseDBError::vector(format!(
+                    "experience {id} was saved but could not be indexed, so the \
+                     record remains without a vector and is not searchable: {e}"
+                )));
+            }
         }
 
         debug!(id = %id, "Synced experience applied");
@@ -3438,6 +3493,20 @@ impl PulseDB {
     ///
     /// Removes from storage and soft-deletes from HNSW.
     /// Caller must hold `SyncApplyGuard` to suppress WAL recording.
+    ///
+    /// # Ordering
+    ///
+    /// The HNSW soft-delete runs FIRST, before the storage deletes. It is
+    /// idempotent and costs nothing to repeat, whereas the storage delete is
+    /// the step that cannot be replayed: the applier's `ExperienceDeleted` arm
+    /// short-circuits on `get_experience(id).is_none()`, so a storage delete
+    /// that landed before a failing index delete would never be retried and the
+    /// index would keep a vector for a record that no longer exists. With this
+    /// order a failure leaves the record present and the retry converges.
+    ///
+    /// This is not a transaction either — a failure between the two steps
+    /// leaves an experience that is still readable but excluded from search
+    /// until the delete is retried. See `apply_synced_experience`.
     #[cfg(feature = "sync")]
     #[allow(dead_code)] // Called by sync applier (Phase 3)
     pub fn apply_synced_experience_delete(&self, id: ExperienceId) -> Result<()> {
@@ -3445,19 +3514,22 @@ impl PulseDB {
         if let Some(exp) = self.storage.get_experience(id)? {
             let collective_id = exp.collective_id;
 
+            // Soft-delete from HNSW first — idempotent, so a later failure is
+            // retryable; the storage delete is not.
+            {
+                let vectors = self
+                    .vectors
+                    .read()
+                    .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
+                if let Some(index) = vectors.get(&collective_id) {
+                    index.delete_experience(id)?;
+                }
+            }
+
             // Cascade delete relations
             self.storage.delete_relations_for_experience(id)?;
 
             self.storage.delete_experience(id)?;
-
-            // Soft-delete from HNSW
-            let vectors = self
-                .vectors
-                .read()
-                .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
-            if let Some(index) = vectors.get(&collective_id) {
-                index.delete_experience(id)?;
-            }
         }
 
         debug!(id = %id, "Synced experience delete applied");
@@ -3491,23 +3563,57 @@ impl PulseDB {
     ///
     /// Writes to storage and inserts into insight HNSW index.
     /// Caller must hold `SyncApplyGuard` to suppress WAL recording.
+    ///
+    /// Same save-then-index shape, and the same limits, as
+    /// [`apply_synced_experience`](Self::apply_synced_experience): the
+    /// embedding is checked against the insight index before anything is
+    /// written, and an insert that fails after the save is reported and logged
+    /// rather than undone.
+    ///
+    /// Unlike `Experience::embedding`, `DerivedInsight::embedding` is stored
+    /// inline and IS serialized, so this path does not meet #96's zero-length
+    /// vector on the wire. The ordering is still what stops a dimension
+    /// mismatch from any other source leaving a record behind with no vector.
     #[cfg(feature = "sync")]
     #[allow(dead_code)] // Called by sync applier (Phase 3)
     pub fn apply_synced_insight(&self, insight: DerivedInsight) -> Result<()> {
         let id = insight.id;
         let collective_id = insight.collective_id;
         let embedding = insight.embedding.clone();
+        // Insight HNSW keys insights by their id reinterpreted as an
+        // ExperienceId (byte conversion).
+        let exp_id = ExperienceId::from_bytes(*id.as_bytes());
+
+        // Reject BEFORE the write — see `apply_synced_experience`.
+        {
+            let insight_vectors = self
+                .insight_vectors
+                .read()
+                .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
+            if let Some(index) = insight_vectors.get(&collective_id) {
+                index.validate_embedding(&embedding)?;
+            }
+        }
 
         self.storage.save_insight(&insight)?;
 
-        // Insert into insight HNSW (using InsightId→ExperienceId byte conversion)
-        let exp_id = ExperienceId::from_bytes(*id.as_bytes());
         let insight_vectors = self
             .insight_vectors
             .read()
             .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
         if let Some(index) = insight_vectors.get(&collective_id) {
-            index.insert_experience(exp_id, &embedding)?;
+            if let Err(e) = index.insert_experience(exp_id, &embedding) {
+                tracing::error!(
+                    id = %id,
+                    collective_id = %collective_id,
+                    "Synced insight saved but NOT indexed; the record has no \
+                     vector and is not searchable: {e}"
+                );
+                return Err(PulseDBError::vector(format!(
+                    "insight {id} was saved but could not be indexed, so the \
+                     record remains without a vector and is not searchable: {e}"
+                )));
+            }
         }
 
         debug!(id = %id, "Synced insight applied");
@@ -3518,21 +3624,28 @@ impl PulseDB {
     ///
     /// Removes from storage and soft-deletes from insight HNSW.
     /// Caller must hold `SyncApplyGuard` to suppress WAL recording.
+    ///
+    /// Soft-deletes from the index first, for the reason given on
+    /// [`apply_synced_experience_delete`](Self::apply_synced_experience_delete):
+    /// the index step is idempotent and the storage step is the one the
+    /// applier will not retry once it has landed.
     #[cfg(feature = "sync")]
     #[allow(dead_code)] // Called by sync applier (Phase 3)
     pub fn apply_synced_insight_delete(&self, id: InsightId) -> Result<()> {
         if let Some(insight) = self.storage.get_insight(id)? {
-            self.storage.delete_insight(id)?;
-
-            // Soft-delete from insight HNSW
+            // Soft-delete from insight HNSW first — idempotent, so retryable.
             let exp_id = ExperienceId::from_bytes(*id.as_bytes());
-            let insight_vectors = self
-                .insight_vectors
-                .read()
-                .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
-            if let Some(index) = insight_vectors.get(&insight.collective_id) {
-                index.delete_experience(exp_id)?;
+            {
+                let insight_vectors = self
+                    .insight_vectors
+                    .read()
+                    .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
+                if let Some(index) = insight_vectors.get(&insight.collective_id) {
+                    index.delete_experience(exp_id)?;
+                }
             }
+
+            self.storage.delete_insight(id)?;
         }
 
         debug!(id = %id, "Synced insight delete applied");

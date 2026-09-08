@@ -211,15 +211,17 @@ async fn test_http_push_and_pull_roundtrip() {
 /// unaffected — it hands the struct over without a serialize step, which is why
 /// the engine tests do not see this.
 ///
-/// The failure is pre-existing; what is new (PR #88 class L) is that
-/// `initial_sync` no longer reports `Ok(())` over the top of it. The client is
-/// left holding the experience RECORD but no vector for it, so it is not
-/// searchable — pinned below so the gap cannot be mistaken for a full sync.
+/// The remaining defect is the WIRE FORMAT: `SyncPayload` does not carry
+/// embeddings, so the experience cannot cross this transport at all. What is no
+/// longer part of it (PR #88 class L, then class P) is the lying: `initial_sync`
+/// does not report `Ok(())` over the top of the failure, and the failed create
+/// no longer leaves the experience RECORD behind without its vector. The
+/// collective arrives; the experience does not arrive at all.
 ///
 /// This test is #96's tripwire. When the sync payload carries embeddings, it
-/// goes RED here: FLIP the expectations back — `initial_sync` to `Ok(())` and
-/// the search to a hit — rather than deleting the test, which is what proves
-/// the fix landed.
+/// goes RED here: FLIP the expectations back — `initial_sync` to `Ok(())`, the
+/// experience to present and the search to a hit — rather than deleting the
+/// test, which is what proves the fix landed.
 #[tokio::test]
 async fn test_http_full_sync_via_manager_pins_the_missing_embedding_defect() {
     let server = start_test_server().await;
@@ -250,15 +252,17 @@ async fn test_http_full_sync_via_manager_pins_the_missing_embedding_defect() {
         "the error must name what stopped it, got: {error}"
     );
 
-    // What DID arrive: the collective, and the experience record without its
-    // vector — so a semantic search over the synced collective finds nothing.
+    // What DID arrive: the collective, and nothing else. The experience change
+    // could not be applied, so none of it was written — no record, and so
+    // nothing for a semantic search over the synced collective to find.
     assert!(
         db_client.get_collective(cid).unwrap().is_some(),
         "Collective should sync via HTTP"
     );
     assert!(
-        db_client.get_experience(exp_id).unwrap().is_some(),
-        "Experience should sync via HTTP"
+        db_client.get_experience(exp_id).unwrap().is_none(),
+        "a create that could not be indexed must leave no record behind — the \
+         experience is absent, not present-but-unsearchable"
     );
     assert_eq!(
         db_client
@@ -266,8 +270,59 @@ async fn test_http_full_sync_via_manager_pins_the_missing_embedding_defect() {
             .unwrap()
             .len(),
         0,
-        "the experience arrived without its embedding, so it is not searchable \
-         — the sync payload does not carry embeddings"
+        "the experience never arrived, so there is nothing to find — the sync \
+         payload does not carry embeddings"
+    );
+}
+
+/// The consequence that makes the class worth having: the failure is
+/// REPEATABLE, not one-shot.
+///
+/// The applier's `ExperienceCreated` arm short-circuits on
+/// `get_experience(id).is_some()`. While a failed create left its record in the
+/// store, the retry therefore resolved as applied-or-skipped, the cursors moved
+/// past the change, and the second catch-up reported `Ok(())` over an
+/// experience that had never been usable. With nothing written, the create path
+/// is re-entered on every attempt and the same honest error comes back.
+#[tokio::test]
+async fn http_catch_up_reports_the_same_failure_on_every_attempt() {
+    let server = start_test_server().await;
+    let dir_client = tempdir().unwrap();
+    let db_client =
+        Arc::new(PulseDB::open(dir_client.path().join("client.db"), Config::default()).unwrap());
+
+    let transport = HttpSyncTransport::new(&server.base_url);
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_client),
+        Box::new(transport),
+        SyncConfig::default(),
+    );
+
+    let cid = server.db.create_collective("repeatable-catch-up").unwrap();
+    let exp_id = server.db.record_experience(minimal_exp(cid)).unwrap();
+
+    let first = manager
+        .initial_sync(None)
+        .await
+        .expect_err("the experience cannot apply without its embedding");
+    assert!(
+        first.is_catch_up_incomplete(),
+        "first catch-up must report the incomplete run, got: {first}"
+    );
+
+    let second = manager
+        .initial_sync(None)
+        .await
+        .expect_err("the same change is still unappliable on the second attempt");
+    assert!(
+        second.is_catch_up_incomplete(),
+        "a repeated catch-up must report the SAME incomplete run, not `Ok(())` \
+         off the back of a half-written record, got: {second}"
+    );
+
+    assert!(
+        db_client.get_experience(exp_id).unwrap().is_none(),
+        "no attempt may leave a record behind"
     );
 }
 
@@ -383,6 +438,15 @@ async fn test_http_error_bad_url() {
     assert!(result.is_err(), "Bad URL should fail");
 }
 
+/// The PUSH direction meets the same wire-format defect as the pull one —
+/// issue #96, and the same note applies: FLIP the experience expectation back
+/// to `is_some()` when `SyncPayload` carries embeddings.
+///
+/// `Experience::embedding` is `#[serde(skip)]`, so the experience reaches the
+/// server's applier with an empty vector and its create is refused by the
+/// collective's dimension check. The collective, which carries no embedding,
+/// goes across fine. Nothing partial is left on the server: the create is
+/// rejected before anything is written.
 #[tokio::test]
 async fn test_http_push_to_server() {
     let server = start_test_server().await;
@@ -404,14 +468,31 @@ async fn test_http_push_to_server() {
     // Push to server
     manager.sync_once().await.unwrap();
 
-    // Server should have the collective and experience
+    // Server should have the collective; the experience cannot cross this
+    // transport at all (#96) and must not arrive half-formed.
     assert!(
         server.db.get_collective(cid).unwrap().is_some(),
         "Collective should be pushed to server"
     );
     assert!(
-        server.db.get_experience(exp_id).unwrap().is_some(),
-        "Experience should be pushed to server"
+        server.db.get_experience(exp_id).unwrap().is_none(),
+        "the experience loses its embedding on the wire (#96), so its create is \
+         refused — and refusing it must leave NO record on the server"
+    );
+
+    // The change that failed is not acknowledged, so it stays pushable: the
+    // client's push position stopped below it and `compact_wal` cannot drop it.
+    let peer_id = server.db.instance_id();
+    let cursor = db_client
+        .storage_for_test()
+        .load_sync_cursor(&peer_id)
+        .unwrap()
+        .expect("a push cycle records a cursor for the peer");
+    assert!(
+        cursor.push_sequence < 2,
+        "the acknowledged push position must stay below the experience event, \
+         so the change is retried rather than compacted away, got {}",
+        cursor.push_sequence
     );
 }
 

@@ -814,6 +814,71 @@ fn test_apply_synced_experience_writes_data() {
     assert_eq!(retrieved.applications(), 5);
 }
 
+/// #96 (atomicity half): a sync create whose embedding cannot go into the
+/// collective's vector index must leave NOTHING behind — not the experience
+/// row, not its secondary index entries, not a WAL event.
+///
+/// The zero-length embedding is the real case: `Experience::embedding` is
+/// `#[serde(skip)]`, so an `ExperienceCreated` crossing a serializing transport
+/// arrives with an empty vector. Saving the record first and only then failing
+/// the index insert left `get_experience` answering `Some` for something
+/// `search_similar` could never find, and made the failure one-shot — the
+/// applier's create arm short-circuits on an existing record, so every retry
+/// resolved as applied and carried the cursors past it.
+#[test]
+fn apply_synced_experience_writes_nothing_when_the_embedding_cannot_be_indexed() {
+    use pulsedb::sync::guard::SyncApplyGuard;
+
+    let (db, _dir) = open_test_db();
+    let cid = db.create_collective("apply-atomicity").unwrap();
+    let seq_before = db.get_current_sequence().unwrap();
+
+    let exp_id = pulsedb::ExperienceId::new();
+    let timestamp = Timestamp::now();
+    let exp = pulsedb::Experience {
+        id: exp_id,
+        collective_id: cid,
+        content: "arrives without its vector".to_string(),
+        // What a serializing transport delivers (#96): no embedding at all.
+        embedding: vec![],
+        experience_type: ExperienceType::Generic { category: None },
+        importance: 0.5,
+        confidence: 0.8,
+        applications: std::collections::BTreeMap::new(),
+        domain: vec![],
+        tags: std::collections::BTreeMap::from([("k".to_string(), "v".to_string())]),
+        related_files: vec![],
+        source_agent: pulsedb::AgentId::new("sync-test"),
+        source_task: None,
+        timestamp,
+        last_reinforced: timestamp,
+        archived: false,
+    };
+
+    let guard = SyncApplyGuard::enter();
+    let err = db
+        .apply_synced_experience(exp)
+        .expect_err("an embedding the index cannot take must not be applied");
+    drop(guard);
+
+    assert!(
+        db.get_experience(exp_id).unwrap().is_none(),
+        "the record must not be in the store after a rejected apply, got: {err}"
+    );
+    assert!(
+        db.list_experiences(cid, 100, 0)
+            .unwrap()
+            .iter()
+            .all(|e| e.id != exp_id),
+        "the by-collective index must not carry the rejected experience either"
+    );
+    assert_eq!(
+        db.get_current_sequence().unwrap(),
+        seq_before,
+        "the rejected apply must not record a WAL event (SyncApplyGuard held)"
+    );
+}
+
 #[test]
 fn test_apply_synced_collective_creates_indexes() {
     use pulsedb::sync::guard::SyncApplyGuard;
