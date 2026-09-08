@@ -18,6 +18,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use ::redb::{Database, ReadableTable};
@@ -317,17 +318,39 @@ fn claim_schema_backup_copy(path: &Path, backup_path: &Path) -> Result<bool> {
     }
 }
 
+/// Per-call discriminator for [`pristine_schema_backup_temp_path`]. Process-wide
+/// and monotonic, so no two calls in one process ever name the same temp.
+static PRISTINE_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
+
 /// Sibling temp path where the PRISTINE schema-backup claim
 /// ([`RedbStorage::claim_pristine_schema_backup_copy`]) stages its copy before
-/// validating it and renaming it onto `backup_path`.
+/// validating it and publishing it onto `backup_path`.
 ///
-/// Process-unique (`.<pid>.pristine.tmp`), unlike [`backup_temp_path`]: that
-/// staging runs under the exclusive [`MigrationLock`], whereas the pristine
-/// claim runs BEFORE any writer lock exists, so two processes can be staging the
-/// same sidecar at once and must not share one temp file.
+/// Unique per CALL (`.<pid>.<nonce>.pristine.tmp`), unlike [`backup_temp_path`]:
+/// that staging runs under the exclusive [`MigrationLock`], whereas the pristine
+/// claim runs BEFORE any writer lock exists, so nothing serialises the
+/// claimants and none of them may share a temp file.
+///
+/// The pid alone is not enough. It separates PROCESSES, and two processes
+/// staging the same sidecar at once was the case the pid was chosen for — but
+/// PulseDB is a library, so two THREADS calling `RedbStorage::open` on the same
+/// store inside one process is an ordinary situation, and they derive the
+/// identical pid. [`RedbStorage::stage_pristine_schema_backup`] then
+/// unconditionally `remove_file`s the temp before creating its own, so on Unix
+/// one thread unlinks and replaces the other's still-open staging file: the
+/// loser's `create_new` collides, or it validates and publishes bytes it did not
+/// write, and the claim fails where it should have produced the byte-identical
+/// ADR-011 rollback point. The nonce keeps every claimant on its own file,
+/// whichever process or thread it runs on; the pid stays in the name so a
+/// crashed run's leftovers remain attributable.
+///
+/// Each call therefore returns a NEW path — callers must keep the value they
+/// staged at rather than recomputing it, and a test asserting no temp survived
+/// looks for the suffix rather than reconstructing the name.
 fn pristine_schema_backup_temp_path(backup_path: &Path) -> PathBuf {
+    let nonce = PRISTINE_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
     let mut temp = backup_path.as_os_str().to_owned();
-    temp.push(format!(".{}.pristine.tmp", std::process::id()));
+    temp.push(format!(".{}.{nonce}.pristine.tmp", std::process::id()));
     PathBuf::from(temp)
 }
 
@@ -4841,6 +4864,139 @@ mod tests {
         );
     }
 
+    /// Every leftover pristine staging temp beside `backup_path`, whatever
+    /// per-call suffix it carries. The temp name is deliberately not
+    /// reconstructible by the caller (see `pristine_schema_backup_temp_path`),
+    /// so "no temp survived" is asserted by looking, not by guessing a name.
+    fn leftover_pristine_temps(backup_path: &Path) -> Vec<PathBuf> {
+        let dir = backup_path.parent().unwrap();
+        let prefix = backup_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| {
+                let name = entry.file_name().unwrap().to_string_lossy().to_string();
+                name.starts_with(&prefix) && name.ends_with(".pristine.tmp")
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// The staging temp must be unique per CALL, not per process.
+    ///
+    /// PulseDB is a library: two THREADS opening the same schema-4 store in one
+    /// process is ordinary, and both run the pristine claim before any writer
+    /// lock exists. A pid-only name gives them the identical path, and
+    /// `stage_pristine_schema_backup` unconditionally `remove_file`s it before
+    /// creating its own — so one thread unlinks and replaces the other's
+    /// still-open staging file, and the other then validates or publishes bytes
+    /// it did not write.
+    #[test]
+    fn test_pristine_staging_temp_is_unique_per_call() {
+        let dir = tempdir().unwrap();
+        let backup_path = dir.path().join("test.db.pre-v5.bak");
+
+        let first = pristine_schema_backup_temp_path(&backup_path);
+        let second = pristine_schema_backup_temp_path(&backup_path);
+
+        assert_ne!(
+            first, second,
+            "two claims in ONE process must not stage at the same temp path"
+        );
+        let pid = std::process::id().to_string();
+        for temp in [&first, &second] {
+            let name = temp.file_name().unwrap().to_string_lossy().to_string();
+            assert!(
+                name.contains(&pid),
+                "the temp must still name the process, so a crashed run's leftovers \
+                 are attributable: {name}"
+            );
+            assert!(
+                name.ends_with(".pristine.tmp"),
+                "the temp must keep its recognisable suffix: {name}"
+            );
+            assert!(
+                temp.starts_with(dir.path()),
+                "the temp must stay a sibling of the sidecar: {}",
+                temp.display()
+            );
+        }
+    }
+
+    /// The same defect through the real entry point: concurrent claimants in
+    /// ONE process must all complete, exactly one must publish, and the
+    /// published sidecar must be a byte-identical copy of the source — not a
+    /// half-written image another thread left at a shared temp path.
+    ///
+    /// This is a RACE, so it is a probabilistic witness, not a deterministic
+    /// one: it is run over several rounds with a barrier to widen the window.
+    #[test]
+    fn test_concurrent_pristine_claims_publish_byte_identical_bytes() {
+        use std::sync::{Arc, Barrier};
+
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 12;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+        Box::new(storage).close().unwrap();
+        let source = std::fs::read(&path).unwrap();
+
+        for round in 0..ROUNDS {
+            let backup_path = dir.path().join(format!("test.db.round-{round}.bak"));
+            let barrier = Arc::new(Barrier::new(THREADS));
+
+            let published: usize = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        let barrier = Arc::clone(&barrier);
+                        let path = path.clone();
+                        let backup_path = backup_path.clone();
+                        scope.spawn(move || {
+                            barrier.wait();
+                            RedbStorage::claim_pristine_schema_backup_copy(
+                                &path,
+                                &backup_path,
+                                SCHEMA_VERSION,
+                            )
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        let claimed = handle
+                            .join()
+                            .unwrap()
+                            .expect("a concurrent claimant must not fail");
+                        usize::from(claimed)
+                    })
+                    .sum()
+            });
+
+            assert_eq!(
+                published, 1,
+                "exactly one concurrent claimant publishes the sidecar (round {round})"
+            );
+            assert_eq!(
+                std::fs::read(&backup_path).unwrap(),
+                source,
+                "the published sidecar must be byte-identical to the pristine \
+                 source, not an image a racing thread left behind (round {round})"
+            );
+            assert!(
+                leftover_pristine_temps(&backup_path).is_empty(),
+                "no staging temp may survive, on any thread's path (round {round})"
+            );
+        }
+    }
+
     #[test]
     fn test_pristine_schema_backup_discards_a_staged_copy_that_fails_validation() {
         // The pristine claim runs BEFORE `create_or_migrate`, so no redb writer
@@ -4875,7 +5031,7 @@ mod tests {
             backup_path.display()
         );
         assert!(
-            !pristine_schema_backup_temp_path(&backup_path).exists(),
+            leftover_pristine_temps(&backup_path).is_empty(),
             "the rejected staging temp must be cleaned up on the failure path"
         );
 
@@ -4896,7 +5052,6 @@ mod tests {
         Box::new(storage).close().unwrap();
 
         let backup_path = pre_v5_backup_path(&path);
-        let temp_path = pristine_schema_backup_temp_path(&backup_path);
         assert!(
             RedbStorage::claim_pristine_schema_backup_copy(&path, &backup_path, SCHEMA_VERSION)
                 .unwrap(),
@@ -4908,7 +5063,7 @@ mod tests {
             "the published sidecar must be the validated copy of the store"
         );
         assert!(
-            !temp_path.exists(),
+            leftover_pristine_temps(&backup_path).is_empty(),
             "the staging temp must not survive a successful publish"
         );
 
@@ -4920,7 +5075,7 @@ mod tests {
             "an already-published sidecar is preserved, not re-published"
         );
         assert_eq!(std::fs::read(&backup_path).unwrap(), published);
-        assert!(!temp_path.exists());
+        assert!(leftover_pristine_temps(&backup_path).is_empty());
     }
 
     /// A sidecar is a byte copy of the database, so it must never be more
