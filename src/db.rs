@@ -3319,9 +3319,10 @@ impl PulseDB {
     ///   ([`SyncDirection::PullOnly`](crate::sync::config::SyncDirection::PullOnly))
     ///   is indistinguishable in the cursor store from a peer it simply has not
     ///   pushed to yet, so it holds compaction at `0` as well: under `PullOnly`
-    ///   the WAL grows until a push to that peer happens. Direction-aware
-    ///   cursors on the wire (sync protocol v5) are what would let compaction
-    ///   tell the two apart.
+    ///   the WAL grows until a push to that peer happens. Telling the two apart
+    ///   needs a direction-aware cursor on the wire; protocol v5 deliberately
+    ///   did not add one, and that work is assigned to a later protocol
+    ///   version.
     ///
     /// Call this periodically (e.g., daily) to reclaim disk space.
     /// Returns the number of WAL events deleted.
@@ -3457,6 +3458,18 @@ impl PulseDB {
 
     /// Applies a synced experience update from a remote peer.
     ///
+    /// Returns whether a record was actually updated. `false` means the target
+    /// was **absent**, so nothing was written — the update was discarded, not
+    /// applied.
+    ///
+    /// **0.8.0 source break:** this returned `Result<()>` and swallowed that
+    /// answer. Discarding it let the sync applier report an update whose target
+    /// did not exist as a success, which let the sender's `push_sequence` move
+    /// past it — and `compact_wal` then free to delete the create the update
+    /// depended on. The caller must decide what an absent target means; the
+    /// sync applier treats it as
+    /// [`SyncError::MissingDependency`](crate::sync::SyncError::MissingDependency).
+    ///
     /// Caller must hold `SyncApplyGuard` to suppress WAL recording.
     #[cfg(feature = "sync")]
     #[allow(dead_code)] // Called by sync applier (Phase 3)
@@ -3464,10 +3477,14 @@ impl PulseDB {
         &self,
         id: ExperienceId,
         update: ExperienceUpdate,
-    ) -> Result<()> {
-        self.storage.update_experience(id, &update)?;
-        debug!(id = %id, "Synced experience update applied");
-        Ok(())
+    ) -> Result<bool> {
+        let updated = self.storage.update_experience(id, &update)?;
+        if updated {
+            debug!(id = %id, "Synced experience update applied");
+        } else {
+            debug!(id = %id, "Synced experience update discarded: no such record");
+        }
+        Ok(updated)
     }
 
     /// Merges synced G-counter reinforcement fields from a remote peer.

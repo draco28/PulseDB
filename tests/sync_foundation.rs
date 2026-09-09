@@ -11,8 +11,8 @@ use pulsedb::sync::guard::{is_sync_applying, SyncApplyGuard};
 use pulsedb::sync::transport::SyncTransport;
 use pulsedb::sync::transport_mem::InMemorySyncTransport;
 use pulsedb::sync::types::{
-    HandshakeRequest, InstanceId, PullRequest, SyncChange, SyncCursor, SyncEntityType, SyncPayload,
-    SyncPosition, SyncStatus,
+    HandshakeRequest, InstanceId, PullRequest, PushRequest, SyncChange, SyncCursor, SyncEntityType,
+    SyncPayload, SyncPosition, SyncStatus,
 };
 use pulsedb::sync::SYNC_PROTOCOL_VERSION;
 use pulsedb::{Collective, CollectiveId, Config, Timestamp};
@@ -384,9 +384,13 @@ fn test_sync_apply_guard_resets_on_panic() {
 // ============================================================================
 
 fn make_change(seq: u64, cid: CollectiveId) -> SyncChange {
+    make_change_from(seq, cid, InstanceId::new())
+}
+
+fn make_change_from(seq: u64, cid: CollectiveId, source: InstanceId) -> SyncChange {
     SyncChange {
         sequence: seq,
-        source_instance: InstanceId::new(),
+        source_instance: source,
         collective_id: cid,
         entity_type: SyncEntityType::Collective,
         payload: SyncPayload::CollectiveCreated(Collective {
@@ -401,92 +405,145 @@ fn make_change(seq: u64, cid: CollectiveId) -> SyncChange {
     }
 }
 
+/// A routed pull addressed to `target`.
+fn pull_request(target: InstanceId, from: u64, batch_size: u64) -> PullRequest {
+    PullRequest {
+        protocol_version: SYNC_PROTOCOL_VERSION,
+        source_instance: InstanceId::new(),
+        target_instance: target,
+        cursor: SyncPosition::new(target, from),
+        batch_size,
+        reply_limit_bytes: 64 * 1024 * 1024,
+        collectives: None,
+    }
+}
+
+/// A routed push from `source` to `target`.
+fn push_request(source: InstanceId, target: InstanceId, changes: Vec<SyncChange>) -> PushRequest {
+    PushRequest {
+        protocol_version: SYNC_PROTOCOL_VERSION,
+        source_instance: source,
+        target_instance: target,
+        reply_limit_bytes: 64 * 1024 * 1024,
+        changes,
+    }
+}
+
 #[tokio::test]
 async fn test_memory_transport_full_roundtrip() {
     let (local, remote) = InMemorySyncTransport::new_pair();
     let cid = CollectiveId::new();
+    let sender = InstanceId::new();
 
     // Handshake
     let hs_req = HandshakeRequest {
-        instance_id: InstanceId::new(),
+        instance_id: sender,
         protocol_version: SYNC_PROTOCOL_VERSION,
         capabilities: vec!["push".into(), "pull".into()],
     };
     let hs_resp = local.handshake(hs_req).await.unwrap();
     assert!(hs_resp.accepted);
     assert_eq!(hs_resp.protocol_version, SYNC_PROTOCOL_VERSION);
+    assert_eq!(
+        hs_resp.receive_limit_bytes as usize,
+        local.receive_limit_bytes(),
+        "the handshake advertises the responder's ACTUAL inbound limit"
+    );
 
     // Health check
     assert!(local.health_check().await.is_ok());
     assert!(remote.health_check().await.is_ok());
 
-    // Push changes from local
+    // Push changes into the SENDER's lane.
     let changes = vec![
-        make_change(1, cid),
-        make_change(2, cid),
-        make_change(3, cid),
+        make_change_from(1, cid, sender),
+        make_change_from(2, cid, sender),
+        make_change_from(3, cid, sender),
     ];
-    let push_resp = local.push_changes(changes).await.unwrap();
-    assert_eq!(push_resp.accepted, 3);
-    assert_eq!(push_resp.rejected, 0);
+    let ack = local
+        .push_changes(push_request(sender, local.instance_id(), changes))
+        .await
+        .unwrap()
+        .into_result(local.instance_id())
+        .unwrap();
+    assert_eq!(ack.accepted, 3);
+    assert_eq!(ack.rejected, 0);
+    assert_eq!(ack.total, 3);
+    assert_eq!(
+        ack.wal_owner, sender,
+        "a push acknowledges a position in the SENDER's WAL"
+    );
 
-    // Pull changes from remote (shared buffer)
-    let pull_req = PullRequest {
-        cursor: SyncPosition::new(remote.instance_id(), 0),
-        batch_size: 500,
-        collectives: None,
-    };
-    let pull_resp = remote.pull_changes(pull_req).await.unwrap();
-    assert_eq!(pull_resp.changes.len(), 3);
-    assert!(!pull_resp.has_more);
+    // A pull reads the addressed peer's OWN lane, which the push did not touch.
+    let page = remote
+        .pull_changes(pull_request(remote.instance_id(), 0, 500))
+        .await
+        .unwrap()
+        .into_result(remote.instance_id())
+        .unwrap();
+    assert!(
+        page.changes.is_empty(),
+        "push and pull are separate lanes: one peer's WAL is not the other's"
+    );
 
-    // Verify sequence ordering
-    assert_eq!(pull_resp.changes[0].sequence, 1);
-    assert_eq!(pull_resp.changes[1].sequence, 2);
-    assert_eq!(pull_resp.changes[2].sequence, 3);
+    // Seeded into the peer's own lane, the same changes come back in order.
+    remote.seed(vec![
+        make_change_from(1, cid, remote.instance_id()),
+        make_change_from(2, cid, remote.instance_id()),
+        make_change_from(3, cid, remote.instance_id()),
+    ]);
+    let page = remote
+        .pull_changes(pull_request(remote.instance_id(), 0, 500))
+        .await
+        .unwrap()
+        .into_result(remote.instance_id())
+        .unwrap();
+    assert_eq!(page.changes.len(), 3);
+    assert!(!page.has_more);
+    assert_eq!(page.changes[0].sequence, 1);
+    assert_eq!(page.changes[1].sequence, 2);
+    assert_eq!(page.changes[2].sequence, 3);
+    assert_eq!(page.scan_position.instance_id, remote.instance_id());
+    assert_eq!(page.scan_position.sequence, 3);
 }
 
 #[tokio::test]
 async fn test_memory_transport_incremental_pull() {
-    let (local, remote) = InMemorySyncTransport::new_pair();
+    let (_local, remote) = InMemorySyncTransport::new_pair();
     let cid = CollectiveId::new();
+    let peer = remote.instance_id();
 
-    // Push 5 changes
-    let changes: Vec<SyncChange> = (1..=5).map(|s| make_change(s, cid)).collect();
-    local.push_changes(changes).await.unwrap();
+    remote.seed((1..=5).map(|s| make_change_from(s, cid, peer)).collect());
 
-    // Pull first batch (size 2)
-    let pull1 = PullRequest {
-        cursor: SyncPosition::new(remote.instance_id(), 0),
-        batch_size: 2,
-        collectives: None,
-    };
-    let resp1 = remote.pull_changes(pull1).await.unwrap();
-    assert_eq!(resp1.changes.len(), 2);
-    assert!(resp1.has_more);
-    assert_eq!(resp1.new_cursor.sequence, 2);
+    let page1 = remote
+        .pull_changes(pull_request(peer, 0, 2))
+        .await
+        .unwrap()
+        .into_result(peer)
+        .unwrap();
+    assert_eq!(page1.changes.len(), 2);
+    assert!(page1.has_more);
+    assert_eq!(page1.scan_position.sequence, 2);
 
-    // Pull next batch from cursor
-    let pull2 = PullRequest {
-        cursor: resp1.new_cursor,
-        batch_size: 2,
-        collectives: None,
-    };
-    let resp2 = remote.pull_changes(pull2).await.unwrap();
-    assert_eq!(resp2.changes.len(), 2);
-    assert!(resp2.has_more);
-    assert_eq!(resp2.new_cursor.sequence, 4);
+    let page2 = remote
+        .pull_changes(pull_request(peer, page1.scan_position.sequence, 2))
+        .await
+        .unwrap()
+        .into_result(peer)
+        .unwrap();
+    assert_eq!(page2.changes.len(), 2);
+    assert!(page2.has_more);
+    assert_eq!(page2.scan_position.sequence, 4);
 
-    // Pull remainder
-    let pull3 = PullRequest {
-        cursor: resp2.new_cursor,
-        batch_size: 100,
-        collectives: None,
-    };
-    let resp3 = remote.pull_changes(pull3).await.unwrap();
-    assert_eq!(resp3.changes.len(), 1);
-    assert!(!resp3.has_more);
-    assert_eq!(resp3.new_cursor.sequence, 5);
+    let page3 = remote
+        .pull_changes(pull_request(peer, page2.scan_position.sequence, 100))
+        .await
+        .unwrap()
+        .into_result(peer)
+        .unwrap();
+    assert_eq!(page3.changes.len(), 1);
+    assert!(!page3.has_more);
+    assert_eq!(page3.scan_position.sequence, 5);
 }
 
 // ============================================================================
@@ -596,9 +653,15 @@ fn test_sync_config_postcard_roundtrip() {
 // ============================================================================
 
 #[test]
-fn test_protocol_version_is_four() {
-    // Bumped 3→4 in VS-4.3.2 work-1.04 (tags field on Experience + SerializableExperienceUpdate).
-    assert_eq!(SYNC_PROTOCOL_VERSION, 4);
+fn recovery_v5_protocol_and_wire_versions_are_five_and_four() {
+    // Bumped 4→5 in 0.8.0: wire-carried embeddings, routed requests,
+    // responder-named replies and exact body budgets. There is no v4
+    // interoperability — both replicas upgrade.
+    assert_eq!(SYNC_PROTOCOL_VERSION, 5);
+    // The frame header moved in lockstep: it grew an operation byte, so a v4
+    // frame is not a v5 frame even where the body would have decoded.
+    assert_eq!(pulsedb::sync::WIRE_FORMAT_VERSION, 4);
+    assert_eq!(pulsedb::sync::SYNC_WIRE_PREAMBLE_LEN, 4);
 }
 
 // ============================================================================

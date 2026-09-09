@@ -59,7 +59,7 @@ fn bench_sync_change_serialization(c: &mut Criterion) {
         source_instance: InstanceId::new(),
         collective_id: cid,
         entity_type: SyncEntityType::Experience,
-        payload: SyncPayload::ExperienceCreated(exp),
+        payload: SyncPayload::ExperienceCreated(exp.into()),
         timestamp: Timestamp::now(),
     };
 
@@ -79,7 +79,7 @@ fn bench_sync_change_deserialization(c: &mut Criterion) {
         source_instance: InstanceId::new(),
         collective_id: cid,
         entity_type: SyncEntityType::Experience,
-        payload: SyncPayload::ExperienceCreated(exp),
+        payload: SyncPayload::ExperienceCreated(exp.into()),
         timestamp: Timestamp::now(),
     };
     let bytes = postcard::to_stdvec(&change).unwrap();

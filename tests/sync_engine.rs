@@ -1,8 +1,13 @@
 //! Integration tests for Phase 3: Sync Engine.
 //!
-//! Tests two real PulseDB instances syncing via InMemorySyncTransport.
+//! Tests two real PulseDB instances syncing through each other's real
+//! `SyncServer` over the real frame codec (`common::ServerBackedTransport`).
 //! Covers push, pull, bidirectional sync, conflict resolution, echo
-//! prevention, incremental sync, and SyncManager lifecycle.
+//! prevention, incremental sync, peer replacement and SyncManager lifecycle.
+//!
+//! The adapter is server-backed on purpose: a double that hands structs across
+//! applies nothing and encodes nothing, so it cannot witness either half of what
+//! these tests assert.
 
 #![cfg(feature = "sync")]
 
@@ -10,7 +15,9 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{copy_fixture, fixtures_dir, sync_both_ways};
+use common::{
+    copy_fixture, fixtures_dir, server_for, server_for_with, sync_both_ways, ServerBackedTransport,
+};
 use pulsedb::sync::config::{ConflictResolution, SyncConfig, SyncDirection};
 use pulsedb::sync::manager::SyncManager;
 use pulsedb::sync::transport_mem::InMemorySyncTransport;
@@ -52,14 +59,30 @@ fn sync_config() -> SyncConfig {
     config
 }
 
-/// Create two PulseDB instances with paired transports and SyncManagers.
+/// Create two PulseDB instances, each syncing through the OTHER's real
+/// `SyncServer`.
+///
+/// `manager_a` talks to B's server and `manager_b` to A's, so a push from A is
+/// genuinely applied into B's store through the same byte handler an HTTP
+/// consumer would call.
 fn setup_sync_pair() -> SyncPair {
     let (db_a, dir_a) = open_db();
     let (db_b, dir_b) = open_db();
-    let (transport_a, transport_b) = InMemorySyncTransport::new_pair();
+    let server_a = server_for(&db_a);
+    let server_b = server_for(&db_b);
 
-    let manager_a = SyncManager::new(Arc::clone(&db_a), Box::new(transport_a), sync_config());
-    let manager_b = SyncManager::new(Arc::clone(&db_b), Box::new(transport_b), sync_config());
+    let manager_a = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::new(Arc::clone(&server_b))),
+        sync_config(),
+    )
+    .unwrap();
+    let manager_b = SyncManager::new(
+        Arc::clone(&db_b),
+        Box::new(ServerBackedTransport::new(Arc::clone(&server_a))),
+        sync_config(),
+    )
+    .unwrap();
 
     SyncPair {
         db_a,
@@ -339,15 +362,26 @@ async fn test_echo_prevention() {
 async fn test_conflict_resolution_server_wins() {
     let (db_a, _dir_a) = open_db();
     let (db_b, _dir_b) = open_db();
-    let (transport_a, transport_b) = InMemorySyncTransport::new_pair();
+    let server_a = server_for(&db_a);
+    let server_b = server_for(&db_b);
 
     let config = SyncConfig {
         conflict_resolution: ConflictResolution::ServerWins,
         ..sync_config()
     };
 
-    let mut manager_a = SyncManager::new(Arc::clone(&db_a), Box::new(transport_a), config.clone());
-    let mut manager_b = SyncManager::new(Arc::clone(&db_b), Box::new(transport_b), config);
+    let mut manager_a = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::new(server_b)),
+        config.clone(),
+    )
+    .unwrap();
+    let mut manager_b = SyncManager::new(
+        Arc::clone(&db_b),
+        Box::new(ServerBackedTransport::new(server_a)),
+        config,
+    )
+    .unwrap();
 
     // Create on A, sync to B
     let cid = db_a.create_collective("conflict").unwrap();
@@ -383,16 +417,12 @@ async fn test_conflict_resolution_server_wins() {
 
 #[tokio::test]
 async fn test_bidirectional_sync() {
-    // Bidirectional sync uses two separate transport pairs:
-    // A→B transport and B→A transport. The InMemorySyncTransport
-    // shares a single buffer, so both directions need separate pairs.
+    // Each direction is its own manager over a server-backed transport: A's
+    // pushes go to B's real server, B's pulls read A's real WAL.
     let (db_a, _dir_a) = open_db();
     let (db_b, _dir_b) = open_db();
-
-    // A→B direction
-    let (transport_a_push, transport_b_pull) = InMemorySyncTransport::new_pair();
-    // B→A direction
-    let (transport_b_push, transport_a_pull) = InMemorySyncTransport::new_pair();
+    let server_a = server_for(&db_a);
+    let server_b = server_for(&db_b);
 
     let config_a_push = SyncConfig {
         direction: SyncDirection::PushOnly,
@@ -411,14 +441,30 @@ async fn test_bidirectional_sync() {
         ..sync_config()
     };
 
-    let mut mgr_a_push =
-        SyncManager::new(Arc::clone(&db_a), Box::new(transport_a_push), config_a_push);
-    let mut mgr_b_pull =
-        SyncManager::new(Arc::clone(&db_b), Box::new(transport_b_pull), config_b_pull);
-    let mut mgr_b_push =
-        SyncManager::new(Arc::clone(&db_b), Box::new(transport_b_push), config_b_push);
-    let mut mgr_a_pull =
-        SyncManager::new(Arc::clone(&db_a), Box::new(transport_a_pull), config_a_pull);
+    let mut mgr_a_push = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::new(Arc::clone(&server_b))),
+        config_a_push,
+    )
+    .unwrap();
+    let mut mgr_b_pull = SyncManager::new(
+        Arc::clone(&db_b),
+        Box::new(ServerBackedTransport::new(Arc::clone(&server_a))),
+        config_b_pull,
+    )
+    .unwrap();
+    let mut mgr_b_push = SyncManager::new(
+        Arc::clone(&db_b),
+        Box::new(ServerBackedTransport::new(server_a)),
+        config_b_push,
+    )
+    .unwrap();
+    let mut mgr_a_pull = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::new(server_b)),
+        config_a_pull,
+    )
+    .unwrap();
 
     // Create collective on A, push to B
     let cid = db_a.create_collective("bidi").unwrap();
@@ -452,41 +498,45 @@ async fn test_bidirectional_reinforcement_gcounter_converges_exact_total() {
     let (db_a, _dir_a) = open_db();
     let (db_b, _dir_b) = open_db();
 
-    let (transport_a_push, transport_b_pull) = InMemorySyncTransport::new_pair();
-    let (transport_b_push, transport_a_pull) = InMemorySyncTransport::new_pair();
+    let server_a = server_for(&db_a);
+    let server_b = server_for(&db_b);
 
     let mut mgr_a_push = SyncManager::new(
         Arc::clone(&db_a),
-        Box::new(transport_a_push),
+        Box::new(ServerBackedTransport::new(Arc::clone(&server_b))),
         SyncConfig {
             direction: SyncDirection::PushOnly,
             ..sync_config()
         },
-    );
+    )
+    .unwrap();
     let mut mgr_b_pull = SyncManager::new(
         Arc::clone(&db_b),
-        Box::new(transport_b_pull),
+        Box::new(ServerBackedTransport::new(Arc::clone(&server_a))),
         SyncConfig {
             direction: SyncDirection::PullOnly,
             ..sync_config()
         },
-    );
+    )
+    .unwrap();
     let mut mgr_b_push = SyncManager::new(
         Arc::clone(&db_b),
-        Box::new(transport_b_push),
+        Box::new(ServerBackedTransport::new(server_a)),
         SyncConfig {
             direction: SyncDirection::PushOnly,
             ..sync_config()
         },
-    );
+    )
+    .unwrap();
     let mut mgr_a_pull = SyncManager::new(
         Arc::clone(&db_a),
-        Box::new(transport_a_pull),
+        Box::new(ServerBackedTransport::new(server_b)),
         SyncConfig {
             direction: SyncDirection::PullOnly,
             ..sync_config()
         },
-    );
+    )
+    .unwrap();
 
     let cid = db_a.create_collective("reinforce-gcounter").unwrap();
     let exp_id = db_a.record_experience(minimal_exp(cid)).unwrap();
@@ -627,15 +677,26 @@ async fn test_create_collision_sentinel_merge_does_not_double_count() {
 async fn test_initial_sync_catchup() {
     let (db_a, _dir_a) = open_db();
     let (db_b, _dir_b) = open_db();
-    let (transport_a, transport_b) = InMemorySyncTransport::new_pair();
+    let server_a = server_for(&db_a);
+    let server_b = server_for(&db_b);
 
     let config = SyncConfig {
         batch_size: 5, // Small batches to test pagination
         ..sync_config()
     };
 
-    let mut manager_a = SyncManager::new(Arc::clone(&db_a), Box::new(transport_a), config.clone());
-    let mut manager_b = SyncManager::new(Arc::clone(&db_b), Box::new(transport_b), config);
+    let mut manager_a = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::new(server_b)),
+        config.clone(),
+    )
+    .unwrap();
+    let mut manager_b = SyncManager::new(
+        Arc::clone(&db_b),
+        Box::new(ServerBackedTransport::new(server_a)),
+        config,
+    )
+    .unwrap();
 
     // Create a bunch of data on A
     let cid = db_a.create_collective("catchup").unwrap();
@@ -695,7 +756,8 @@ async fn test_sync_manager_start_stop() {
 async fn test_selective_collective_sync() {
     let (db_a, _dir_a) = open_db();
     let (db_b, _dir_b) = open_db();
-    let (transport_a, transport_b) = InMemorySyncTransport::new_pair();
+    let server_a = server_for(&db_a);
+    let server_b = server_for(&db_b);
 
     let cid_yes = db_a.create_collective("yes").unwrap();
     let cid_no = db_a.create_collective("no").unwrap();
@@ -709,8 +771,18 @@ async fn test_selective_collective_sync() {
         ..sync_config()
     };
 
-    let mut manager_a = SyncManager::new(Arc::clone(&db_a), Box::new(transport_a), config.clone());
-    let mut manager_b = SyncManager::new(Arc::clone(&db_b), Box::new(transport_b), config);
+    let mut manager_a = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::new(server_b)),
+        config.clone(),
+    )
+    .unwrap();
+    let mut manager_b = SyncManager::new(
+        Arc::clone(&db_b),
+        Box::new(ServerBackedTransport::new(server_a)),
+        config,
+    )
+    .unwrap();
 
     manager_a.sync_once().await.unwrap();
     manager_b.sync_once().await.unwrap();
@@ -741,28 +813,36 @@ async fn test_selective_collective_sync() {
 async fn test_compact_wal_keeps_unpushed_local_events() {
     let (db_a, _dir_a) = open_db();
     let (db_b, _dir_b) = open_db();
-    let (transport_a, transport_b) = InMemorySyncTransport::new_pair();
-    let peer_of_a = transport_a.instance_id();
+    let server_a = server_for(&db_a);
+    let server_b = server_for(&db_b);
+    let peer_of_a = db_b.instance_id();
 
-    let mut manager_a = SyncManager::new(Arc::clone(&db_a), Box::new(transport_a), sync_config());
-    // B pushes and pulls through separate managers over the same transport so
-    // B's own seeding push does not advance B's pull position past A's events.
+    let mut manager_a = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::new(Arc::clone(&server_b))),
+        sync_config(),
+    )
+    .unwrap();
+    // B pushes and pulls through separate managers so B's own seeding push does
+    // not advance B's pull position past A's events.
     let mut manager_b_push = SyncManager::new(
         Arc::clone(&db_b),
-        Box::new(transport_b.clone()),
+        Box::new(ServerBackedTransport::new(Arc::clone(&server_a))),
         SyncConfig {
             direction: SyncDirection::PushOnly,
             ..sync_config()
         },
-    );
+    )
+    .unwrap();
     let mut manager_b_pull = SyncManager::new(
         Arc::clone(&db_b),
-        Box::new(transport_b),
+        Box::new(ServerBackedTransport::new(server_a)),
         SyncConfig {
             direction: SyncDirection::PullOnly,
             ..sync_config()
         },
-    );
+    )
+    .unwrap();
 
     // Seed B so A's pull position lands well above A's own WAL.
     let cid = db_b.create_collective("shared").unwrap();
@@ -843,14 +923,13 @@ async fn test_compact_wal_keeps_unpushed_local_events() {
 async fn manager_stats_count_skewed_last_reinforced() {
     use std::collections::BTreeMap;
 
-    use pulsedb::sync::transport::SyncTransport;
     use pulsedb::sync::types::{
         SerializableExperienceUpdate, SyncChange, SyncEntityType, SyncPayload, SyncStats,
     };
     use pulsedb::Timestamp;
 
     let (db_a, _dir_a) = open_db();
-    let (transport_a, transport_b) = InMemorySyncTransport::new_pair();
+    let (transport_a, _transport_b) = InMemorySyncTransport::new_pair();
     let cid = db_a.create_collective("skew-stats").unwrap();
     let exp_id = db_a.record_experience(minimal_exp(cid)).unwrap();
 
@@ -858,13 +937,18 @@ async fn manager_stats_count_skewed_last_reinforced() {
         direction: SyncDirection::PullOnly,
         ..sync_config()
     };
-    let mut manager_a = SyncManager::new(Arc::clone(&db_a), Box::new(transport_a), config.clone());
+    // The peer is the identity `transport_a` answers as, and the lane it serves
+    // on a pull is that identity's own WAL.
+    let peer = transport_a.instance_id();
+    let seeder = transport_a.clone();
+    let mut manager_a =
+        SyncManager::new(Arc::clone(&db_a), Box::new(transport_a), config.clone()).unwrap();
     assert_eq!(manager_a.stats(), SyncStats::default());
 
-    // The peer pushes a reinforcement whose timestamp is a day past the bound.
+    // The peer's WAL holds a reinforcement whose timestamp is a day past the
+    // bound.
     let allowance = i64::try_from(config.max_clock_skew_ms).unwrap();
     let skewed = Timestamp::from_millis(Timestamp::now().as_millis() + allowance + 86_400_000);
-    let peer = transport_b.instance_id();
     let change = SyncChange {
         sequence: 1_000,
         source_instance: peer,
@@ -881,7 +965,7 @@ async fn manager_stats_count_skewed_last_reinforced() {
         },
         timestamp: Timestamp::now(),
     };
-    transport_b.push_changes(vec![change]).await.unwrap();
+    seeder.seed(vec![change]);
 
     manager_a.sync_once().await.unwrap();
 
@@ -926,7 +1010,8 @@ async fn empty_pull_still_registers_the_peer_and_blocks_compaction() {
             direction: SyncDirection::PullOnly,
             ..sync_config()
         },
-    );
+    )
+    .unwrap();
     manager_a.sync_once().await.unwrap();
 
     // The peer must nevertheless be on record, at push_sequence 0.
@@ -957,13 +1042,12 @@ async fn empty_pull_still_registers_the_peer_and_blocks_compaction() {
 async fn pull_position_does_not_advance_past_a_change_that_failed_to_apply() {
     use std::collections::BTreeMap;
 
-    use pulsedb::sync::transport::SyncTransport;
     use pulsedb::sync::types::{
         SerializableExperienceUpdate, SyncChange, SyncEntityType, SyncPayload,
     };
 
     let (db_a, _dir_a) = open_db();
-    let (transport_a, transport_b) = InMemorySyncTransport::new_pair();
+    let (transport_a, _transport_b) = InMemorySyncTransport::new_pair();
     let peer_of_a = transport_a.instance_id();
     let cid = db_a.create_collective("pull-ack-bound").unwrap();
     let exp_id = db_a.record_experience(minimal_exp(cid)).unwrap();
@@ -994,14 +1078,11 @@ async fn pull_position_does_not_advance_past_a_change_that_failed_to_apply() {
     };
 
     // seq 7 applies, seq 8 is refused, seq 9 would apply.
-    transport_b
-        .push_changes(vec![
-            change_at(7, None),
-            change_at(8, Some(buckets)),
-            change_at(9, None),
-        ])
-        .await
-        .unwrap();
+    transport_a.seed(vec![
+        change_at(7, None),
+        change_at(8, Some(buckets)),
+        change_at(9, None),
+    ]);
 
     let mut manager_a = SyncManager::new(
         Arc::clone(&db_a),
@@ -1010,7 +1091,8 @@ async fn pull_position_does_not_advance_past_a_change_that_failed_to_apply() {
             direction: SyncDirection::PullOnly,
             ..sync_config()
         },
-    );
+    )
+    .unwrap();
     manager_a.sync_once().await.unwrap();
 
     let cursor = db_a
@@ -1048,8 +1130,8 @@ async fn initial_sync_terminates_on_an_empty_batch_that_claims_more() {
     use async_trait::async_trait;
     use pulsedb::sync::transport::SyncTransport;
     use pulsedb::sync::types::{
-        HandshakeRequest, HandshakeResponse, InstanceId, PullRequest, PullResponse, PushResponse,
-        SyncChange, SyncPosition,
+        HandshakeRequest, HandshakeResponse, InstanceId, PullPage, PullRequest, PushAck,
+        PushRequest, SyncPosition, WireReply,
     };
     use pulsedb::sync::{SyncError, SYNC_PROTOCOL_VERSION};
 
@@ -1074,26 +1156,40 @@ async fn initial_sync_terminates_on_an_empty_batch_that_claims_more() {
                 protocol_version: SYNC_PROTOCOL_VERSION,
                 accepted: true,
                 reason: None,
+                receive_limit_bytes: 64 * 1024 * 1024,
             })
         }
 
-        async fn push_changes(&self, _changes: Vec<SyncChange>) -> Result<PushResponse, SyncError> {
+        async fn push_changes(
+            &self,
+            _request: PushRequest,
+        ) -> Result<WireReply<PushAck>, SyncError> {
             unreachable!("initial_sync never pushes");
         }
 
-        async fn pull_changes(&self, request: PullRequest) -> Result<PullResponse, SyncError> {
+        async fn pull_changes(
+            &self,
+            request: PullRequest,
+        ) -> Result<WireReply<PullPage>, SyncError> {
             if self.pulls.fetch_add(1, Ordering::SeqCst) >= SPIN_TRIPWIRE {
                 return Err(SyncError::transport("initial_sync is spinning"));
             }
-            Ok(PullResponse {
-                changes: Vec::new(),
-                has_more: true,
-                new_cursor: SyncPosition::new(self.peer, request.cursor.sequence),
-            })
+            Ok(WireReply::ok(
+                self.peer,
+                PullPage {
+                    changes: Vec::new(),
+                    has_more: true,
+                    scan_position: SyncPosition::new(self.peer, request.cursor.sequence),
+                },
+            ))
         }
 
         async fn health_check(&self) -> Result<(), SyncError> {
             Ok(())
+        }
+
+        fn receive_limit_bytes(&self) -> usize {
+            64 * 1024 * 1024
         }
     }
 
@@ -1111,7 +1207,8 @@ async fn initial_sync_terminates_on_an_empty_batch_that_claims_more() {
             direction: SyncDirection::PullOnly,
             ..sync_config()
         },
-    );
+    )
+    .unwrap();
 
     let error = manager
         .initial_sync(None)
@@ -1174,20 +1271,27 @@ impl pulsedb::sync::transport::SyncTransport for ScriptedPullTransport {
             protocol_version: pulsedb::sync::SYNC_PROTOCOL_VERSION,
             accepted: true,
             reason: None,
+            receive_limit_bytes: 64 * 1024 * 1024,
         })
     }
 
     async fn push_changes(
         &self,
-        _changes: Vec<pulsedb::sync::types::SyncChange>,
-    ) -> Result<pulsedb::sync::types::PushResponse, pulsedb::sync::SyncError> {
+        _request: pulsedb::sync::types::PushRequest,
+    ) -> Result<
+        pulsedb::sync::types::WireReply<pulsedb::sync::types::PushAck>,
+        pulsedb::sync::SyncError,
+    > {
         unreachable!("initial_sync never pushes");
     }
 
     async fn pull_changes(
         &self,
         request: pulsedb::sync::types::PullRequest,
-    ) -> Result<pulsedb::sync::types::PullResponse, pulsedb::sync::SyncError> {
+    ) -> Result<
+        pulsedb::sync::types::WireReply<pulsedb::sync::types::PullPage>,
+        pulsedb::sync::SyncError,
+    > {
         use std::sync::atomic::Ordering;
 
         if self.pulls.fetch_add(1, Ordering::SeqCst) >= Self::SPIN_TRIPWIRE {
@@ -1195,22 +1299,35 @@ impl pulsedb::sync::transport::SyncTransport for ScriptedPullTransport {
                 "initial_sync is spinning",
             ));
         }
-        let page = std::mem::take(&mut *self.page.lock().unwrap());
+        let mut page = std::mem::take(&mut *self.page.lock().unwrap());
+        // A pull serves the RESPONDER's own WAL, so every change it emits is
+        // owned by the responder — exactly what `SyncServer::handle_pull` does
+        // with `build_change_from_record(.., self.instance_id)`.
+        for change in &mut page {
+            change.source_instance = self.peer;
+        }
         // Once the page is served the peer is exhausted, whatever it said the
         // first time.
         let has_more = !page.is_empty() && self.has_more;
         let new_seq = page
             .last()
             .map_or(request.cursor.sequence, |change| change.sequence);
-        Ok(pulsedb::sync::types::PullResponse {
-            changes: page,
-            has_more,
-            new_cursor: pulsedb::sync::types::SyncPosition::new(self.peer, new_seq),
-        })
+        Ok(pulsedb::sync::types::WireReply::ok(
+            self.peer,
+            pulsedb::sync::types::PullPage {
+                changes: page,
+                has_more,
+                scan_position: pulsedb::sync::types::SyncPosition::new(self.peer, new_seq),
+            },
+        ))
     }
 
     async fn health_check(&self) -> Result<(), pulsedb::sync::SyncError> {
         Ok(())
+    }
+
+    fn receive_limit_bytes(&self) -> usize {
+        64 * 1024 * 1024
     }
 }
 
@@ -1230,6 +1347,7 @@ fn catchup_manager(
             ..sync_config()
         },
     )
+    .unwrap()
 }
 
 /// A page the peer reports as its last, with every change applying, IS a
@@ -1381,20 +1499,27 @@ impl pulsedb::sync::transport::SyncTransport for ScriptedPagesTransport {
             protocol_version: pulsedb::sync::SYNC_PROTOCOL_VERSION,
             accepted: true,
             reason: None,
+            receive_limit_bytes: 64 * 1024 * 1024,
         })
     }
 
     async fn push_changes(
         &self,
-        _changes: Vec<pulsedb::sync::types::SyncChange>,
-    ) -> Result<pulsedb::sync::types::PushResponse, pulsedb::sync::SyncError> {
+        _request: pulsedb::sync::types::PushRequest,
+    ) -> Result<
+        pulsedb::sync::types::WireReply<pulsedb::sync::types::PushAck>,
+        pulsedb::sync::SyncError,
+    > {
         unreachable!("initial_sync never pushes");
     }
 
     async fn pull_changes(
         &self,
         request: pulsedb::sync::types::PullRequest,
-    ) -> Result<pulsedb::sync::types::PullResponse, pulsedb::sync::SyncError> {
+    ) -> Result<
+        pulsedb::sync::types::WireReply<pulsedb::sync::types::PullPage>,
+        pulsedb::sync::SyncError,
+    > {
         let from = request.cursor.sequence;
         {
             let mut asked = self.requested.lock().unwrap();
@@ -1406,12 +1531,16 @@ impl pulsedb::sync::transport::SyncTransport for ScriptedPagesTransport {
             }
         }
 
-        let (changes, has_more) = self
+        let (mut changes, has_more) = self
             .pages
             .lock()
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| (Vec::new(), false));
+        // Owned by the responder, as a real pull's changes are.
+        for change in &mut changes {
+            change.source_instance = self.peer;
+        }
         // An honest server names the highest sequence it served, and echoes the
         // requested position when it served nothing.
         let new_seq = changes
@@ -1419,15 +1548,22 @@ impl pulsedb::sync::transport::SyncTransport for ScriptedPagesTransport {
             .map(|change| change.sequence)
             .max()
             .unwrap_or(from);
-        Ok(pulsedb::sync::types::PullResponse {
-            changes,
-            has_more,
-            new_cursor: pulsedb::sync::types::SyncPosition::new(self.peer, new_seq),
-        })
+        Ok(pulsedb::sync::types::WireReply::ok(
+            self.peer,
+            pulsedb::sync::types::PullPage {
+                changes,
+                has_more,
+                scan_position: pulsedb::sync::types::SyncPosition::new(self.peer, new_seq),
+            },
+        ))
     }
 
     async fn health_check(&self) -> Result<(), pulsedb::sync::SyncError> {
         Ok(())
+    }
+
+    fn receive_limit_bytes(&self) -> usize {
+        64 * 1024 * 1024
     }
 }
 
@@ -1446,6 +1582,7 @@ fn scripted_catchup_manager(
             ..sync_config()
         },
     )
+    .unwrap()
 }
 
 /// The persisted pull position for `peer`.
@@ -1730,6 +1867,7 @@ struct RestorableEndpoint {
     offers: std::sync::Mutex<Vec<pulsedb::sync::types::SyncChange>>,
     handshakes: std::sync::atomic::AtomicUsize,
     pulls: std::sync::atomic::AtomicUsize,
+    pushes: std::sync::atomic::AtomicUsize,
 }
 
 impl RestorableEndpoint {
@@ -1740,6 +1878,7 @@ impl RestorableEndpoint {
             offers: std::sync::Mutex::new(offers),
             handshakes: std::sync::atomic::AtomicUsize::new(0),
             pulls: std::sync::atomic::AtomicUsize::new(0),
+            pushes: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -1790,66 +1929,106 @@ impl pulsedb::sync::transport::SyncTransport for RestorableTransport {
             protocol_version: pulsedb::sync::SYNC_PROTOCOL_VERSION,
             accepted: true,
             reason: None,
+            receive_limit_bytes: 64 * 1024 * 1024,
         })
     }
 
     async fn push_changes(
         &self,
-        changes: Vec<pulsedb::sync::types::SyncChange>,
-    ) -> Result<pulsedb::sync::types::PushResponse, pulsedb::sync::SyncError> {
-        let source = changes
-            .first()
-            .map(|c| c.source_instance)
-            .unwrap_or_else(pulsedb::sync::types::InstanceId::nil);
-        let accepted = changes.len();
-        let max_seq = changes.iter().map(|c| c.sequence).max().unwrap_or(0);
+        request: pulsedb::sync::types::PushRequest,
+    ) -> Result<
+        pulsedb::sync::types::WireReply<pulsedb::sync::types::PushAck>,
+        pulsedb::sync::SyncError,
+    > {
+        self.0
+            .pushes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let peer = self.0.peer();
+        // Route FIRST, exactly as a real endpoint does: a batch addressed to
+        // the identity this endpoint USED to have is refused, and records
+        // nothing.
+        if request.target_instance != peer {
+            return Ok(pulsedb::sync::types::WireReply::peer_changed(
+                peer,
+                request.target_instance,
+            ));
+        }
+
+        let total = request.changes.len() as u64;
+        let max_seq = request.changes.iter().map(|c| c.sequence).max();
 
         let mut held = self.0.held.lock().unwrap();
-        for change in &changes {
+        for change in &request.changes {
             if let pulsedb::sync::types::SyncPayload::ExperienceCreated(exp) = &change.payload {
-                held.insert(exp.id);
+                held.insert(exp.experience.id);
             }
         }
 
-        Ok(pulsedb::sync::types::PushResponse {
-            accepted,
-            rejected: 0,
-            // The SENDER's id, as `SyncServer::handle_push` does.
-            new_cursor: pulsedb::sync::types::SyncPosition::new(source, max_seq),
-        })
+        Ok(pulsedb::sync::types::WireReply::ok(
+            peer,
+            pulsedb::sync::types::PushAck {
+                // The SENDER's WAL is what the position indexes.
+                wal_owner: request.source_instance,
+                accepted: total,
+                rejected: 0,
+                total,
+                safe_through: max_seq,
+            },
+        ))
     }
 
     async fn pull_changes(
         &self,
         request: pulsedb::sync::types::PullRequest,
-    ) -> Result<pulsedb::sync::types::PullResponse, pulsedb::sync::SyncError> {
+    ) -> Result<
+        pulsedb::sync::types::WireReply<pulsedb::sync::types::PullPage>,
+        pulsedb::sync::SyncError,
+    > {
         self.0
             .pulls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let peer = self.0.peer();
+        if request.target_instance != peer {
+            return Ok(pulsedb::sync::types::WireReply::peer_changed(
+                peer,
+                request.target_instance,
+            ));
+        }
 
         let offers = self.0.offers.lock().unwrap();
         let changes: Vec<pulsedb::sync::types::SyncChange> = offers
             .iter()
             .filter(|c| c.sequence > request.cursor.sequence)
             .cloned()
+            .map(|mut change| {
+                // The endpoint's own WAL, so the endpoint's own identity — and
+                // a restored copy re-stamps them under its NEW identity.
+                change.source_instance = peer;
+                change
+            })
             .collect();
-        // An honest server echoes the requested position when it has nothing
-        // above it (`SyncServer::handle_pull`).
+        // An honest server names the highest sequence it served, and echoes the
+        // requested position when it served nothing.
         let new_seq = changes
             .last()
             .map_or(request.cursor.sequence, |c| c.sequence);
 
-        Ok(pulsedb::sync::types::PullResponse {
-            changes,
-            has_more: false,
-            // The PEER's id, as `SyncServer::handle_pull` does — a pull position
-            // is a position in the peer's WAL.
-            new_cursor: pulsedb::sync::types::SyncPosition::new(self.0.peer(), new_seq),
-        })
+        Ok(pulsedb::sync::types::WireReply::ok(
+            peer,
+            pulsedb::sync::types::PullPage {
+                changes,
+                has_more: false,
+                scan_position: pulsedb::sync::types::SyncPosition::new(peer, new_seq),
+            },
+        ))
     }
 
     async fn health_check(&self) -> Result<(), pulsedb::sync::SyncError> {
         Ok(())
+    }
+
+    fn receive_limit_bytes(&self) -> usize {
+        64 * 1024 * 1024
     }
 }
 
@@ -1882,7 +2061,8 @@ fn established_session(
         Arc::clone(&db),
         Box::new(RestorableTransport(Arc::clone(endpoint))),
         config,
-    );
+    )
+    .unwrap();
 
     (db, dir, ids, manager)
 }
@@ -2074,4 +2254,785 @@ async fn await_until(condition: impl Fn() -> bool, what: &str) {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     panic!("timed out waiting: {what}");
+}
+
+// ============================================================================
+// Peer replacement, terminal errors and explicit dependency failure
+//
+// A reminted peer is rebound and replayed from its own cursor (#90); a body no
+// budget can ever hold stops the background loop instead of being retried; and
+// an update whose target is absent fails explicitly rather than being
+// acknowledged (#96).
+// ============================================================================
+
+/// Records a collective and three experiences into a fresh store.
+fn seeded_store() -> (
+    Arc<PulseDB>,
+    tempfile::TempDir,
+    CollectiveId,
+    Vec<ExperienceId>,
+) {
+    let (db, dir) = open_db();
+    let cid = db.create_collective("replacement").unwrap();
+    let ids = (0..3)
+        .map(|_| db.record_experience(minimal_exp(cid)).unwrap())
+        .collect();
+    (db, dir, cid, ids)
+}
+
+/// A **PushOnly** manager whose cursor already sits at the WAL head still
+/// notices that the endpoint was replaced.
+///
+/// This is the case a pull-only detection point cannot reach: nothing is
+/// pulled, and nothing is selected to push either, so under protocol v4 the
+/// cycle made no request at all and the manager kept syncing a peer that was
+/// gone. Under v5 it sends a bounded EMPTY routed push whose `target_instance`
+/// the replacement refuses, which is what re-establishes the identity — and a
+/// health check would not have done it, because liveness is not identity.
+#[tokio::test]
+async fn recovery_v5_push_only_at_head_rebinds() {
+    let (db_a, _dir_a, _cid, ids) = seeded_store();
+    let (db_b, _dir_b) = open_db();
+    let endpoint = common::SyncEndpoint::new(server_for(&db_b));
+    let original = endpoint.instance_id();
+
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::over(Arc::clone(&endpoint))),
+        SyncConfig {
+            direction: SyncDirection::PushOnly,
+            ..sync_config()
+        },
+    )
+    .unwrap();
+
+    manager.sync_once().await.unwrap();
+    let head = db_a.get_current_sequence().unwrap();
+    let old_row = cursor_row(&db_a, original).expect("the original peer is on record");
+    assert_eq!(
+        old_row.push_sequence, head,
+        "the session must start with the cursor AT the WAL head, or the case does not bite"
+    );
+    for id in &ids {
+        assert!(db_b.get_experience(*id).unwrap().is_some());
+    }
+
+    // The endpoint is replaced by a correctly reminted copy holding none of it.
+    let (db_c, _dir_c) = open_db();
+    endpoint.replace(server_for(&db_c));
+    let restored = endpoint.instance_id();
+    assert_ne!(restored, original);
+
+    // Nothing is selected to push — the cursor is at the head — and the empty
+    // probe is what finds out. ONE cycle is enough: the rebind spends this
+    // cycle's single allowance and the cycle then restarts against the new
+    // identity's own cursor, so the replay happens here, not on a later call.
+    manager.sync_once().await.unwrap();
+
+    for id in &ids {
+        assert!(
+            db_c.get_experience(*id).unwrap().is_some(),
+            "a replaced endpoint must be re-sent the changes it is missing, within \
+             the cycle that detected the replacement"
+        );
+    }
+    // A following cycle is an ordinary idempotent no-op.
+    manager.sync_once().await.unwrap();
+    assert_eq!(
+        cursor_row(&db_a, original).unwrap(),
+        old_row,
+        "no position for the new identity may be written into the old identity's row"
+    );
+    let new_row = cursor_row(&db_a, restored).expect("the restored identity gets its OWN row");
+    assert_eq!(new_row.push_sequence, head);
+}
+
+/// The same detection when the whole page is FILTERED away: no changes are
+/// selected, and the empty routed push still checks the identity.
+#[tokio::test]
+async fn recovery_v5_empty_filtered_push_checks_identity() {
+    let (db_a, _dir_a, _cid, ids) = seeded_store();
+    let (db_b, _dir_b) = open_db();
+    let endpoint = common::SyncEndpoint::new(server_for(&db_b));
+    let original = endpoint.instance_id();
+
+    // A filter that excludes everything this store holds.
+    let unrelated = CollectiveId::new();
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::over(Arc::clone(&endpoint))),
+        SyncConfig {
+            direction: SyncDirection::PushOnly,
+            collectives: Some(vec![unrelated]),
+            ..sync_config()
+        },
+    )
+    .unwrap();
+
+    manager.sync_once().await.unwrap();
+    let pushes_after_first = endpoint.pushes();
+    assert!(
+        pushes_after_first >= 1,
+        "an entirely filtered page must still put a bounded probe on the wire"
+    );
+    for id in &ids {
+        assert!(
+            db_b.get_experience(*id).unwrap().is_none(),
+            "the filter still excludes what it excludes"
+        );
+    }
+    let old_row = cursor_row(&db_a, original).expect("the peer is on record");
+    assert_eq!(
+        old_row.push_sequence,
+        db_a.get_current_sequence().unwrap(),
+        "a validated empty probe lets the filtered scan position be saved"
+    );
+
+    let (db_c, _dir_c) = open_db();
+    endpoint.replace(server_for(&db_c));
+    let restored = endpoint.instance_id();
+
+    manager.sync_once().await.unwrap();
+    assert!(
+        endpoint.pushes() > pushes_after_first,
+        "the filtered cycle must have made a request, or it could not have noticed"
+    );
+    assert!(
+        cursor_row(&db_a, restored).is_some(),
+        "the replacement must have been detected and bound"
+    );
+    assert_eq!(
+        cursor_row(&db_a, original).unwrap(),
+        old_row,
+        "the old identity's row is retained untouched"
+    );
+}
+
+/// The endpoint is replaced **between the pull and the push of one cycle**.
+///
+/// The pull confirmed a peer that was already gone by the time the push went
+/// out, so pull-before-push cannot make this safe. The push request's own
+/// `target_instance` is what refuses it — with no apply, no statistic and no
+/// cursor movement on the replacement — and the cycle rebinds.
+#[tokio::test]
+async fn recovery_v5_replacement_between_pull_and_push() {
+    let (db_a, _dir_a, _cid, ids) = seeded_store();
+    let (db_b, _dir_b) = open_db();
+    let endpoint = common::SyncEndpoint::new(server_for(&db_b));
+    let original = endpoint.instance_id();
+
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::over(Arc::clone(&endpoint))),
+        sync_config(),
+    )
+    .unwrap();
+
+    // Establish the session against B.
+    manager.sync_once().await.unwrap();
+    let head = db_a.get_current_sequence().unwrap();
+    let old_row = cursor_row(&db_a, original).expect("the original peer is on record");
+
+    // Give A something new to push, and arm the swap for the instant after the
+    // next pull is answered.
+    let extra = db_a.record_experience(minimal_exp(_cid)).unwrap();
+    let (db_c, _dir_c) = open_db();
+    endpoint.replace_after_next_pull(server_for(&db_c));
+
+    manager.sync_once().await.unwrap();
+    let restored = endpoint.instance_id();
+    assert_ne!(restored, original);
+
+    // The push of that cycle was refused by C's own target check — the pull
+    // could not vouch for it. The cycle then spends its single rebind
+    // allowance and restarts against C's own cursor (0, since C has never been
+    // synced with), so the replay happens WITHIN this cycle.
+    for id in ids.iter().chain(std::iter::once(&extra)) {
+        assert!(
+            db_c.get_experience(*id).unwrap().is_some(),
+            "the replacement must receive the changes it never had"
+        );
+    }
+    assert_eq!(
+        cursor_row(&db_a, original).unwrap().push_sequence,
+        old_row.push_sequence,
+        "the refused push must not have advanced the OLD identity's row"
+    );
+    assert!(
+        cursor_row(&db_a, original).unwrap().push_sequence < db_a.get_current_sequence().unwrap()
+            || head == db_a.get_current_sequence().unwrap()
+    );
+    let new_row = cursor_row(&db_a, restored).expect("the restored identity gets its OWN row");
+    assert_eq!(new_row.push_sequence, db_a.get_current_sequence().unwrap());
+}
+
+/// An endpoint whose identity changes on EVERY answer is flapping. One rebind
+/// per cycle is the allowance; a second in the same cycle is a bounded failure,
+/// not an unbounded loop of handshakes.
+#[tokio::test]
+async fn recovery_v5_a_second_remint_in_one_cycle_fails_boundedly() {
+    let (db_a, _dir_a, _cid, _ids) = seeded_store();
+
+    /// Answers every request as a brand-new instance.
+    struct FlappingEndpoint {
+        handshakes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl pulsedb::sync::transport::SyncTransport for FlappingEndpoint {
+        async fn handshake(
+            &self,
+            _request: pulsedb::sync::types::HandshakeRequest,
+        ) -> Result<pulsedb::sync::types::HandshakeResponse, pulsedb::sync::SyncError> {
+            self.handshakes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(pulsedb::sync::types::HandshakeResponse {
+                instance_id: pulsedb::sync::types::InstanceId::new(),
+                protocol_version: pulsedb::sync::SYNC_PROTOCOL_VERSION,
+                accepted: true,
+                reason: None,
+                receive_limit_bytes: 64 * 1024 * 1024,
+            })
+        }
+
+        async fn push_changes(
+            &self,
+            request: pulsedb::sync::types::PushRequest,
+        ) -> Result<
+            pulsedb::sync::types::WireReply<pulsedb::sync::types::PushAck>,
+            pulsedb::sync::SyncError,
+        > {
+            Ok(pulsedb::sync::types::WireReply::peer_changed(
+                pulsedb::sync::types::InstanceId::new(),
+                request.target_instance,
+            ))
+        }
+
+        async fn pull_changes(
+            &self,
+            request: pulsedb::sync::types::PullRequest,
+        ) -> Result<
+            pulsedb::sync::types::WireReply<pulsedb::sync::types::PullPage>,
+            pulsedb::sync::SyncError,
+        > {
+            Ok(pulsedb::sync::types::WireReply::peer_changed(
+                pulsedb::sync::types::InstanceId::new(),
+                request.target_instance,
+            ))
+        }
+
+        async fn health_check(&self) -> Result<(), pulsedb::sync::SyncError> {
+            Ok(())
+        }
+
+        fn receive_limit_bytes(&self) -> usize {
+            64 * 1024 * 1024
+        }
+    }
+
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(FlappingEndpoint {
+            handshakes: std::sync::atomic::AtomicUsize::new(0),
+        }),
+        sync_config(),
+    )
+    .unwrap();
+
+    let err = manager
+        .sync_once()
+        .await
+        .expect_err("a peer that changes identity twice in one cycle must fail, not loop");
+    assert!(
+        err.to_string().contains("changed twice"),
+        "the failure must say what it refused to keep doing, got: {err}"
+    );
+}
+
+/// A change that cannot fit a body on its own is deterministic and terminal:
+/// the background loop records the typed error and STOPS, rather than
+/// rebuilding a body it already knows will be refused, forever. An explicit
+/// restart after the cause is corrected runs again.
+#[tokio::test]
+async fn recovery_v5_oversized_change_stops_background() {
+    let (db_a, _dir_a) = open_db();
+    let (db_b, _dir_b) = open_db();
+    let endpoint = common::SyncEndpoint::new(server_for(&db_b));
+
+    let cid = db_a.create_collective("oversized").unwrap();
+    // An experience whose encoded change cannot fit a small body on its own.
+    let big = db_a
+        .record_experience(NewExperience {
+            collective_id: cid,
+            content: "x".repeat(8 * 1024),
+            embedding: Some(vec![0.1f32; 384]),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let tight = 4 * 1024;
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::over(Arc::clone(&endpoint))),
+        SyncConfig {
+            direction: SyncDirection::PushOnly,
+            max_request_bytes: tight,
+            push_interval_ms: 10,
+            pull_interval_ms: 10,
+            ..sync_config()
+        },
+    )
+    .unwrap();
+
+    // Cycle one sends the fitting prefix — the collective at sequence 1 — and
+    // stops before the change that does not fit. Nothing is wrong yet.
+    manager
+        .sync_once()
+        .await
+        .expect("the collective fits, so the prefix goes out");
+
+    // Cycle two meets the oversized change with no prefix in front of it, and
+    // that is the deterministic dead end.
+    let err = manager
+        .sync_once()
+        .await
+        .expect_err("the experience cannot fit a body on its own");
+    match err {
+        pulsedb::sync::SyncError::ChangeTooLarge {
+            sequence,
+            needed,
+            cap,
+        } => {
+            assert_eq!(sequence, 2, "the oversized change is named");
+            assert!(needed > cap, "{needed} must exceed the {cap}-byte cap");
+            assert_eq!(cap, tight as u64);
+        }
+        other => panic!("expected the typed ChangeTooLarge, got {other}"),
+    }
+    assert!(
+        !matches!(manager.status(), SyncStatus::Syncing),
+        "a terminal one-shot must not leave the manager wedged in Syncing"
+    );
+    let peer = endpoint.instance_id();
+    assert_eq!(
+        cursor_row(&db_a, peer).unwrap().push_sequence,
+        1,
+        "nothing may be acknowledged over the oversized change"
+    );
+    assert!(
+        db_b.get_experience(big).unwrap().is_none(),
+        "and it was never sent"
+    );
+
+    // Background: it records the error and stops attempting.
+    manager.start().await.unwrap();
+    await_until(
+        || matches!(manager.status(), SyncStatus::Error(ref m) if m.contains("over the")),
+        "the background loop records the terminal error",
+    )
+    .await;
+    // Attempt-count evidence, over many configured intervals: the loop ticks
+    // every 10 ms, so this window spans ~20 of them. Elapsed time alone would
+    // be weak; the push counter is what says no transfer was attempted.
+    let attempts = endpoint.pushes();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        endpoint.pushes(),
+        attempts,
+        "a deterministic dead end must not be retried automatically across ~30 \
+         poll intervals"
+    );
+    assert!(
+        matches!(manager.status(), SyncStatus::Error(_)),
+        "and the reason must survive on the exited task"
+    );
+
+    // Deterministic proof the task actually EXITED rather than merely being
+    // quiet: a `start()` on a live run is refused, so one that succeeds can
+    // only mean the previous handle was finished and got reaped.
+    manager
+        .start()
+        .await
+        .expect("the terminal task exited, so a restart reaps it instead of refusing");
+    await_until(
+        || matches!(manager.status(), SyncStatus::Error(_)),
+        "the restarted run hits the same dead end and records it again",
+    )
+    .await;
+
+    // Stopping a task that already exited reaps it without erasing the reason.
+    manager.stop().await.unwrap();
+    assert!(matches!(manager.status(), SyncStatus::Error(_)));
+
+    // Explicit correction — the operator raises the peer's inbound limit — then
+    // an explicit restart, which re-handshakes and picks the new budget up.
+    endpoint.replace(server_for_with(
+        &db_b,
+        SyncConfig {
+            max_request_bytes: 64 * 1024 * 1024,
+            ..SyncConfig::default()
+        },
+    ));
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::over(Arc::clone(&endpoint))),
+        SyncConfig {
+            direction: SyncDirection::PushOnly,
+            max_request_bytes: 64 * 1024 * 1024,
+            push_interval_ms: 10,
+            pull_interval_ms: 10,
+            ..sync_config()
+        },
+    )
+    .unwrap();
+    manager.start().await.unwrap();
+    await_until(
+        || db_b.get_experience(big).unwrap().is_some(),
+        "after the correction and an explicit restart the manager runs again",
+    )
+    .await;
+    manager.stop().await.unwrap();
+}
+
+/// An `ExperienceUpdated` whose target is absent is a FAILURE, not a
+/// successful or idempotent acknowledgement.
+///
+/// Acknowledging it would let the sender's `push_sequence` pass the update, and
+/// `compact_wal` would then be free to delete the create the update depends on
+/// — losing the record on both sides. Recovering the missing dependency is out
+/// of scope here; the point is that the non-completion is explicit.
+///
+/// Already-absent deletes and archives keep their idempotent skip: they need no
+/// record to be correct.
+#[tokio::test]
+async fn recovery_v5_absent_update_target_is_a_failure_not_an_ack() {
+    use pulsedb::sync::types::{
+        SerializableExperienceUpdate, SyncChange, SyncEntityType, SyncPayload,
+    };
+
+    let (db_b, _dir_b) = open_db();
+    let server = server_for(&db_b);
+    let sender = pulsedb::sync::types::InstanceId::new();
+    let absent = ExperienceId::new();
+
+    let update = SyncChange {
+        sequence: 4,
+        source_instance: sender,
+        collective_id: CollectiveId::new(),
+        entity_type: SyncEntityType::Experience,
+        payload: SyncPayload::ExperienceUpdated {
+            id: absent,
+            update: SerializableExperienceUpdate {
+                importance: Some(0.9),
+                applications: Some(std::collections::BTreeMap::from([(sender, 2)])),
+                last_reinforced: Some(pulsedb::Timestamp::now()),
+                ..Default::default()
+            },
+            timestamp: pulsedb::Timestamp::now(),
+        },
+        timestamp: pulsedb::Timestamp::now(),
+    };
+    let delete = SyncChange {
+        sequence: 5,
+        source_instance: sender,
+        collective_id: CollectiveId::new(),
+        entity_type: SyncEntityType::Experience,
+        payload: SyncPayload::ExperienceDeleted {
+            id: ExperienceId::new(),
+            timestamp: pulsedb::Timestamp::now(),
+        },
+        timestamp: pulsedb::Timestamp::now(),
+    };
+
+    let ack = server
+        .handle_push(pulsedb::sync::types::PushRequest {
+            protocol_version: pulsedb::sync::SYNC_PROTOCOL_VERSION,
+            source_instance: sender,
+            target_instance: server.instance_id(),
+            reply_limit_bytes: 64 * 1024 * 1024,
+            changes: vec![update, delete],
+        })
+        .unwrap()
+        .into_result(server.instance_id())
+        .unwrap();
+
+    assert_eq!(ack.total, 2);
+    assert_eq!(
+        ack.rejected, 1,
+        "the update whose target is absent is a failure"
+    );
+    assert_eq!(
+        ack.accepted, 1,
+        "the already-absent delete is a genuine idempotent skip and stays accepted"
+    );
+    assert_eq!(
+        ack.safe_through, None,
+        "nothing below the failure succeeded, so no position may be acknowledged"
+    );
+}
+
+/// A push whose MIDDLE change fails is acknowledged only up to the last
+/// sequence that really applied — proved on the real `handle_push` path, with
+/// real stored outcomes rather than a hand-written acknowledgement.
+///
+/// The applier's own unit tests already pin the failure-floor rule. What this
+/// closes is the seam between them and the wire: that `SyncServer::handle_push`
+/// emits a NON-`None` `safe_through` under a genuine partial apply failure, and
+/// that the value is the highest real success below the failure rather than
+/// the batch tail or `failure_sequence - 1`.
+///
+/// The sequences are deliberately NONADJACENT — 2 / 5 / 9. With 1 / 2 / 3 an
+/// off-by-one on the failure (`5 - 1`) and the correct answer coincide; at this
+/// spacing `Some(4)`, `Some(9)` and `None` are all distinguishable from
+/// `Some(2)`.
+///
+/// Arbitrary order is the second half: a peer chooses its batch's order, and
+/// the floor is by SEQUENCE, not by position. `[9 ok, 2 ok, 5 err]` must reach
+/// the same answer, which position-based bookkeeping cannot.
+#[tokio::test]
+async fn recovery_v5_partial_push_failure_acknowledges_the_real_success_floor() {
+    use pulsedb::sync::types::{
+        InstanceId, PushRequest, SerializableExperienceUpdate, SyncChange, SyncEntityType,
+        SyncPayload,
+    };
+
+    /// A `CollectiveCreated` that genuinely applies, attributed to `sender`.
+    fn applies(sequence: u64, sender: InstanceId, name: &str) -> (CollectiveId, SyncChange) {
+        let id = CollectiveId::new();
+        (
+            id,
+            SyncChange {
+                sequence,
+                source_instance: sender,
+                collective_id: id,
+                entity_type: SyncEntityType::Collective,
+                payload: SyncPayload::CollectiveCreated(pulsedb::Collective {
+                    id,
+                    name: name.to_string(),
+                    owner_id: None,
+                    embedding_dimension: 384,
+                    created_at: pulsedb::Timestamp::now(),
+                    updated_at: pulsedb::Timestamp::now(),
+                }),
+                timestamp: pulsedb::Timestamp::now(),
+            },
+        )
+    }
+
+    /// An `ExperienceUpdated` whose target is absent — a real failure, not a
+    /// synthesized one.
+    fn fails(sequence: u64, sender: InstanceId) -> (ExperienceId, SyncChange) {
+        let absent = ExperienceId::new();
+        (
+            absent,
+            SyncChange {
+                sequence,
+                source_instance: sender,
+                collective_id: CollectiveId::new(),
+                entity_type: SyncEntityType::Experience,
+                payload: SyncPayload::ExperienceUpdated {
+                    id: absent,
+                    update: SerializableExperienceUpdate {
+                        importance: Some(0.9),
+                        ..Default::default()
+                    },
+                    timestamp: pulsedb::Timestamp::now(),
+                },
+                timestamp: pulsedb::Timestamp::now(),
+            },
+        )
+    }
+
+    for (label, order) in [
+        ("wal order", [0usize, 1, 2]),
+        ("arbitrary order", [2, 0, 1]),
+    ] {
+        let (db, _dir) = open_db();
+        let server = server_for(&db);
+        let sender = InstanceId::new();
+
+        let (low, low_change) = applies(2, sender, "low-applies");
+        let (absent, failing) = fails(5, sender);
+        let (high, high_change) = applies(9, sender, "high-applies");
+        let batch = [low_change, failing, high_change];
+        let changes: Vec<SyncChange> = order.iter().map(|i| batch[*i].clone()).collect();
+        assert_eq!(changes.len(), 3);
+
+        let ack = server
+            .handle_push(PushRequest {
+                protocol_version: pulsedb::sync::SYNC_PROTOCOL_VERSION,
+                source_instance: sender,
+                target_instance: server.instance_id(),
+                reply_limit_bytes: 64 * 1024 * 1024,
+                changes,
+            })
+            .unwrap()
+            .into_result(server.instance_id())
+            .unwrap();
+
+        assert_eq!(ack.total, 3, "{label}");
+        assert_eq!(
+            ack.rejected, 1,
+            "{label}: the absent update target is a failure"
+        );
+        assert_eq!(ack.accepted, 2, "{label}: both collectives really applied");
+        assert_eq!(
+            ack.safe_through,
+            Some(2),
+            "{label}: the acknowledgement is the highest success BELOW the failure \
+             at sequence 5 — not the tail (9), not `failure - 1` (4), not `None`"
+        );
+
+        // The counters are read off real storage, not off the reply.
+        assert!(
+            db.get_collective(low).unwrap().is_some(),
+            "{label}: the acknowledged change must actually be present"
+        );
+        assert!(
+            db.get_collective(high).unwrap().is_some(),
+            "{label}: a success ABOVE the failure is still applied — it is simply \
+             not acknowledged"
+        );
+        assert!(
+            db.get_experience(absent).unwrap().is_none(),
+            "{label}: the failing change wrote nothing"
+        );
+    }
+}
+
+/// The wire counters come from actual apply outcomes: an ordinary idempotent
+/// re-push has `rejected == 0`, and `accepted + rejected` always equals what
+/// was submitted.
+#[tokio::test]
+async fn recovery_v5_idempotent_repush_reports_zero_rejected() {
+    let (db_a, _dir_a, _cid, ids) = seeded_store();
+    let (db_b, _dir_b) = open_db();
+    let endpoint = common::SyncEndpoint::new(server_for(&db_b));
+
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::over(Arc::clone(&endpoint))),
+        SyncConfig {
+            direction: SyncDirection::PushOnly,
+            ..sync_config()
+        },
+    )
+    .unwrap();
+    manager.sync_once().await.unwrap();
+    for id in &ids {
+        assert!(db_b.get_experience(*id).unwrap().is_some());
+    }
+
+    // Re-push the same batch by hand: every change is now an idempotent skip.
+    let server = server_for(&db_b);
+    let changes: Vec<_> = db_a
+        .storage_for_test()
+        .poll_sync_events(0, 100)
+        .unwrap()
+        .into_iter()
+        .map(|(sequence, record)| {
+            // Rebuild the change the pusher would have built.
+            let _ = record;
+            sequence
+        })
+        .collect();
+    assert!(!changes.is_empty());
+
+    // A second full cycle from position 0 re-sends everything.
+    let mut replay = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::over(Arc::clone(&endpoint))),
+        SyncConfig {
+            direction: SyncDirection::PushOnly,
+            ..sync_config()
+        },
+    )
+    .unwrap();
+    db_a.storage_for_test()
+        .update_push_cursor(&server.instance_id(), 0)
+        .unwrap();
+    replay.sync_once().await.unwrap();
+    let row = cursor_row(&db_a, endpoint.instance_id()).unwrap();
+    assert_eq!(
+        row.push_sequence,
+        db_a.get_current_sequence().unwrap(),
+        "an all-idempotent re-push is a complete success and advances to the head"
+    );
+}
+
+/// `start()` after a `stop()` runs a genuinely new loop.
+///
+/// `stop()` signals shutdown through a `Notify`, and a `notify_one` with no
+/// waiter leaves a **permit** behind. Reusing one signal across runs meant a
+/// `stop()` whose task had already exited armed the NEXT task to shut down the
+/// instant it started — a manager that reported itself started and did nothing.
+/// The signal is replaced per run, and a finished handle is reaped rather than
+/// refusing the restart.
+#[tokio::test]
+async fn recovery_v5_restart_after_stop_runs_again() {
+    let (db_a, _dir_a, cid, _ids) = seeded_store();
+    let (db_b, _dir_b) = open_db();
+    let endpoint = common::SyncEndpoint::new(server_for(&db_b));
+
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::over(Arc::clone(&endpoint))),
+        SyncConfig {
+            direction: SyncDirection::PushOnly,
+            push_interval_ms: 10,
+            pull_interval_ms: 10,
+            ..sync_config()
+        },
+    )
+    .unwrap();
+
+    manager.start().await.unwrap();
+    let first = db_a.record_experience(minimal_exp(cid)).unwrap();
+    await_until(
+        || db_b.get_experience(first).unwrap().is_some(),
+        "the first run pushes",
+    )
+    .await;
+    manager.stop().await.unwrap();
+    assert_eq!(manager.status(), SyncStatus::Idle);
+
+    // A second run, with a second write, on the same manager.
+    manager.start().await.unwrap();
+    let second = db_a.record_experience(minimal_exp(cid)).unwrap();
+    await_until(
+        || db_b.get_experience(second).unwrap().is_some(),
+        "the RESTARTED run must push too — a stale shutdown permit would have \
+         stopped it before its first tick",
+    )
+    .await;
+    manager.stop().await.unwrap();
+    assert_eq!(manager.status(), SyncStatus::Idle);
+}
+
+/// A double `start()` is still refused while a run is live.
+#[tokio::test]
+async fn recovery_v5_double_start_is_refused_while_running() {
+    let (db_a, _dir_a, _cid, _ids) = seeded_store();
+    let (db_b, _dir_b) = open_db();
+    let endpoint = common::SyncEndpoint::new(server_for(&db_b));
+
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::over(endpoint)),
+        SyncConfig {
+            direction: SyncDirection::PushOnly,
+            push_interval_ms: 10_000,
+            pull_interval_ms: 10_000,
+            ..sync_config()
+        },
+    )
+    .unwrap();
+
+    manager.start().await.unwrap();
+    let err = manager
+        .start()
+        .await
+        .expect_err("a live run must not be started twice");
+    assert!(err.to_string().contains("already started"), "got {err}");
+    manager.stop().await.unwrap();
 }

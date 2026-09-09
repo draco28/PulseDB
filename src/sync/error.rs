@@ -91,6 +91,111 @@ pub enum SyncError {
     #[error("Invalid sync payload: {0}")]
     InvalidPayload(String),
 
+    /// A frame carried the right magic and wire-format version but the wrong
+    /// **operation** discriminator — a push body delivered to the pull
+    /// endpoint, say.
+    ///
+    /// Caught by raw byte inspection of the frame header, like
+    /// [`SyncError::WireFormatMismatch`], so a misrouted body never reaches the
+    /// decoder. Protocol v4 framed only the handshake and carried no operation
+    /// byte at all, which is why an unframed v4 push or pull body surfaces as a
+    /// wire-format mismatch rather than this variant.
+    #[error("Sync wire operation mismatch: this endpoint serves operation {expected}, got {got}")]
+    WireOperationMismatch {
+        /// The operation discriminator this endpoint serves.
+        expected: u8,
+        /// The operation discriminator the frame carried.
+        got: u8,
+    },
+
+    /// The endpoint answered under an instance id other than the one the
+    /// request was addressed to — a remint, a restored snapshot, or a different
+    /// instance behind the same address.
+    ///
+    /// Raised on both legs. A **server** returns it (as
+    /// `WireResult::PeerChanged`) when a routed request names a
+    /// `target_instance` that is not its own, and applies nothing: no storage
+    /// write, no statistic, no WAL event, no cursor movement. A **client**
+    /// raises it when a reply's `responder` is not the identity it is bound to.
+    ///
+    /// This is identity consistency, not authentication: it says the exchange
+    /// reached a different peer, not that the peer is untrusted.
+    #[error("Sync peer changed: expected instance {expected}, endpoint answered as {responder}")]
+    PeerChanged {
+        /// The identity the exchange was addressed to.
+        expected: InstanceId,
+        /// The identity that actually answered.
+        responder: InstanceId,
+    },
+
+    /// One individual change cannot fit a sync body on its own, so no batch
+    /// containing it can ever be sent.
+    ///
+    /// This is **deterministic and terminal**, not transient: the same change
+    /// rebuilt on the next cycle is the same size against the same cap. The
+    /// background loop therefore records
+    /// [`SyncStatus::Error`](super::types::SyncStatus::Error) and stops
+    /// retrying rather than resending a body it already knows will not fit, and
+    /// a one-shot call returns this error. The change's cursor is left
+    /// unadvanced, so nothing is acknowledged over it.
+    ///
+    /// Correcting it is an operator action — raise the peer's
+    /// `max_request_bytes`, or the transport's receive limit — after which
+    /// [`SyncManager::start`](super::manager::SyncManager::start) runs again.
+    #[error(
+        "Sync change {sequence} needs {needed} bytes on its own, over the {cap}-byte body cap"
+    )]
+    ChangeTooLarge {
+        /// The WAL sequence of the change that cannot fit.
+        sequence: u64,
+        /// The exact frame size that one change alone requires.
+        needed: u64,
+        /// The effective body cap it was measured against.
+        cap: u64,
+    },
+
+    /// The peer refused the request with a compact structured reason.
+    ///
+    /// The detail is bounded on the wire
+    /// ([`MAX_WIRE_DETAIL_BYTES`](super::types::MAX_WIRE_DETAIL_BYTES)) — a
+    /// reply never carries an unbounded message or a per-change failure vector.
+    #[error("Sync request rejected by peer: {code:?}: {detail}")]
+    RemoteRejected {
+        /// The machine-readable rejection code.
+        code: super::types::WireErrorCode,
+        /// A bounded human-readable detail.
+        detail: String,
+    },
+
+    /// An apply could not run because the record it depends on is absent.
+    ///
+    /// Returned for an `ExperienceUpdated` whose target does not exist locally,
+    /// and for a storage update that reported no row changed. It is a
+    /// **failure**, never an idempotent skip: acknowledging it would let the
+    /// sender compact away the create this update needs. Recovering the missing
+    /// dependency is outside this repair — the point of the variant is that the
+    /// non-completion is explicit rather than papered over.
+    ///
+    /// Already-absent deletes and archives keep their existing idempotent-skip
+    /// behaviour; they need no record to be correct.
+    #[error("Sync change depends on {entity} {id}, which is absent locally")]
+    MissingDependency {
+        /// The kind of record the change depends on.
+        entity: &'static str,
+        /// Its id, as text.
+        id: String,
+    },
+
+    /// A [`SyncConfig`](super::config::SyncConfig) or transport pairing was
+    /// refused at construction.
+    ///
+    /// [`SyncManager::new`](super::manager::SyncManager::new) and
+    /// `SyncServer::new` validate before anything is built, so an unusable
+    /// configuration fails at the call that made it rather than on the first
+    /// cycle. 0.8.0 source break: both return `Result`.
+    #[error("Invalid sync configuration: {0}")]
+    Config(String),
+
     /// A one-shot catch-up ([`SyncManager::initial_sync`]) stopped before it had
     /// pulled everything the peer holds, so its completion cannot be claimed.
     ///
@@ -209,6 +314,64 @@ impl SyncError {
             position,
             reason: format!("{failed} change(s) failed to apply"),
         }
+    }
+
+    /// Creates a configuration error with the given message.
+    pub fn config(msg: impl Into<String>) -> Self {
+        Self::Config(msg.into())
+    }
+
+    /// Creates a [`SyncError::MissingDependency`] for an absent experience.
+    pub fn missing_experience(id: impl std::fmt::Display) -> Self {
+        Self::MissingDependency {
+            entity: "experience",
+            id: id.to_string(),
+        }
+    }
+
+    /// Returns true if the exchange reached a different peer identity.
+    pub fn is_peer_changed(&self) -> bool {
+        matches!(self, Self::PeerChanged { .. })
+    }
+
+    /// Returns true if a single change is too large to ever be sent — the
+    /// deterministic, terminal failure the background loop stops retrying on.
+    pub fn is_change_too_large(&self) -> bool {
+        matches!(self, Self::ChangeTooLarge { .. })
+    }
+
+    /// Returns true if a frame carried the wrong operation discriminator.
+    pub fn is_wire_operation_mismatch(&self) -> bool {
+        matches!(self, Self::WireOperationMismatch { .. })
+    }
+
+    /// Returns true if an apply was refused because a record it depends on is
+    /// absent locally.
+    pub fn is_missing_dependency(&self) -> bool {
+        matches!(self, Self::MissingDependency { .. })
+    }
+
+    /// Returns true if a constructor refused the configuration.
+    pub fn is_config(&self) -> bool {
+        matches!(self, Self::Config(_))
+    }
+
+    /// Returns true if the incompatibility is one a **protocol v5 peer reports
+    /// about a peer that is not v5** — a wire-format mismatch (an unframed or
+    /// wrong-version body, which is what protocol v4 produces), a wrong
+    /// operation discriminator, or a negotiated protocol-version mismatch.
+    ///
+    /// v5 does not interoperate with v4 and offers no fallback: both replicas
+    /// upgrade. This predicate is the typed hook a v5 client matches on. It
+    /// makes no promise about what an *old* client understands — a v4 peer
+    /// predates every error type here.
+    pub fn is_protocol_incompatible(&self) -> bool {
+        matches!(
+            self,
+            Self::WireFormatMismatch { .. }
+                | Self::WireOperationMismatch { .. }
+                | Self::ProtocolVersion { .. }
+        )
     }
 
     /// Returns true if this is a transport error.

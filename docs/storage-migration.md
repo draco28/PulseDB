@@ -88,9 +88,13 @@ therefore land in the slot `compact_wal` trusted, and compaction deleted local e
 been pushed (issue #9). Schema v5 splits the record into
 `SyncCursor { instance_id, push_sequence, pull_sequence }`: `push_sequence` is the local WAL sequence
 the peer has acknowledged, `pull_sequence` is the remote WAL sequence applied locally, and
-`compact_wal` uses `min(push_sequence)` only. The wire format is unchanged (`SYNC_PROTOCOL_VERSION`
-stays 4): pull/push messages carry a single-direction `SyncPosition { instance_id, sequence }` whose
-bytes equal the old wire cursor.
+`compact_wal` uses `min(push_sequence)` only.
+
+**Disk schema and sync protocol are independent version axes.** This migration is about the *stored*
+record and is unaffected by the protocol. `SyncPosition { instance_id, sequence }` — whose bytes
+still equal the old wire cursor — is the single-direction position carried in `PullRequest::cursor`
+and `PullPage::scan_position`. The 0.8.0 sync protocol is **v5** and does not interoperate with v4
+(see the CHANGELOG), but nothing about that changes the schema-v5 cursor migration described here.
 
 **What happens on the first writable open of a schema-4 store** (every 0.7.x store):
 

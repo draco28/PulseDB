@@ -229,7 +229,7 @@ impl RemoteChangeApplier {
                 skewed_timestamps = result.skewed_timestamps,
                 max_skew_ms,
                 max_clock_skew_ms = self.config.max_clock_skew_ms,
-                "Incoming last_reinforced is beyond the clock-skew bound; merged unchanged (bound is advisory until protocol v5)"
+                "Incoming last_reinforced is beyond the clock-skew bound; merged unchanged (the bound is advisory: no protocol version carries a record-level time reference yet)"
             );
         }
 
@@ -255,14 +255,15 @@ impl RemoteChangeApplier {
     /// the merged value stays byte-for-byte what max-merge produces, so
     /// convergence is unaffected and the skew is visible in logs and
     /// [`SyncStats`] instead of silently freezing decay. A bound that also
-    /// corrects needs a record-carried reference — protocol v5 (Release 2).
+    /// corrects needs a record-carried reference. Protocol v5 deliberately did
+    /// not add one; that work is assigned to a later protocol version.
     ///
     /// **Detection does not log.** The condition never self-clears while the
     /// peer's clock is wrong, so [`apply_batch`](Self::apply_batch) emits one
     /// `warn!` summary per batch instead of one per change.
     fn detect_skew(&self, change: &SyncChange) -> Option<i64> {
         let incoming = match &change.payload {
-            SyncPayload::ExperienceCreated(experience) => experience.last_reinforced,
+            SyncPayload::ExperienceCreated(carried) => carried.experience.last_reinforced,
             SyncPayload::ExperienceUpdated { update, .. } => update.last_reinforced?,
             _ => return None,
         };
@@ -287,7 +288,16 @@ impl RemoteChangeApplier {
 
         match change.payload {
             // ─── Experience ──────────────────────────────────────────
-            SyncPayload::ExperienceCreated(experience) => {
+            SyncPayload::ExperienceCreated(carried) => {
+                // Restore the wire-carried vector into the record BEFORE any
+                // existing validation runs: `Experience::embedding` is
+                // `#[serde(skip)]`, so what arrived is a record with an empty
+                // vector plus the vector beside it. The dimension check below
+                // and `apply_synced_experience`'s pre-write check both see the
+                // real embedding, exactly as an in-process create would (#96).
+                // Nothing is re-embedded — a payload that carried no vector
+                // still has none.
+                let experience: crate::experience::Experience = carried.into();
                 let id = experience.id;
                 if experience.applications.len() > MAX_SYNC_APPLICATION_BUCKETS {
                     return Err(SyncError::invalid_payload(format!(
@@ -331,6 +341,17 @@ impl RemoteChangeApplier {
                         )));
                     }
                 }
+                // The dependency check comes BEFORE any mutation — before the
+                // G-counter merge and before the scalar update. An update whose
+                // target does not exist here is a FAILURE, not an idempotent
+                // skip: acknowledging it would let the sender's `push_sequence`
+                // move past it, and `compact_wal` would then be free to delete
+                // the create this update depends on. Recovering the missing
+                // dependency is out of scope; making the non-completion
+                // explicit is the point.
+                if self.db.get_experience(id).map_err(map_err)?.is_none() {
+                    return Err(SyncError::missing_experience(id));
+                }
                 let applications = update.applications.as_ref().cloned().unwrap_or_default();
                 let last_reinforced = update.last_reinforced;
                 let has_counter_merge =
@@ -363,9 +384,16 @@ impl RemoteChangeApplier {
 
                 // ServerWins: always apply. LastWriteWins: remote is newer or equal.
                 let experience_update: ExperienceUpdate = update.into();
-                self.db
+                // A `false` here means the storage layer changed nothing — the
+                // record went away between the check above and the write. It is
+                // propagated rather than acknowledged, for the same reason.
+                if !self
+                    .db
                     .apply_synced_experience_update(id, experience_update)
-                    .map_err(map_err)?;
+                    .map_err(map_err)?
+                {
+                    return Err(SyncError::missing_experience(id));
+                }
                 if self.config.conflict_resolution == ConflictResolution::LastWriteWins {
                     Ok(ApplyOutcome::ConflictResolved)
                 } else {
@@ -383,9 +411,15 @@ impl RemoteChangeApplier {
                     trace!(id = %id, "Skipping ExperienceArchived: not found");
                     return Ok(ApplyOutcome::Skipped);
                 }
-                self.db
+                // An archive of a record that IS present; the already-absent
+                // case took the idempotent skip above and keeps it.
+                if !self
+                    .db
                     .apply_synced_experience_update(id, update)
-                    .map_err(map_err)?;
+                    .map_err(map_err)?
+                {
+                    return Err(SyncError::missing_experience(id));
+                }
                 Ok(ApplyOutcome::Applied)
             }
 
@@ -525,7 +559,7 @@ mod tests {
 
         let applier = RemoteChangeApplier::new(Arc::clone(&db), SyncConfig::default());
         let outcome = applier
-            .apply_single(change(SyncPayload::ExperienceCreated(remote), cid))
+            .apply_single(change(SyncPayload::ExperienceCreated(remote.into()), cid))
             .unwrap();
 
         assert!(matches!(outcome, ApplyOutcome::Applied));
@@ -933,7 +967,7 @@ mod tests {
         fresh.last_reinforced = skewed;
         let result = applier
             .apply_batch(vec![change(
-                SyncPayload::ExperienceCreated(fresh.clone()),
+                SyncPayload::ExperienceCreated(fresh.clone().into()),
                 cid,
             )])
             .unwrap();
@@ -954,7 +988,7 @@ mod tests {
         collision.last_reinforced = Timestamp::from_millis(skewed.as_millis() + 1);
         let result = applier
             .apply_batch(vec![change(
-                SyncPayload::ExperienceCreated(collision.clone()),
+                SyncPayload::ExperienceCreated(collision.clone().into()),
                 cid,
             )])
             .unwrap();
